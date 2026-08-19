@@ -46,6 +46,10 @@ Public (Cognito-protected, called by the frontend):
 | POST | `/query/by-file` | Detect tags on an uploaded file, return matches |
 | POST | `/tags/edit` | Bulk add/remove tags (`operation` 1=add, 0=remove) |
 | POST | `/files/delete` | Bulk delete (database + storage) |
+| POST | `/notifications/subscribe` | Subscribe a user to a species tag |
+| DELETE | `/notifications/subscribe` | Unsubscribe a user from a species tag |
+| GET  | `/notifications/subscriptions?user_id=...` | List a user's subscriptions |
+| GET  | `/notifications?user_id=...` | List a user's notifications |
 
 Internal metadata state machine (called by Member B, see
 [`docs/member-b/api-contracts.md`](../../docs/member-b/api-contracts.md)):
@@ -57,7 +61,13 @@ Internal metadata state machine (called by Member B, see
 | PUT  | `/internal/files/{id}/complete` | Record a completed run (idempotent) |
 | PUT  | `/internal/files/{id}/failed` | Record a bounded failure (idempotent, message ≤240 chars) |
 
-Import `postman_collection.json` into Postman for ready-made requests.
+`complete` also fires the **notification trigger**: every user subscribed to a
+species the file detected (count ≥1) gets a notification record + a
+`NotificationPublisher.publish` call. Subscriptions and notifications live in
+their own tables (`subscriptions` / `notifications`), same SQLite/DynamoDB swap.
+
+Import `postman_collection.json` into Postman for ready-made requests, or replay
+the JSON fixtures in `events/` with `curl` (see `events/README.md`).
 
 ## Run tests
 
@@ -89,11 +99,18 @@ The query API code is unchanged — only the repository backend swaps
 - **Member A (auth):** replace the body of `get_current_user` in `app/main.py`
   with `build_get_current_user()` from `examples/cognito_auth_example.py`
   (real Cognito params already filled in) — every public route already depends on it.
+- **Member E (notifications):** replace `StubNotificationPublisher` with a real
+  SNS/email/push implementation (`examples/sns_notification_example.py`). Member D
+  owns the trigger + durable records + subscription/notification endpoints;
+  Member E owns the delivery UX on top.
 
 ## Cloud database setup (for the AWS operator)
 
-The DynamoDB table and Lambda IAM role are declared in
+Three DynamoDB tables (`PacificBioArchiveFiles`, `PacificBioArchiveSubscriptions`,
+`PacificBioArchiveNotifications`) and the Lambda IAM role are declared in
 [`infrastructure/member-d/dynamodb.yaml`](../../infrastructure/member-d/dynamodb.yaml).
 The step-by-step operator guide (which file to read, what to run, and the env
 vars to pass to the API) lives in
-[`docs/member-d/database-setup.md`](../../docs/member-d/database-setup.md).
+[`docs/member-d/database-setup.md`](../../docs/member-d/database-setup.md); the
+failure-mode reference is
+[`docs/member-d/troubleshooting.md`](../../docs/member-d/troubleshooting.md).

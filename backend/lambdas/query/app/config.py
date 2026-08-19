@@ -17,8 +17,14 @@ class Settings:
     # Local SQLite file path (used when backend == "sqlite").
     sqlite_path: str = os.getenv("SQLITE_PATH", "data/pacific_bioarchive.db")
 
-    # DynamoDB table name (used when backend == "dynamodb").
+    # DynamoDB table names (used when backend == "dynamodb").
     dynamodb_table: str = os.getenv("DYNAMODB_TABLE", "PacificBioArchiveFiles")
+    subscriptions_table: str = os.getenv(
+        "SUBSCRIPTIONS_TABLE", "PacificBioArchiveSubscriptions"
+    )
+    notifications_table: str = os.getenv(
+        "NOTIFICATIONS_TABLE", "PacificBioArchiveNotifications"
+    )
     aws_region: str = os.getenv("AWS_REGION", "ap-southeast-2")
 
 

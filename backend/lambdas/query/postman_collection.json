@@ -1,7 +1,7 @@
 {
   "info": {
     "name": "Pacific BioArchive — Database & Query API",
-    "description": "Member D endpoints. Set `baseUrl` to http://localhost:8000 for local dev.",
+    "description": "Member D public endpoints (Member E frontend). Set `baseUrl` to http://localhost:8000 for local dev.",
     "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
   },
   "variable": [
@@ -27,14 +27,14 @@
       }
     },
     {
-      "name": "Find by thumbnail URL",
+      "name": "Find by thumbnail key",
       "request": {
         "method": "GET",
         "url": {
-          "raw": "{{baseUrl}}/query/by-thumbnail?url=https://s3/bucket/a1_thumb.jpg",
+          "raw": "{{baseUrl}}/query/by-thumbnail?key=thumbnails/u1/a1.jpg",
           "host": ["{{baseUrl}}"],
           "path": ["query", "by-thumbnail"],
-          "query": [{ "key": "url", "value": "https://s3/bucket/a1_thumb.jpg" }]
+          "query": [{ "key": "key", "value": "thumbnails/u1/a1.jpg" }]
         }
       }
     },
@@ -54,7 +54,7 @@
         "url": { "raw": "{{baseUrl}}/tags/edit", "host": ["{{baseUrl}}"], "path": ["tags", "edit"] },
         "body": {
           "mode": "raw",
-          "raw": "{\"urls\": [\"https://s3/bucket/a1.jpg\"], \"tags\": [\"echidna\"], \"operation\": 1}"
+          "raw": "{\"keys\": [\"originals/u1/a1.jpg\"], \"tags\": [\"echidna\"], \"operation\": 1}"
         }
       }
     },
@@ -66,7 +66,7 @@
         "url": { "raw": "{{baseUrl}}/tags/edit", "host": ["{{baseUrl}}"], "path": ["tags", "edit"] },
         "body": {
           "mode": "raw",
-          "raw": "{\"urls\": [\"https://s3/bucket/a1.jpg\"], \"tags\": [\"koala\"], \"operation\": 0}"
+          "raw": "{\"keys\": [\"originals/u1/a1.jpg\"], \"tags\": [\"koala\"], \"operation\": 0}"
         }
       }
     },
@@ -76,7 +76,55 @@
         "method": "POST",
         "header": [{ "key": "Content-Type", "value": "application/json" }],
         "url": { "raw": "{{baseUrl}}/files/delete", "host": ["{{baseUrl}}"], "path": ["files", "delete"] },
-        "body": { "mode": "raw", "raw": "{\"urls\": [\"https://s3/bucket/a5.jpg\"]}" }
+        "body": { "mode": "raw", "raw": "{\"keys\": [\"originals/u1/a5.jpg\"]}" }
+      }
+    },
+    {
+      "name": "Subscribe to a species",
+      "request": {
+        "method": "POST",
+        "header": [{ "key": "Content-Type", "value": "application/json" }],
+        "url": { "raw": "{{baseUrl}}/notifications/subscribe", "host": ["{{baseUrl}}"], "path": ["notifications", "subscribe"] },
+        "body": { "mode": "raw", "raw": "{\"user_id\": \"u1\", \"species\": \"wombat\"}" }
+      }
+    },
+    {
+      "name": "Unsubscribe from a species",
+      "request": {
+        "method": "DELETE",
+        "url": {
+          "raw": "{{baseUrl}}/notifications/subscribe?user_id=u1&species=wombat",
+          "host": ["{{baseUrl}}"],
+          "path": ["notifications", "subscribe"],
+          "query": [
+            { "key": "user_id", "value": "u1" },
+            { "key": "species", "value": "wombat" }
+          ]
+        }
+      }
+    },
+    {
+      "name": "List my subscriptions",
+      "request": {
+        "method": "GET",
+        "url": {
+          "raw": "{{baseUrl}}/notifications/subscriptions?user_id=u1",
+          "host": ["{{baseUrl}}"],
+          "path": ["notifications", "subscriptions"],
+          "query": [{ "key": "user_id", "value": "u1" }]
+        }
+      }
+    },
+    {
+      "name": "List my notifications",
+      "request": {
+        "method": "GET",
+        "url": {
+          "raw": "{{baseUrl}}/notifications?user_id=u1",
+          "host": ["{{baseUrl}}"],
+          "path": ["notifications"],
+          "query": [{ "key": "user_id", "value": "u1" }]
+        }
       }
     }
   ]

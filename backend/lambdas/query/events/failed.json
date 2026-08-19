@@ -1,0 +1,6 @@
+{
+  "user_id": "cognito-sub-example",
+  "error_code": "FRAME_EXTRACTION_FAILED",
+  "message": "ffmpeg could not decode the video; container is corrupt or unsupported",
+  "status": "failed"
+}

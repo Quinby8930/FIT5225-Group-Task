@@ -10,7 +10,8 @@ import pytest
 from fastapi.testclient import TestClient
 
 from app import main
-from app.repository import SQLiteRepository
+from app.notification_client import NotificationPublisher
+from app.repository import SQLiteNotificationRepository, SQLiteRepository
 from app.schemas import FileRecord
 from app.services.query_service import (
     filter_by_min_counts,
@@ -73,6 +74,7 @@ class TestPureLogic:
 @pytest.fixture()
 def client(tmp_path, monkeypatch):
     repo = SQLiteRepository(str(tmp_path / "test.db"))
+    notif_repo = SQLiteNotificationRepository(str(tmp_path / "test_notif.db"))
     # Seed with the same shape as seed.py
     repo.add(_record("f1", "image", "thumbnails/f1.jpg", {"dingo": 2, "wombat": 1}))
     repo.add(_record("f2", "image", "thumbnails/f2.jpg", {"wombat": 2, "magpie": 1}))
@@ -85,18 +87,32 @@ def client(tmp_path, monkeypatch):
     class _Storage(StorageClient):
         def __init__(self):
             self.deleted = []
+            self.deleted_by_owner = {}
 
-        def delete(self, keys):
+        def delete(self, user_id, keys):
             self.deleted.extend(keys)
+            self.deleted_by_owner.setdefault(user_id, []).extend(keys)
+
+    class _Publisher(NotificationPublisher):
+        def __init__(self):
+            self.published = []
+
+        def publish(self, notification):
+            self.published.append(notification)
 
     storage = _Storage()
+    publisher = _Publisher()
     main.app.dependency_overrides[main.get_repo] = lambda: repo
+    main.app.dependency_overrides[main.get_notification_repo] = lambda: notif_repo
     main.app.dependency_overrides[main.get_detector] = lambda: _Detector()
     main.app.dependency_overrides[main.get_storage] = lambda: storage
+    main.app.dependency_overrides[main.get_publisher] = lambda: publisher
 
     with TestClient(main.app) as c:
         c.repo = repo
+        c.notif_repo = notif_repo
         c.storage = storage
+        c.publisher = publisher
         yield c
 
     main.app.dependency_overrides.clear()
@@ -153,6 +169,11 @@ class TestEndpoints:
         ids = {x.file_id for x in client.repo.all()}
         assert "f1" not in ids
         assert "thumbnails/f1.jpg" in client.storage.deleted  # storage notified
+        # Storage delete is grouped by owner so Member B's guarded delete can
+        # enforce per-user key-prefix ownership.
+        assert client.storage.deleted_by_owner == {
+            "u1": ["originals/f1", "thumbnails/f1.jpg"]
+        }
 
 
 # ---------------------------------------------------------------------------
@@ -237,3 +258,63 @@ class TestMetadataEndpoints:
             json={"user_id": "u1", "error_code": "X", "message": "m", "status": "failed"},
         )
         assert client.repo.get("e2").status == "completed"
+
+
+# ---------------------------------------------------------------------------
+# Subscriptions & notification trigger (Member E frontend -> Member D)
+# ---------------------------------------------------------------------------
+class TestSubscriptionAndNotification:
+    def test_subscribe_and_list(self, client):
+        r = client.post(
+            "/notifications/subscribe", json={"user_id": "u9", "species": "wombat"}
+        )
+        assert r.status_code == 201
+        r = client.get("/notifications/subscriptions", params={"user_id": "u9"})
+        assert r.json() == {"species": ["wombat"], "count": 1}
+
+    def test_unsubscribe_idempotent(self, client):
+        client.post("/notifications/subscribe", json={"user_id": "u9", "species": "wombat"})
+        client.delete("/notifications/subscribe", params={"user_id": "u9", "species": "wombat"})
+        assert client.get("/notifications/subscriptions", params={"user_id": "u9"}).json()["count"] == 0
+        # second unsubscribe is a no-op
+        r = client.delete("/notifications/subscribe", params={"user_id": "u9", "species": "wombat"})
+        assert r.status_code == 200
+
+    def _complete(self, client, file_id, tags):
+        return client.put(
+            f"/internal/files/{file_id}/complete",
+            json={
+                "user_id": "u1",
+                "file_type": "image",
+                "original_key": f"originals/{file_id}",
+                "thumbnail_key": None,
+                "tags": tags,
+                "detections": [],
+                "model_version": "v1",
+                "status": "completed",
+            },
+        )
+
+    def test_complete_triggers_notification(self, client):
+        client.post("/notifications/subscribe", json={"user_id": "u2", "species": "wombat"})
+        _reserve(client, "n1")
+        assert self._complete(client, "n1", {"wombat": 2}).status_code == 200
+        notifs = client.notif_repo.notifications("u2")
+        assert len(notifs) == 1
+        assert notifs[0].species == "wombat"
+        assert notifs[0].file_id == "n1"
+        assert notifs[0].object_key == "originals/n1"
+        assert len(client.publisher.published) == 1
+
+    def test_complete_no_match_no_notification(self, client):
+        client.post("/notifications/subscribe", json={"user_id": "u2", "species": "magpie"})
+        _reserve(client, "n2")
+        self._complete(client, "n2", {"wombat": 1})
+        assert client.notif_repo.notifications("u2") == []
+
+    def test_complete_replay_no_duplicate_notifications(self, client):
+        client.post("/notifications/subscribe", json={"user_id": "u2", "species": "wombat"})
+        _reserve(client, "n3")
+        self._complete(client, "n3", {"wombat": 1})
+        self._complete(client, "n3", {"wombat": 1})  # idempotent replay
+        assert len(client.notif_repo.notifications("u2")) == 1

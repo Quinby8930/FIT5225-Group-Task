@@ -1,0 +1,14 @@
+{
+  "user_id": "cognito-sub-example",
+  "file_type": "image",
+  "original_key": "originals/cognito-sub-example/11111111-2222-4333-8444-555555555555/wombat.jpg",
+  "thumbnail_key": "thumbnails/cognito-sub-example/11111111-2222-4333-8444-555555555555/thumbnail.jpg",
+  "tags": {"wombat": 2, "magpie": 1},
+  "detections": [
+    {"species": "wombat", "confidence": 0.94},
+    {"species": "wombat", "confidence": 0.91},
+    {"species": "magpie", "confidence": 0.88}
+  ],
+  "model_version": "speciesnet-v1",
+  "status": "completed"
+}

@@ -93,6 +93,49 @@ class QueryResponse(BaseModel):
 
 
 # ---------------------------------------------------------------------------
+# Subscription & notification (Member D owns the data model + trigger;
+# Member E owns the delivery/UX on top of these endpoints)
+# ---------------------------------------------------------------------------
+class SubscribeRequest(BaseModel):
+    """Subscribe (or unsubscribe) a user to a species tag.
+
+    `species` is the team short name (see `app/species.py`), e.g. ``"wombat"``.
+    When a newly processed file is completed with that species in its tags, the
+    user receives a notification.
+    """
+
+    user_id: str
+    species: str
+
+
+class SubscriptionListResponse(BaseModel):
+    """A user's current subscriptions."""
+
+    species: list[str]
+    count: int
+
+
+class Notification(BaseModel):
+    """One notification produced by the trigger when a completed file's tags
+    match a subscription. The delivery channel (SNS/email/UI) is Member E's
+    concern; this is the durable record the trigger writes."""
+
+    notification_id: str
+    user_id: str
+    file_id: str
+    species: str
+    object_key: str
+    created_at: datetime = Field(default_factory=utcnow)
+
+
+class NotificationListResponse(BaseModel):
+    """A user's notifications, newest first."""
+
+    notifications: list[Notification]
+    count: int
+
+
+# ---------------------------------------------------------------------------
 # Internal metadata requests (Member B -> Member D, see api-contracts.md)
 # ---------------------------------------------------------------------------
 class ReserveRequest(BaseModel):

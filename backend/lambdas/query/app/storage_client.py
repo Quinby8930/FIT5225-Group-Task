@@ -18,11 +18,22 @@ logger = logging.getLogger(__name__)
 
 class StorageClient(ABC):
     @abstractmethod
-    def delete(self, keys: list[str]) -> None:
-        """Delete the given objects (originals + thumbnails) from storage."""
+    def delete(self, user_id: str, keys: list[str]) -> None:
+        """Delete the given objects (originals + thumbnails) owned by `user_id`.
+
+        `user_id` is required because Member B's guarded storage-delete Lambda
+        enforces that every key sits under ``originals/{user_id}/``,
+        ``thumbnails/{user_id}/`` or ``processing/{user_id}/`` (see
+        `docs/member-b/api-contracts.md`). Grouping deletions by owner keeps that
+        ownership check correct when a bulk delete spans multiple users.
+        """
 
 
 class StubStorageClient(StorageClient):
-    def delete(self, keys: list[str]) -> None:
+    def delete(self, user_id: str, keys: list[str]) -> None:
         # Real impl: Member B's guarded storage-delete Lambda (second cloud).
-        logger.info("[stub] storage delete requested for %d object(s)", len(keys))
+        logger.info(
+            "[stub] storage delete requested for %d object(s) owned by %s",
+            len(keys),
+            user_id,
+        )

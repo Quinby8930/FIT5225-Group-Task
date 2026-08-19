@@ -8,8 +8,10 @@
 > SQLite locally and DynamoDB in the cloud. Built the query layer (tag AND queries
 > with minimum counts, species lookup, thumbnail-to-original mapping, file-based
 > querying, bulk tag edit, bulk delete) plus the internal metadata state machine
-> (reserve / processing lease / complete / failed) consumed by Member B. Wrote 25
-> passing tests and a Postman collection.
+> (reserve / processing lease / complete / failed) consumed by Member B, and the
+> subscription/notification model (subscribe/unsubscribe/list + a notification
+> trigger that fires when a completed file matches a user's subscribed species).
+> Wrote 30 passing tests and a Postman collection.
 
 ## Technical description
 
@@ -65,9 +67,25 @@ Member B's ingestion boundary drives a four-step lifecycle over HTTP (defined in
 4. `PUT /internal/files/{id}/failed` — idempotent bounded failure (message
    truncated to 240 chars).
 
+### Subscription & notification trigger
+
+Member D owns the subscription data model and the notification *trigger* (the
+doc's 「通知触发」); Member E owns the delivery UX. A user subscribes to a species
+short name; when a newly completed file's `tags` contain that species (`count >= 1`),
+the trigger writes a `Notification` record and hands it to a `NotificationPublisher`.
+
+- `subscriptions` table — `(user_id, species)`, idempotent subscribe/unsubscribe.
+- `notifications` table — one row per (subscribed user, matched species), pointing
+  at the triggering file.
+- Trigger is wired into `complete` only, so the idempotent-complete guarantee
+  means a replayed completion cannot produce duplicate notifications.
+- `NotificationPublisher` is an integration slot (like `StorageClient`/`TagDetector`)
+  for Member E's real SNS/email/push delivery.
+
 ### Cross-module boundaries
 
 - **ML (C):** `TagDetector` interface; C provides a MegaDetector + SpeciesNet adapter.
 - **Storage (B):** `StorageClient` interface; B provides the guarded storage-delete
-  Lambda (deletes S3 keys).
+  Lambda (deletes S3 keys, enforced per-owner via `delete(user_id, keys)`).
+- **Notifications (E):** `NotificationPublisher` interface; E provides delivery.
 - **Auth (A):** `get_current_user` dependency already applied to every public route.

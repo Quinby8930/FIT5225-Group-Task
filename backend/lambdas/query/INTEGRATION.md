@@ -11,7 +11,8 @@
 | **C (ML)** | 输出 tags 给数据库 | §2 标签命名 + §4.1 |
 | **B (上传/存储)** | 写库（reserve/complete 状态机）+ 删 storage | §3 数据 schema + §4.2 + §5.7 |
 | **A (认证)** | 保护所有公开端点 | §4.3 |
-| **E (前端)** | 调用查询/编辑 API | §5 API 契约 |
+| **E (前端)** | 调用查询/编辑/订阅/通知 API | §5 API 契约（含 §5.8 订阅通知） |
+| **E (通知体验)** | 实现通知投递（SNS/邮件/推送） | §4.4 NotificationPublisher |
 
 ---
 
@@ -78,9 +79,33 @@ mapper.common_name("Canis_familiaris")   # -> "dingo"
 先 `reserve`（`pending_upload`），处理完再 `complete`（`completed`）。只有查询层
 内部的 seed/测试才直接构造 `FileRecord`。
 
+### 3.1 订阅 & 通知数据模型
+
+除了文件表，Member D 还维护两张表（同样 SQLite / DynamoDB 双后端）：
+
+**订阅表 `subscriptions`** —— 用户订阅某个物种标签：
+
+| 字段 | 类型 | 说明 |
+|------|------|------|
+| `user_id` | string | Cognito `sub` |
+| `species` | string | 团队简化名（§2） |
+
+主键 `(user_id, species)`，幂等（重复订阅 = 无操作）。
+
+**通知表 `notifications`** —— 触发器写出的通知记录：
+
+| 字段 | 类型 | 说明 |
+|------|------|------|
+| `notification_id` | string | UUID |
+| `user_id` | string | 被通知的订阅者 |
+| `file_id` | string | 触发通知的文件 |
+| `species` | string | 命中的物种 |
+| `object_key` | string | 该文件原图 key |
+| `created_at` | string | ISO-8601 |
+
 ---
 
-## 4. 三个集成插槽（已定义接口，填实现即可）
+## 4. 四个集成插槽（已定义接口，填实现即可）
 
 ### 4.1 成员 C — `TagDetector`
 
@@ -97,11 +122,12 @@ detector: TagDetector = SpeciesNetDetector()
 
 ### 4.2 成员 B — `StorageClient`
 
-接口：`app/storage_client.py`，方法 `delete(keys: list[str]) -> None`。
+接口：`app/storage_client.py`，方法 `delete(user_id: str, keys: list[str]) -> None`。
 
-作用：删文件时成员 D 负责删 DB 记录，同时调 `storage.delete(keys)` 删原图+缩略图
-（对应成员 B 的 guarded storage-delete Lambda，入参 `{"user_id": ..., "keys": [...]}`），
-两边不留孤儿。
+作用：删文件时成员 D 负责删 DB 记录，同时调 `storage.delete(user_id, keys)` 删
+原图+缩略图（对应成员 B 的 guarded storage-delete Lambda，入参
+`{"user_id": ..., "keys": [...]}`）。批量删除跨多个用户时，D 会按 owner 分组、每个
+owner 单独调用，保证 B 的前缀所有权校验（`originals/{user_id}/...`）通过。两边不留孤儿。
 
 ### 4.3 成员 A — `get_current_user`
 
@@ -126,6 +152,22 @@ detector: TagDetector = SpeciesNetDetector()
 
 接好后：未登录请求自动 401，且 `sub` 会一路流到 `FileRecord.user_id`。
 **成员 B 写库时 `user_id` 必须用 `claims.sub`，不是 email。**
+
+### 4.4 成员 E — `NotificationPublisher`（通知投递）
+
+接口：`app/notification_client.py`，方法 `publish(notification) -> None`。
+
+作用：新文件 `complete` 时，Member D 的触发器会匹配所有订阅并写一条通知记录，
+然后调 `publisher.publish(notification)` 真正送达用户。**投递通道（SNS / 邮件 /
+推送 / 站内 UI）由成员 E 实现**，D 只负责「触发」+「持久化」+「查询」。接好后改
+`app/main.py` 一行：
+
+```python
+from examples.sns_notification_example import SNSNotificationPublisher
+publisher: NotificationPublisher = SNSNotificationPublisher()
+```
+
+通知数据模型见 §3.1，订阅/通知端点见 §5.8。
 
 ---
 
@@ -260,6 +302,46 @@ PUT /internal/files/{file_id}/failed
 - `200 {}` → 已标记 `failed`。`error_code` 取值：`INVALID_MEDIA` /
   `FRAME_EXTRACTION_FAILED` / `INFERENCE_FAILED`。已 `completed` 的文件不会被降级为 `failed`。
 
+### 5.8 订阅 & 通知（成员 E 前端调用）
+
+**订阅一个物种**
+
+```
+POST /notifications/subscribe
+{"user_id": "<sub>", "species": "wombat"}
+```
+
+- `201 {"user_id": ..., "species": ..., "subscribed": true}`（幂等，重复订阅无副作用）。
+
+**取消订阅**
+
+```
+DELETE /notifications/subscribe?user_id=<sub>&species=wombat
+```
+
+- `200 {"user_id": ..., "species": ..., "subscribed": false}`（幂等）。
+
+**列出我的订阅**
+
+```
+GET /notifications/subscriptions?user_id=<sub>
+```
+
+- `200 {"species": ["wombat", "magpie"], "count": 2}`
+
+**列出我的通知**
+
+```
+GET /notifications?user_id=<sub>
+```
+
+- `200 {"notifications": [{"notification_id": ..., "user_id": ..., "file_id": ...,
+  "species": "wombat", "object_key": "...", "created_at": "..."}], "count": 1}`（新的在前）
+
+**触发时机**：当成员 B 对某个文件调用 `complete`（§5.7③）且该文件的 `tags` 里有
+数量 ≥1 的物种时，Member D 会为**每个订阅了该物种的用户**写一条通知并调
+`NotificationPublisher.publish` 投递（§4.4）。完成是幂等的，所以重放不会重复通知。
+
 ---
 
 ## 6. 端到端流程（谁在哪个节点做什么）
@@ -271,11 +353,14 @@ PUT /internal/files/{file_id}/failed
           └─> 处理 Lambda：POST /internal/files/{id}/processing（取租约，§5.7②）
           └─> 抽帧/生成缩略图（成员 B）→ 调成员 C /infer 识别（§4.1）→ 得到 tags
           └─> 处理 Lambda：PUT /internal/files/{id}/complete（写结果，§5.7③）
+                └─> 成员 D 触发器：匹配订阅 → 写通知 + publish（§5.8）
                 └─> 失败则 PUT /internal/files/{id}/failed（§5.7④）
 用户查询
    └─> 前端（成员 E）→ 成员 A 验证 token → 成员 D 的查询端点（§5.1–5.4）
+用户订阅/查看通知
+   └─> 前端（成员 E）→ POST /notifications/subscribe、GET /notifications（§5.8）
 用户删除
-   └─> 成员 D 删 DB 记录 + 调成员 B 的 StorageClient 删 S3 对象（§4.2）
+   └─> 成员 D 删 DB 记录 + 按 owner 调成员 B 的 StorageClient 删 S3 对象（§4.2）
 ```
 
 ---

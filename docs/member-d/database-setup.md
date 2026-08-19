@@ -7,8 +7,8 @@
 
 ## 0. 一句话总结
 
-用 CloudFormation 部署一个 **DynamoDB 表 + 一个 IAM 角色**，然后把查询 Lambda
-指向这张表（改 3 个环境变量）。没有别的资源要建。
+用 CloudFormation 部署 **三张 DynamoDB 表 + 一个 IAM 角色**，然后把查询 Lambda
+指向这三张表（改 5 个环境变量）。没有别的资源要建。
 
 ---
 
@@ -37,8 +37,10 @@ aws cloudformation deploy \
 
 | 资源 | 名称 | 说明 |
 |------|------|------|
-| DynamoDB 表 | `PacificBioArchiveFiles` | 主键 `file_id`（字符串），按需计费（PAY_PER_REQUEST） |
-| IAM 角色 | `PacificBioArchive-QueryLambdaRole` | 允许 Lambda 对这张表 Put/Get/Scan/Update/Delete |
+| DynamoDB 表 | `PacificBioArchiveFiles` | 文件元数据，主键 `file_id`（字符串），按需计费 |
+| DynamoDB 表 | `PacificBioArchiveSubscriptions` | 订阅，主键 `user_id` + 排序键 `species` |
+| DynamoDB 表 | `PacificBioArchiveNotifications` | 通知，主键 `user_id` + 排序键 `notification_id` |
+| IAM 角色 | `PacificBioArchive-QueryLambdaRole` | 允许 Lambda 对这三张表 Put/Get/Scan/Query/Update/Delete |
 
 ---
 
@@ -58,6 +60,8 @@ aws cloudformation deploy \
      |------|-----|
      | `REPO_BACKEND` | `dynamodb` |
      | `DYNAMODB_TABLE` | `PacificBioArchiveFiles` |
+     | `SUBSCRIPTIONS_TABLE` | `PacificBioArchiveSubscriptions` |
+     | `NOTIFICATIONS_TABLE` | `PacificBioArchiveNotifications` |
      | `AWS_REGION` | `ap-southeast-2` |
 
 3. 不改任何代码 —— 后端切换靠 `REPO_BACKEND` 环境变量完成
@@ -69,8 +73,8 @@ aws cloudformation deploy \
 
 查询 Lambda 通过**现有的 HTTP API `2dd2aqb32j`** 暴露，两个用途：
 
-- **公开查询路由**（`/query/*`、`/tags/edit`、`/files/delete`）：挂成员 A 的
-  `CognitoJWTAuthorizer`，用户带 ID token 调用。
+- **公开查询路由**（`/query/*`、`/tags/edit`、`/files/delete`、`/notifications/*`）：
+  挂成员 A 的 `CognitoJWTAuthorizer`，用户带 ID token 调用。
 - **内部元数据路由**（`/internal/uploads/reserve`、`/internal/files/{id}/processing`
   、`/internal/files/{id}/complete`、`/internal/files/{id}/failed`）：成员 B 的
   上传/处理 Lambda 直接调用（无需 Cognito），对接契约见
@@ -99,3 +103,8 @@ aws cloudformation deploy \
   和 `/internal/files/{id}/complete` 写入；查询 Lambda 只负责读。
 - **唯一性去重**：`(user_id, checksum)` 唯一是**应用层**保证的（reserve 端点
   先查再写）。DynamoDB 主键只有 `file_id`，没建 GSI —— 对这个数据量用 Scan 就够。
+- **订阅/通知两张表**：`complete` 时通知触发器会写 `PacificBioArchiveNotifications`
+  （并查 `PacificBioArchiveSubscriptions`），所以 Lambda 的 IAM 角色必须同时授权
+  这两张表（新模板已含 `dynamodb:Query`）。
+- **排错**：报错先看 `docs/member-d/troubleshooting.md`，绝大多数问题（旧 schema、
+  IAM、表名/区域、简化名匹配）都有对应解法。

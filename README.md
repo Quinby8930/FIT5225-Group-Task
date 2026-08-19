@@ -59,8 +59,12 @@ Member D has added the database and query API:
   query file), bulk tag add/remove, and bulk delete across database and storage.
 - An internal metadata state machine (`reserve` / `processing` lease /
   `complete` / `failed`) that Member B's upload and processing Lambdas call.
-- A CloudFormation template declaring the DynamoDB table and the query Lambda's
-  IAM role.
+- A subscription & notification model (subscribe/unsubscribe/list endpoints plus
+  a trigger that notifies subscribers when a completed file matches their
+  subscribed species), behind a `NotificationPublisher` integration slot for
+  Member E's delivery.
+- A CloudFormation template declaring three DynamoDB tables (file metadata,
+  subscriptions, notifications) and the query Lambda's IAM role.
 
 The Member D database has not been deployed from this repository. Live DynamoDB,
 Lambda, and API Gateway wiring remains in the manual handoff (see

@@ -1,7 +1,8 @@
 AWSTemplateFormatVersion: '2010-09-09'
 Description: >
-  Pacific BioArchive — DynamoDB table for file metadata + the IAM role the
-  query Lambda assumes. Owned by Member D. Deploy in ap-southeast-2.
+  Pacific BioArchive — DynamoDB tables for file metadata, subscriptions and
+  notifications, plus the IAM role the query Lambda assumes. Owned by Member D.
+  Deploy in ap-southeast-2.
 
 Resources:
   FilesTable:
@@ -15,6 +16,38 @@ Resources:
       KeySchema:
         - AttributeName: file_id
           KeyType: HASH             # partition key
+
+  SubscriptionsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: PacificBioArchiveSubscriptions
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: user_id
+          AttributeType: S
+        - AttributeName: species
+          AttributeType: S
+      KeySchema:
+        - AttributeName: user_id
+          KeyType: HASH             # partition key
+        - AttributeName: species
+          KeyType: RANGE            # sort key -> unique (user, species) subscription
+
+  NotificationsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: PacificBioArchiveNotifications
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: user_id
+          AttributeType: S
+        - AttributeName: notification_id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: user_id
+          KeyType: HASH             # partition key -> list a user's notifications
+        - AttributeName: notification_id
+          KeyType: RANGE            # sort key -> unique notification
 
   QueryLambdaRole:
     Type: AWS::IAM::Role
@@ -39,14 +72,24 @@ Resources:
                   - dynamodb:PutItem
                   - dynamodb:GetItem
                   - dynamodb:Scan
+                  - dynamodb:Query
                   - dynamodb:UpdateItem
                   - dynamodb:DeleteItem
-                Resource: !Sub ${FilesTable.Arn}
+                Resource:
+                  - !Sub ${FilesTable.Arn}
+                  - !Sub ${SubscriptionsTable.Arn}
+                  - !Sub ${NotificationsTable.Arn}
 
 Outputs:
   TableName:
     Value: !Ref FilesTable
     Description: DynamoDB table the query API reads/writes.
+  SubscriptionsTableName:
+    Value: !Ref SubscriptionsTable
+    Description: DynamoDB table holding (user, species) subscriptions.
+  NotificationsTableName:
+    Value: !Ref NotificationsTable
+    Description: DynamoDB table holding per-user notifications.
   QueryLambdaRoleArn:
     Value: !GetAtt QueryLambdaRole.Arn
     Description: Attach this role to the query Lambda.

@@ -13,9 +13,13 @@ setup guide (which single file to read) is in
 
 - **`PacificBioArchiveFiles`** — DynamoDB table, partition key `file_id`
   (String), `PAY_PER_REQUEST` billing (no capacity planning for this dataset).
+- **`PacificBioArchiveSubscriptions`** — DynamoDB table, partition key `user_id`
+  + sort key `species` (one subscription per user/species).
+- **`PacificBioArchiveNotifications`** — DynamoDB table, partition key `user_id`
+  + sort key `notification_id` (the notification trigger writes here).
 - **`PacificBioArchive-QueryLambdaRole`** — IAM role for the query Lambda,
-  granting `dynamodb:PutItem / GetItem / Scan / UpdateItem / DeleteItem` on that
-  table only, plus the standard Lambda execution policy.
+  granting `dynamodb:PutItem / GetItem / Scan / Query / UpdateItem / DeleteItem`
+  on those three tables, plus the standard Lambda execution policy.
 
 ## Deploy
 
@@ -32,6 +36,8 @@ aws cloudformation deploy \
 | Output | Meaning |
 |--------|---------|
 | `TableName` | DynamoDB table the query API reads/writes (`PacificBioArchiveFiles`). |
+| `SubscriptionsTableName` | Table holding (user, species) subscriptions. |
+| `NotificationsTableName` | Table holding per-user notifications. |
 | `QueryLambdaRoleArn` | Attach this role to the query Lambda. |
 
 No live AWS deployment was performed while preparing these artifacts; account
