@@ -1,0 +1,192 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: Private media ingestion and preprocessing boundary for Member B.
+
+Parameters:
+  ExistingHttpApiId:
+    Type: String
+    Default: 2dd2aqb32j
+  ExistingJwtAuthorizerId:
+    Type: String
+  AllowedOrigin:
+    Type: String
+    Default: http://localhost:3000
+  MetadataApiBaseUrl:
+    Type: String
+  InferenceApiUrl:
+    Type: String
+  InternalApiKey:
+    Type: String
+    NoEcho: true
+    Default: ''
+  FfmpegLayerArn:
+    Type: String
+    Default: ''
+  MaxUploadBytes:
+    Type: Number
+    Default: 262144000
+
+Conditions:
+  HasFfmpegLayer: !Not [!Equals [!Ref FfmpegLayerArn, '']]
+
+Resources:
+  MediaBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerEnforced
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      CorsConfiguration:
+        CorsRules:
+          - AllowedOrigins:
+              - !Ref AllowedOrigin
+            AllowedMethods:
+              - PUT
+              - GET
+              - HEAD
+            AllowedHeaders:
+              - Content-Type
+              - x-amz-checksum-sha256
+            ExposedHeaders:
+              - ETag
+              - x-amz-checksum-sha256
+            MaxAge: 300
+      LifecycleConfiguration:
+        Rules:
+          - Id: ExpireAbandonedProcessingObjects
+            Prefix: processing/
+            Status: Enabled
+            ExpirationInDays: 1
+
+  UploadFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: ../../backend/lambdas/upload/
+      Handler: index.handler
+      Runtime: nodejs20.x
+      Timeout: 15
+      MemorySize: 256
+      Environment:
+        Variables:
+          UPLOAD_BUCKET: !Ref MediaBucket
+          METADATA_API_BASE_URL: !Ref MetadataApiBaseUrl
+          INTERNAL_API_KEY: !Ref InternalApiKey
+          MAX_UPLOAD_BYTES: !Ref MaxUploadBytes
+          ALLOWED_ORIGIN: !Ref AllowedOrigin
+      Policies:
+        - AWSLambdaBasicExecutionRole
+        - Statement:
+            - Effect: Allow
+              Action: s3:PutObject
+              Resource: !Sub ${MediaBucket.Arn}/originals/*
+
+  MediaProcessingFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: ../../backend/lambdas/media-processing/
+      Handler: handler.handler
+      Runtime: python3.12
+      Timeout: 900
+      MemorySize: 4096
+      EphemeralStorage:
+        Size: 4096
+      Layers:
+        - !If [HasFfmpegLayer, !Ref FfmpegLayerArn, !Ref AWS::NoValue]
+      Environment:
+        Variables:
+          MEDIA_BUCKET_NAME: !Ref MediaBucket
+          METADATA_API_BASE_URL: !Ref MetadataApiBaseUrl
+          INFERENCE_API_URL: !Ref InferenceApiUrl
+          INTERNAL_API_KEY: !Ref InternalApiKey
+          FFMPEG_PATH: /opt/bin/ffmpeg
+      Policies:
+        - AWSLambdaBasicExecutionRole
+        - Statement:
+            - Effect: Allow
+              Action: s3:GetObject
+              Resource: !Sub ${MediaBucket.Arn}/originals/*
+            - Effect: Allow
+              Action: s3:PutObject
+              Resource:
+                - !Sub ${MediaBucket.Arn}/thumbnails/*
+                - !Sub ${MediaBucket.Arn}/processing/*
+            - Effect: Allow
+              Action: s3:DeleteObject
+              Resource: !Sub ${MediaBucket.Arn}/processing/*
+      Events:
+        OriginalUpload:
+          Type: S3
+          Properties:
+            Bucket: !Ref MediaBucket
+            Events: s3:ObjectCreated:*
+            Filter:
+              S3Key:
+                Rules:
+                  - Name: prefix
+                    Value: originals/
+
+  StorageDeleteFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: ../../backend/lambdas/storage-delete/
+      Handler: index.handler
+      Runtime: nodejs20.x
+      Timeout: 30
+      MemorySize: 256
+      Environment:
+        Variables:
+          MEDIA_BUCKET_NAME: !Ref MediaBucket
+      Policies:
+        - AWSLambdaBasicExecutionRole
+        - Statement:
+            - Effect: Allow
+              Action: s3:DeleteObject
+              Resource:
+                - !Sub ${MediaBucket.Arn}/originals/*
+                - !Sub ${MediaBucket.Arn}/thumbnails/*
+                - !Sub ${MediaBucket.Arn}/processing/*
+
+  UploadIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref ExistingHttpApiId
+      IntegrationType: AWS_PROXY
+      IntegrationMethod: POST
+      IntegrationUri: !Sub arn:${AWS::Partition}:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${UploadFunction.Arn}/invocations
+      PayloadFormatVersion: '2.0'
+
+  UploadRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref ExistingHttpApiId
+      RouteKey: POST /upload-url
+      AuthorizationType: JWT
+      AuthorizerId: !Ref ExistingJwtAuthorizerId
+      Target: !Sub integrations/${UploadIntegration}
+
+  UploadInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref UploadFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub arn:${AWS::Partition}:execute-api:${AWS::Region}:${AWS::AccountId}:${ExistingHttpApiId}/*/POST/upload-url
+
+Outputs:
+  MediaBucketName:
+    Value: !Ref MediaBucket
+  UploadFunctionArn:
+    Value: !GetAtt UploadFunction.Arn
+  MediaProcessingFunctionArn:
+    Value: !GetAtt MediaProcessingFunction.Arn
+  StorageDeleteFunctionArn:
+    Value: !GetAtt StorageDeleteFunction.Arn

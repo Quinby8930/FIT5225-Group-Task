@@ -1,0 +1,39 @@
+{
+  "Records": [
+    {
+      "eventVersion": "2.1",
+      "eventSource": "aws:s3",
+      "awsRegion": "ap-southeast-2",
+      "eventTime": "2026-08-19T00:01:00.000Z",
+      "eventName": "ObjectCreated:CompleteMultipartUpload",
+      "userIdentity": {
+        "principalId": "EXAMPLE"
+      },
+      "requestParameters": {
+        "sourceIPAddress": "192.0.2.20"
+      },
+      "responseElements": {
+        "x-amz-request-id": "EXAMPLEVIDEO123",
+        "x-amz-id-2": "EXAMPLEVIDEOSECONDARYID"
+      },
+      "s3": {
+        "s3SchemaVersion": "1.0",
+        "configurationId": "MemberBOriginalUpload",
+        "bucket": {
+          "name": "pacific-bioarchive-example-media",
+          "ownerIdentity": {
+            "principalId": "EXAMPLE"
+          },
+          "arn": "arn:aws:s3:::pacific-bioarchive-example-media"
+        },
+        "object": {
+          "key": "originals%2Fexample-user-456%2Faaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee%2Fkoala+crossing.mov",
+          "size": 18491320,
+          "eTag": "fedcba9876543210fedcba9876543210-2",
+          "versionId": "example-video-version",
+          "sequencer": "0068A4B1D2C3E4F600"
+        }
+      }
+    }
+  ]
+}

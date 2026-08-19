@@ -31,6 +31,50 @@ Member A has added the authentication and authorization module:
 - API Gateway JWT authorizer handoff.
 - `GET /auth-test` Lambda for verifying protected routes.
 
+Member B has added a locally verified media-ingestion boundary:
+
+- Authenticated, checksum-bound S3 upload pre-signing with per-user duplicate
+  reservation through Member D's metadata contract.
+- Private S3 object layout and `originals/`-only event processing.
+- Aspect-ratio-preserving image thumbnails and video extraction at exactly one
+  frame per second.
+- Provider-neutral HTTP contracts for Member C inference and Member D metadata
+  state, plus guarded storage deletion.
+- AWS SAM resources for the media bucket, three Lambda functions, scoped IAM,
+  and the protected `POST /upload-url` integration with the existing HTTP API.
+
+The Member B infrastructure has not been deployed from this repository. Live
+AWS, Cognito, FFmpeg-layer, and Member C/D endpoint verification remains in the
+manual handoff.
+
+### Member B architecture
+
+```text
+Authenticated browser -> POST /upload-url -> private S3 originals/
+  -> S3 ObjectCreated event -> media processing Lambda
+  -> Member C /infer + Member D processing status
+  -> private thumbnails/ and cleaned processing/ frames
+```
+
+### Member B verification
+
+Run from the repository root with dependencies already installed:
+
+```powershell
+python -m pytest infrastructure/member-b/test_template.py backend/lambdas/media-processing/tests -q
+node --test backend/lambdas/upload/test/*.test.mjs backend/lambdas/storage-delete/test/*.test.mjs
+Set-Location frontend
+node node_modules/vite/bin/vite.js build
+Set-Location ..
+```
+
+Handoff references:
+
+- [SAM infrastructure and parameters](infrastructure/member-b/README.md)
+- [API contracts](docs/member-b/api-contracts.md)
+- [Local testing](docs/member-b/local-testing.md)
+- [Manual AWS and integration steps](docs/member-b/manual-aws-steps.md)
+
 ## Local frontend start
 
 ```bash
