@@ -1,0 +1,52 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Pacific BioArchive — DynamoDB table for file metadata + the IAM role the
+  query Lambda assumes. Owned by Member D. Deploy in ap-southeast-2.
+
+Resources:
+  FilesTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: PacificBioArchiveFiles
+      BillingMode: PAY_PER_REQUEST   # on-demand: no capacity planning for this dataset
+      AttributeDefinitions:
+        - AttributeName: file_id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: file_id
+          KeyType: HASH             # partition key
+
+  QueryLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: PacificBioArchive-QueryLambdaRole
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: DynamoDBFilesAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:PutItem
+                  - dynamodb:GetItem
+                  - dynamodb:Scan
+                  - dynamodb:UpdateItem
+                  - dynamodb:DeleteItem
+                Resource: !Sub ${FilesTable.Arn}
+
+Outputs:
+  TableName:
+    Value: !Ref FilesTable
+    Description: DynamoDB table the query API reads/writes.
+  QueryLambdaRoleArn:
+    Value: !GetAtt QueryLambdaRole.Arn
+    Description: Attach this role to the query Lambda.

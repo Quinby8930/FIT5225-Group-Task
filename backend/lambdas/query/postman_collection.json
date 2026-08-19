@@ -1,0 +1,83 @@
+{
+  "info": {
+    "name": "Pacific BioArchive — Database & Query API",
+    "description": "Member D endpoints. Set `baseUrl` to http://localhost:8000 for local dev.",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+  },
+  "variable": [
+    { "key": "baseUrl", "value": "http://localhost:8000" }
+  ],
+  "item": [
+    {
+      "name": "Find by tags (AND + min counts)",
+      "request": {
+        "method": "POST",
+        "header": [{ "key": "Content-Type", "value": "application/json" }],
+        "url": { "raw": "{{baseUrl}}/query/by-tags", "host": ["{{baseUrl}}"], "path": ["query", "by-tags"] },
+        "body": { "mode": "raw", "raw": "{\"tags\": {\"dingo\": 1, \"wombat\": 1}}" }
+      }
+    },
+    {
+      "name": "Find by species",
+      "request": {
+        "method": "POST",
+        "header": [{ "key": "Content-Type", "value": "application/json" }],
+        "url": { "raw": "{{baseUrl}}/query/by-species", "host": ["{{baseUrl}}"], "path": ["query", "by-species"] },
+        "body": { "mode": "raw", "raw": "{\"species\": \"magpie\"}" }
+      }
+    },
+    {
+      "name": "Find by thumbnail URL",
+      "request": {
+        "method": "GET",
+        "url": {
+          "raw": "{{baseUrl}}/query/by-thumbnail?url=https://s3/bucket/a1_thumb.jpg",
+          "host": ["{{baseUrl}}"],
+          "path": ["query", "by-thumbnail"],
+          "query": [{ "key": "url", "value": "https://s3/bucket/a1_thumb.jpg" }]
+        }
+      }
+    },
+    {
+      "name": "Find by uploaded file",
+      "request": {
+        "method": "POST",
+        "url": { "raw": "{{baseUrl}}/query/by-file", "host": ["{{baseUrl}}"], "path": ["query", "by-file"] },
+        "body": { "mode": "formdata", "formdata": [{ "key": "file", "type": "file", "src": "query.jpg" }] }
+      }
+    },
+    {
+      "name": "Bulk add tags",
+      "request": {
+        "method": "POST",
+        "header": [{ "key": "Content-Type", "value": "application/json" }],
+        "url": { "raw": "{{baseUrl}}/tags/edit", "host": ["{{baseUrl}}"], "path": ["tags", "edit"] },
+        "body": {
+          "mode": "raw",
+          "raw": "{\"urls\": [\"https://s3/bucket/a1.jpg\"], \"tags\": [\"echidna\"], \"operation\": 1}"
+        }
+      }
+    },
+    {
+      "name": "Bulk remove tags (ignore missing)",
+      "request": {
+        "method": "POST",
+        "header": [{ "key": "Content-Type", "value": "application/json" }],
+        "url": { "raw": "{{baseUrl}}/tags/edit", "host": ["{{baseUrl}}"], "path": ["tags", "edit"] },
+        "body": {
+          "mode": "raw",
+          "raw": "{\"urls\": [\"https://s3/bucket/a1.jpg\"], \"tags\": [\"koala\"], \"operation\": 0}"
+        }
+      }
+    },
+    {
+      "name": "Bulk delete files",
+      "request": {
+        "method": "POST",
+        "header": [{ "key": "Content-Type", "value": "application/json" }],
+        "url": { "raw": "{{baseUrl}}/files/delete", "host": ["{{baseUrl}}"], "path": ["files", "delete"] },
+        "body": { "mode": "raw", "raw": "{\"urls\": [\"https://s3/bucket/a5.jpg\"]}" }
+      }
+    }
+  ]
+}

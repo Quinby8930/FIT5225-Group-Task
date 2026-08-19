@@ -1,0 +1,11 @@
+fastapi>=0.110
+uvicorn[standard]>=0.29
+pydantic>=2.6
+python-multipart>=0.0.9
+pytest>=8.0
+httpx>=0.27
+# Cloud deploy: Lambda entry point (lambda_function.py).
+mangum>=0.17
+# Cloud DB backend (DynamoDB). Lambda runtime bundles boto3 already; install
+# locally only if you want to test the DynamoDB path outside Lambda.
+# boto3>=1.34

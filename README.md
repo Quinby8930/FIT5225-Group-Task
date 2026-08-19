@@ -49,6 +49,23 @@ The Member B infrastructure has not been deployed from this repository. Live
 AWS, Cognito, FFmpeg-layer, and Member C/D endpoint verification remains in the
 manual handoff.
 
+Member D has added the database and query API:
+
+- A file-metadata schema (S3 object/thumbnail keys, species tags with counts,
+  detections, checksum, processing status) behind a repository abstraction that
+  runs on SQLite locally and DynamoDB in the cloud, swapped by one env var.
+- Query endpoints for tag AND queries with minimum counts, species lookup,
+  thumbnail-to-original mapping, file-based querying (without persisting the
+  query file), bulk tag add/remove, and bulk delete across database and storage.
+- An internal metadata state machine (`reserve` / `processing` lease /
+  `complete` / `failed`) that Member B's upload and processing Lambdas call.
+- A CloudFormation template declaring the DynamoDB table and the query Lambda's
+  IAM role.
+
+The Member D database has not been deployed from this repository. Live DynamoDB,
+Lambda, and API Gateway wiring remains in the manual handoff (see
+`docs/member-d/database-setup.md`).
+
 ### Member B architecture
 
 ```text
@@ -76,6 +93,31 @@ Handoff references:
 - [API contracts](docs/member-b/api-contracts.md)
 - [Local testing](docs/member-b/local-testing.md)
 - [Manual AWS and integration steps](docs/member-b/manual-aws-steps.md)
+
+### Member D architecture
+
+```text
+Query API (FastAPI, one Lambda via mangum)
+  -> FileRepository abstraction -> SQLite (local) | DynamoDB (cloud)
+  -> /query/* , /tags/edit , /files/delete        (Member E, Cognito-protected)
+  -> /internal/uploads/reserve , /internal/files/{id}/{processing,complete,failed}
+                                                   (Member B, internal state machine)
+```
+
+### Member D verification
+
+Run from the repository root with dependencies already installed:
+
+```powershell
+python -m pytest backend/lambdas/query/tests -q
+```
+
+Handoff references:
+
+- [Query API README](backend/lambdas/query/README.md)
+- [Integration guide (tag names, schema, API contract)](backend/lambdas/query/INTEGRATION.md)
+- [DynamoDB infrastructure](infrastructure/member-d/README.md)
+- [Database setup for the AWS operator](docs/member-d/database-setup.md)
 
 ## Local frontend start
 
