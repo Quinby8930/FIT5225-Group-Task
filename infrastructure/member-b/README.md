@@ -16,12 +16,13 @@ deployment remain manual steps.
   recovery cleanup under `processing/`.
 - A Node.js 20 upload Lambda with write access only to `originals/*`.
 - A Python 3.12 processing Lambda triggered only by object creation under
-  `originals/`; it can read originals, write thumbnails and processing frames,
-  and delete processing frames.
+  `originals/`; it can read originals and processing frames, write thumbnails
+  and processing frames, and delete processing frames.
 - A Node.js 20 storage-delete Lambda with delete access only to `originals/*`,
   `thumbnails/*`, and `processing/*`.
-- API Gateway v2 integration, protected JWT route, and scoped Lambda invoke
-  permission for the existing HTTP API.
+- API Gateway v2 integration, protected JWT POST route, unauthenticated OPTIONS
+  preflight route, and method-scoped Lambda invoke permissions for the existing
+  HTTP API.
 
 ## Parameters
 
@@ -58,8 +59,10 @@ no invented or environment-specific endpoint value.
   `backend/lambdas/upload/package.json`.
 - `@aws-sdk/client-s3` from
   `backend/lambdas/storage-delete/package.json`.
-- AWS SAM CLI for `sam validate --lint` and `sam build`. Lambda's Python runtime
-  supplies `boto3`; the separate FFmpeg layer supplies the binary.
+- AWS SAM CLI for `sam validate --lint` and `sam build --use-container`, plus a
+  running Docker installation for the container build. The container is
+  required because Pillow includes native Lambda dependencies. Lambda's Python
+  runtime supplies `boto3`; the separate FFmpeg layer supplies the binary.
 
 Dependency installation is an explicit developer setup step and was not
 performed as part of this infrastructure task.
@@ -72,7 +75,7 @@ available:
 ```powershell
 python -m pytest infrastructure/member-b/test_template.py -q
 sam validate --template-file infrastructure/member-b/template.yaml --lint
-sam build --template-file infrastructure/member-b/template.yaml
+sam build --use-container --template-file infrastructure/member-b/template.yaml
 ```
 
 `sam validate --lint` can contact AWS-backed validation depending on SAM CLI

@@ -165,7 +165,7 @@ def test_function_environment_names_match_production_handlers(template):
         assert set(variables) == names
 
 
-def test_upload_route_uses_existing_jwt_authorizer(template):
+def test_upload_post_route_uses_existing_jwt_authorizer(template):
     integration = _properties(template, "UploadIntegration")
     assert integration["ApiId"] == {"Ref": "ExistingHttpApiId"}
     assert integration["IntegrationType"] == "AWS_PROXY"
@@ -190,6 +190,35 @@ def test_upload_route_uses_existing_jwt_authorizer(template):
     assert permission["Principal"] == "apigateway.amazonaws.com"
     assert permission["Action"] == "lambda:InvokeFunction"
     assert permission["FunctionName"] == {"Ref": "UploadFunction"}
+    assert permission["SourceArn"] == {
+        "Fn::Sub": (
+            "arn:${AWS::Partition}:execute-api:${AWS::Region}:${AWS::AccountId}:"
+            "${ExistingHttpApiId}/*/POST/upload-url"
+        )
+    }
+
+
+def test_upload_options_route_is_unauthenticated_and_method_scoped(template):
+    route = _properties(template, "UploadPreflightRoute")
+    assert route == {
+        "ApiId": {"Ref": "ExistingHttpApiId"},
+        "RouteKey": "OPTIONS /upload-url",
+        "AuthorizationType": "NONE",
+        "Target": {"Fn::Sub": "integrations/${UploadIntegration}"},
+    }
+
+    permission = _properties(template, "UploadPreflightInvokePermission")
+    assert permission == {
+        "Action": "lambda:InvokeFunction",
+        "FunctionName": {"Ref": "UploadFunction"},
+        "Principal": "apigateway.amazonaws.com",
+        "SourceArn": {
+            "Fn::Sub": (
+                "arn:${AWS::Partition}:execute-api:${AWS::Region}:${AWS::AccountId}:"
+                "${ExistingHttpApiId}/*/OPTIONS/upload-url"
+            )
+        },
+    }
 
 
 def test_s3_policies_are_limited_to_owned_bucket_prefixes(template):
@@ -205,7 +234,10 @@ def test_s3_policies_are_limited_to_owned_bucket_prefixes(template):
             {
                 "Effect": "Allow",
                 "Action": "s3:GetObject",
-                "Resource": {"Fn::Sub": "${MediaBucket.Arn}/originals/*"},
+                "Resource": [
+                    {"Fn::Sub": "${MediaBucket.Arn}/originals/*"},
+                    {"Fn::Sub": "${MediaBucket.Arn}/processing/*"},
+                ],
             },
             {
                 "Effect": "Allow",

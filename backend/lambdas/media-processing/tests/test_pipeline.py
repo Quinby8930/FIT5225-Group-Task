@@ -91,6 +91,38 @@ def test_s3_storage_deletes_in_service_limit_batches():
     assert delete_calls[1]["Delete"]["Objects"][0] == {"Key": keys[-1]}
 
 
+def test_s3_storage_rejects_http_success_with_per_object_delete_errors():
+    class MixedResultClient:
+        def delete_objects(self, **kwargs):
+            return {
+                "Deleted": [{"Key": "processing/u/f/frames/frame-000001.jpg"}],
+                "Errors": [
+                    {
+                        "Key": "processing/u/f/frames/private-frame.jpg",
+                        "Code": "AccessDenied",
+                        "Message": "sensitive AWS error body",
+                    }
+                ],
+            }
+
+    storage = S3Storage(MixedResultClient())
+
+    with pytest.raises(MediaPipelineError) as caught:
+        storage.delete(
+            "private-media",
+            [
+                "processing/u/f/frames/frame-000001.jpg",
+                "processing/u/f/frames/private-frame.jpg",
+            ],
+        )
+
+    assert caught.value.code == "STORAGE_DELETE_FAILED"
+    assert caught.value.retryable is True
+    assert "private-frame.jpg" not in caught.value.message
+    assert "AccessDenied" not in caught.value.message
+    assert "sensitive AWS error body" not in caught.value.message
+
+
 def s3_record(filename="wombat.jpg"):
     return {
         "s3": {

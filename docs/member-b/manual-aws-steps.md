@@ -9,8 +9,9 @@ deployment approval.
 
 - Protected upload handler behavior and checksum-bound S3 pre-signing.
 - Per-user duplicate reservation through Member D's HTTP contract.
-- S3 event parsing, image thumbnails, one-frame-per-second video sampling,
-  Member C inference calls, Member D status calls, and temporary-frame cleanup.
+- S3 event parsing, 40 MP-bounded image thumbnails, one-frame-per-second video
+  sampling with an 840-second/900-frame bound, Member C inference calls, Member
+  D status calls, and temporary-frame cleanup.
 - Guarded, prefix-scoped storage deletion for Member D.
 - Private-bucket SAM resources, prefix-filtered notification, least-privilege
   S3 IAM statements, and API Gateway v2 route resources.
@@ -54,6 +55,13 @@ reachable metadata base URL. Validate their ownership and the JSON contracts
 in [`api-contracts.md`](api-contracts.md). Keep these as deployment parameter
 values; do not replace the parameters with guessed or fake endpoints.
 
+Before live integration, agree with Member D on recovery or cleanup for a
+committed `pending_upload` reservation when pre-signing fails or the browser
+never receives the URL. Also confirm the lease semantics: completed files
+return `should_process:false`, failed or expired interrupted work is
+re-acquirable with the same sequencer, and completion/failure PUTs are
+idempotent. Do not invent a replay or lease-token endpoint to fill this gate.
+
 If the team uses an internal API key, pass it using the course-approved secret
 workflow. Do not put the value in Git, documentation, screenshots, chat, or a
 saved command line.
@@ -69,13 +77,14 @@ The repository does not contain FFmpeg binaries, archives, or a layer ARN.
 
 ### 5. Validate, review, and obtain deployment approval
 
-Run local checks first:
+Start Docker, then run local checks. The container build is required for
+Pillow's native Lambda dependencies:
 
 ```powershell
 python -m pytest infrastructure/member-b/test_template.py backend/lambdas/media-processing/tests -q
 node --test backend/lambdas/upload/test/*.test.mjs backend/lambdas/storage-delete/test/*.test.mjs
 sam validate --template-file infrastructure/member-b/template.yaml --lint
-sam build --template-file infrastructure/member-b/template.yaml
+sam build --use-container --template-file infrastructure/member-b/template.yaml
 ```
 
 Review the generated change set with the team and obtain explicit approval
@@ -97,7 +106,9 @@ token. From the authenticated UI:
 
 1. Request `POST /upload-url` for one accepted image and one accepted video.
 2. PUT each file to its returned URL with the exact `Content-Type` and
-   `x-amz-checksum-sha256` headers.
+   `x-amz-checksum-sha256` headers. Do not set `Content-Length` in frontend
+   JavaScript; the browser supplies it automatically and the signature binds it
+   to the declared upload size.
 3. Verify an unauthenticated request returns `401` and a repeated checksum for
    the same user returns `409` after Member D integration is active.
 4. Verify the browser origin works and an unapproved origin is not granted CORS
@@ -124,7 +135,9 @@ public for screenshots.
 - Confirm Member C accepts `POST /infer` and returns tags, detections, and a
   non-empty model version.
 - Confirm Member D supports reserve, processing lease, completion, and failure
-  endpoints and enforces unique `(user_id, checksum)` reservations.
+  endpoints, enforces unique `(user_id, checksum)` reservations, implements the
+  agreed reservation recovery/cleanup, and satisfies the lease/idempotency
+  semantics above.
 - Give Member D the `StorageDeleteFunctionArn` output and agree on an
   invocation permission/role before its public delete workflow invokes it.
 - Exercise success, duplicate/stale-event skip, inference failure, and metadata

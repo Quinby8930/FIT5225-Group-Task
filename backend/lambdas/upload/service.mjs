@@ -21,6 +21,7 @@ export function createUploadService({ createFileId, reserveUpload, presignUpload
         objectKey,
         contentType: upload.contentType,
         checksumSha256: upload.checksumSha256,
+        sizeBytes: upload.sizeBytes,
       });
       return {
         file_id: fileId,

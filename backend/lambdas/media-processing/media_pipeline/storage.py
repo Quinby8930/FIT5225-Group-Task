@@ -1,3 +1,6 @@
+from .errors import MediaPipelineError
+
+
 class S3Storage:
     def __init__(self, client):
         self.client = client
@@ -27,7 +30,13 @@ class S3Storage:
     def delete(self, bucket, keys):
         for offset in range(0, len(keys), 1000):
             batch = keys[offset : offset + 1000]
-            self.client.delete_objects(
+            result = self.client.delete_objects(
                 Bucket=bucket,
                 Delete={"Objects": [{"Key": key} for key in batch]},
             )
+            if isinstance(result, dict) and result.get("Errors"):
+                raise MediaPipelineError(
+                    "STORAGE_DELETE_FAILED",
+                    "S3 reported one or more object deletion failures",
+                    retryable=True,
+                )

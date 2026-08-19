@@ -89,7 +89,10 @@ maximum upload is 262,144,000 bytes and is configurable through
 ```
 
 The backend sanitizes the filename and generates the key. A client cannot
-select an arbitrary S3 key. The PUT URL is valid for 300 seconds by default.
+select an arbitrary S3 key. The PUT URL is valid for 300 seconds by default and
+binds the declared content length, content type, and checksum. Browser code
+sets the two returned `required_headers`; the browser supplies `Content-Length`
+automatically and frontend code must not attempt to set that forbidden header.
 
 ### Error responses
 
@@ -132,6 +135,13 @@ The metadata implementation enforces a unique `(user_id, checksum)` pair.
 `201` reserves the upload. `409` returns
 `{"existing_file_id":"existing-uuid"}`.
 
+The reservation request has a five-second client deadline. A transport failure
+or deadline expiry maps to `DEPENDENCY_UNAVAILABLE`. A committed
+`pending_upload` reservation can still exist when pre-signing fails or the
+upload response is not delivered. Before live integration, Member D and Member
+B must agree on recovery or cleanup for that state; this repository does not
+invent a reservation-replay or cancellation endpoint.
+
 ### Begin processing
 
 ```http
@@ -148,6 +158,9 @@ POST {METADATA_API_BASE_URL}/internal/files/{file_id}/processing
 
 `200` with `{"should_process":true}` grants the processing lease. `200` with
 `{"should_process":false}` makes a duplicate or stale S3 event a no-op.
+Member D must return `false` for an already completed file. A failed or expired
+interrupted attempt must be re-acquirable with the same sequencer, while an
+active lease for that event is not duplicated.
 
 ### Complete processing
 
@@ -168,7 +181,8 @@ PUT {METADATA_API_BASE_URL}/internal/files/{file_id}/complete
 }
 ```
 
-For videos, `thumbnail_key` is `null`.
+For videos, `thumbnail_key` is `null`. Completion PUTs are idempotent: replaying
+the same completion does not duplicate state or produce an error.
 
 ### Record failure
 
@@ -184,6 +198,8 @@ PUT {METADATA_API_BASE_URL}/internal/files/{file_id}/failed
   "status": "failed"
 }
 ```
+
+Failure PUTs are also idempotent for retries of the same processing attempt.
 
 ## Inference Contract
 
@@ -231,8 +247,15 @@ objects under `processing/` as a recovery control.
 - Thumbnails are JPEG, converted to RGB, and saved with quality 82 and
   optimization enabled.
 - Video frame extraction uses `fps=1`; it does not select every source frame.
+- Image decode is limited to 40,000,000 pixels. Pillow decompression-bomb
+  warnings/errors and larger decoded dimensions map to `INVALID_MEDIA`.
 - The executable path is configured by `FFMPEG_PATH`, defaulting to
   `/opt/bin/ffmpeg` in Lambda.
+- FFmpeg has an 840-second subprocess timeout, below the Lambda's 900-second
+  timeout.
+- FFmpeg extracts at most 901 samples to detect overflow; more than the
+  900-frame processing cap (about 15 minutes at one frame per second) is
+  rejected rather than truncated.
 - Image decoding errors map to `INVALID_MEDIA`.
 - Video command failures or an empty frame set map to
   `FRAME_EXTRACTION_FAILED`.
@@ -243,9 +266,11 @@ objects under `processing/` as a recovery control.
 
 S3 events are treated as at-least-once and potentially out of order. The
 metadata processing lease is the source of truth. A record with
-`should_process=false` is skipped before media work. S3 writes use deterministic
-keys, so a retry replaces the same thumbnail or frame objects. Completion is an
-idempotent PUT. Temporary objects are removed on every exit path.
+`should_process=false` is skipped before media work. Completed files return
+`false`; failed or lease-expired interrupted work remains re-acquirable with the
+same sequencer. S3 writes use deterministic keys, so a retry replaces the same
+thumbnail or frame objects. Completion and failure are idempotent PUTs.
+Temporary objects are removed on every exit path.
 
 ## Storage Deletion Contract
 
@@ -263,15 +288,19 @@ The internal storage deletion Lambda accepts a direct invocation:
 
 It rejects keys outside `originals/{user_id}/`, `thumbnails/{user_id}/`, and
 `processing/{user_id}/`, deletes valid keys in S3 batches, and treats missing
-objects as successfully deleted. Member D's public `DELETE /files` route owns
-database removal and invokes this storage boundary.
+objects as successfully deleted. An empty key list is a successful idempotent
+no-op returning zero; an empty individual key is forbidden. A deletion batch is
+successful only when S3 returns no per-object `Errors`; mixed-success responses
+raise a generic retry-visible failure. Member D's public `DELETE /files` route
+owns database removal and invokes this storage boundary.
 
 ## Security
 
 - The S3 bucket has Block Public Access enabled.
 - API Gateway validates Cognito JWTs before invoking the upload Lambda.
 - The Lambda also rejects events without `claims.sub`.
-- PUT URLs contain the exact key, content type, and SHA-256 checksum.
+- PUT URLs contain the exact key, content length, content type, and SHA-256
+  checksum.
 - IAM grants each Lambda access only to the required bucket prefixes/actions.
 - Internal HTTP credentials are environment variables and are not committed.
 - Logs exclude tokens, internal API keys, pre-signed URLs, and full request
@@ -280,10 +309,11 @@ database removal and invokes this storage boundary.
 ## Test Strategy
 
 - Node's built-in test runner covers upload validation, object-key generation,
-  duplicate mapping, handler responses, and storage-delete authorization.
+  duplicate mapping, signing inputs/options, reservation timeout, handler
+  responses, storage-delete authorization, and per-object delete failures.
 - Pytest covers S3 event parsing, thumbnail geometry/compression, FFmpeg command
-  construction, pipeline idempotency, success/failure metadata, and temporary
-  cleanup.
+  construction and bounds, image decode bounds, pipeline idempotency,
+  success/failure metadata, per-object delete failures, and temporary cleanup.
 - AWS, inference, and metadata boundaries are dependency-injected. Unit tests
   use behavior fakes; HTTP serialization has focused adapter tests.
 - `sam validate --lint` is used when SAM CLI is available; otherwise the
@@ -297,4 +327,3 @@ Cognito token acquisition, Member C endpoint integration, and Member D endpoint
 integration. Those operations require account access or concrete endpoint
 values. The repository will contain deployment instructions and exact required
 environment variables for the manual handoff.
-

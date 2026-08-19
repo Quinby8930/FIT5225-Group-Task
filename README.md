@@ -33,15 +33,17 @@ Member A has added the authentication and authorization module:
 
 Member B has added a locally verified media-ingestion boundary:
 
-- Authenticated, checksum-bound S3 upload pre-signing with per-user duplicate
-  reservation through Member D's metadata contract.
+- Authenticated S3 upload pre-signing bound to declared length, content type,
+  and checksum, with per-user duplicate reservation through Member D's metadata
+  contract.
 - Private S3 object layout and `originals/`-only event processing.
-- Aspect-ratio-preserving image thumbnails and video extraction at exactly one
-  frame per second.
+- Aspect-ratio-preserving image thumbnails with a 40 MP decode ceiling and
+  bounded video extraction at exactly one frame per second (840-second timeout,
+  900-frame cap).
 - Provider-neutral HTTP contracts for Member C inference and Member D metadata
   state, plus guarded storage deletion.
 - AWS SAM resources for the media bucket, three Lambda functions, scoped IAM,
-  and the protected `POST /upload-url` integration with the existing HTTP API.
+  the protected `POST /upload-url`, and unauthenticated browser preflight.
 
 The Member B infrastructure has not been deployed from this repository. Live
 AWS, Cognito, FFmpeg-layer, and Member C/D endpoint verification remains in the

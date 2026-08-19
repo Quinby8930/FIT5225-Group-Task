@@ -39,10 +39,15 @@ export function createHandler({ service }) {
 
 export function createS3DeleteKeys({ client, bucket, DeleteObjectsCommand }) {
   return async function deleteKeys(keys) {
-    await client.send(new DeleteObjectsCommand({
+    const result = await client.send(new DeleteObjectsCommand({
       Bucket: bucket,
       Delete: { Objects: keys.map((Key) => ({ Key })) },
     }));
+    if (Array.isArray(result?.Errors) && result.Errors.length > 0) {
+      const error = new Error('S3 reported one or more object deletion failures');
+      error.code = 'STORAGE_DELETE_FAILED';
+      throw error;
+    }
   };
 }
 

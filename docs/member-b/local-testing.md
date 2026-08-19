@@ -9,9 +9,12 @@ Member C/D deployments, or an FFmpeg installation.
 - Node.js 20 or a compatible newer Node release.
 - Python 3.12 with `pytest`, `PyYAML`, and `Pillow==11.3.0` already installed.
 - The Node dependencies declared in each Lambda `package.json` already
-  installed when exercising production AWS adapters or running `sam build`.
+  installed when exercising production AWS adapters or running
+  `sam build --use-container`.
 - Existing frontend dependencies in `frontend/node_modules` for the production
   build.
+- Docker running locally when using `sam build --use-container`; the container
+  build is required because Pillow includes native Lambda dependencies.
 
 This task does not install dependencies. Follow the group's approved setup
 process when any prerequisite is missing.
@@ -25,8 +28,9 @@ node --test backend/lambdas/upload/test/*.test.mjs backend/lambdas/storage-delet
 
 The Python suite replaces external HTTP/S3 boundaries with behavior fakes. Its
 video adapter tests inject a command runner or frame extractor, so unit tests
-verify the exact `fps=1` FFmpeg command and cleanup behavior without invoking a
-local FFmpeg executable.
+verify the exact `fps=1` FFmpeg command, 840-second timeout, 900-frame cap, and
+cleanup behavior without invoking a local FFmpeg executable. Image tests cover
+the 40,000,000-pixel ceiling and Pillow decompression-bomb mapping.
 
 To run suites separately:
 
@@ -57,7 +61,7 @@ When AWS SAM CLI is installed:
 
 ```powershell
 sam validate --template-file infrastructure/member-b/template.yaml --lint
-sam build --template-file infrastructure/member-b/template.yaml
+sam build --use-container --template-file infrastructure/member-b/template.yaml
 ```
 
 The structural pytest loader accepts CloudFormation intrinsic tags and is the
@@ -80,9 +84,10 @@ construction creates real AWS and HTTP adapters.
 ## Unit verification versus live verification
 
 Local verification covers validation, duplicate mapping, object keys, IAM and
-template structure, S3-event parsing, thumbnail behavior, one-frame-per-second
-command construction, pipeline idempotency, HTTP serialization, failure
-handling, and temporary-object cleanup.
+template structure, S3-event parsing, bounded thumbnail/video behavior,
+one-frame-per-second command construction, pipeline idempotency, HTTP
+serialization/timeouts, per-object deletion errors, failure handling, and
+temporary-object cleanup.
 
 Only the manual AWS workflow can verify the deployed authorizer, real browser
 CORS, pre-signed PUT behavior, S3 notification delivery, Lambda layer binary,

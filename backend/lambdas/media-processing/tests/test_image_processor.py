@@ -4,7 +4,10 @@ import pytest
 from PIL import Image
 
 from media_pipeline.errors import MediaPipelineError
-from media_pipeline.image_processor import create_thumbnail
+from media_pipeline.image_processor import (
+    create_thumbnail,
+    validate_decoded_pixel_count,
+)
 
 
 @pytest.mark.parametrize(
@@ -57,3 +60,40 @@ def test_thumbnail_maps_corrupt_input_to_invalid_media(tmp_path):
 
     assert caught.value.code == "INVALID_MEDIA"
     assert not Path(target).exists()
+
+
+def test_decoded_pixel_validator_enforces_the_forty_megapixel_default():
+    assert validate_decoded_pixel_count(8_000, 5_000) == 40_000_000
+
+    with pytest.raises(MediaPipelineError) as caught:
+        validate_decoded_pixel_count(8_001, 5_000)
+
+    assert caught.value.code == "INVALID_MEDIA"
+
+
+def test_thumbnail_rejects_dimensions_over_an_injected_pixel_limit(tmp_path):
+    source = tmp_path / "source.png"
+    target = tmp_path / "thumbnail.jpg"
+    Image.new("RGB", (11, 10), "green").save(source)
+
+    with pytest.raises(MediaPipelineError) as caught:
+        create_thumbnail(source, target, max_pixels=100)
+
+    assert caught.value.code == "INVALID_MEDIA"
+    assert not target.exists()
+
+
+@pytest.mark.parametrize("pillow_pixel_limit", [300, 100])
+def test_thumbnail_maps_pillow_decompression_bomb_signals_to_invalid_media(
+    tmp_path, monkeypatch, pillow_pixel_limit
+):
+    source = tmp_path / "source.png"
+    target = tmp_path / "thumbnail.jpg"
+    Image.new("RGB", (20, 20), "green").save(source)
+    monkeypatch.setattr(Image, "MAX_IMAGE_PIXELS", pillow_pixel_limit)
+
+    with pytest.raises(MediaPipelineError) as caught:
+        create_thumbnail(source, target, max_pixels=1_000)
+
+    assert caught.value.code == "INVALID_MEDIA"
+    assert not target.exists()

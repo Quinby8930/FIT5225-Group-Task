@@ -53,8 +53,12 @@ Success (`200`):
 }
 ```
 
-The browser must use the exact required headers when PUTting to the returned
-short-lived URL. `OPTIONS` returns `204` for the configured origin.
+The pre-signed PUT binds the declared `size_bytes` as `Content-Length`, plus the
+exact content type and checksum. The browser must use the two returned
+`required_headers` when PUTting to the short-lived URL. Browser networking code
+supplies `Content-Length` automatically; frontend JavaScript must not attempt to
+set that forbidden header. The unauthenticated `OPTIONS /upload-url` route
+returns `204` for the configured origin, while POST remains JWT-protected.
 
 | Status | Code | Meaning |
 | --- | --- | --- |
@@ -92,6 +96,14 @@ POST {METADATA_API_BASE_URL}/internal/uploads/reserve
 - `409` returns `{"existing_file_id":"existing-uuid"}`.
 - Other responses are treated as `DEPENDENCY_UNAVAILABLE` by the upload
   boundary.
+- The upload boundary aborts a stalled reservation request after five seconds
+  and maps abort or network failure to `DEPENDENCY_UNAVAILABLE`.
+
+A reservation can be committed as `pending_upload` even if pre-signing fails or
+the response containing the upload URL never reaches the browser. Before live
+integration, Member D and Member B must agree on recovery or cleanup for that
+state. No replay, cancellation, or cleanup endpoint is implemented or assumed
+by this contract.
 
 ### Acquire the processing lease
 
@@ -114,8 +126,10 @@ POST {METADATA_API_BASE_URL}/internal/files/{file_id}/processing
 ```
 
 `false` means the duplicate or stale event is a successful no-op before S3
-download. Transport, non-success, invalid JSON, and malformed responses are
-retryable dependency failures.
+download. Member D must return `false` when the file is already completed. A
+failed or lease-expired interrupted attempt must be re-acquirable with the same
+sequencer; an active attempt must not be granted twice. Transport, non-success,
+invalid JSON, and malformed responses are retryable dependency failures.
 
 ### Complete processing
 
@@ -140,7 +154,8 @@ Image payload:
 
 For videos, `file_type` is `video` and `thumbnail_key` is `null`. Member D must
 return a successful status with a JSON object, for example `200 {}`. Completion
-is an idempotent PUT.
+is an idempotent PUT: replaying the same completion produces the same completed
+state without duplicated effects.
 
 ### Record a bounded processing failure
 
@@ -160,7 +175,8 @@ PUT {METADATA_API_BASE_URL}/internal/files/{file_id}/failed
 The message is truncated to 240 characters. Locally reportable error codes are
 `INVALID_MEDIA`, `FRAME_EXTRACTION_FAILED`, and `INFERENCE_FAILED`. Member D
 must return a successful status with a JSON object. Metadata failures remain
-retryable so S3/Lambda delivery can retry.
+retryable so S3/Lambda delivery can retry. The failure PUT is idempotent for a
+replayed processing attempt.
 
 ## Member C inference contract
 
@@ -181,7 +197,10 @@ POST {INFERENCE_API_URL}/infer
 
 For an image, `media_type` is `image` and `image_urls` contains one temporary
 GET URL for the original. For a video it contains the one-frame-per-second
-temporary images in order.
+temporary images in lexical order. Image decoding is capped at 40,000,000
+pixels. Video extraction times out after 840 seconds and rejects more than 900
+sampled frames (about 15 minutes at one frame per second) rather than silently
+truncating a longer video.
 
 Successful JSON response:
 
@@ -213,11 +232,15 @@ has authorized the user and handled database ownership:
 
 Only keys below `originals/{user_id}/`, `thumbnails/{user_id}/`, and
 `processing/{user_id}/` are accepted. Valid keys are deleted in S3 batches of
-at most 1,000; missing objects remain a successful idempotent deletion.
+at most 1,000; missing objects remain a successful idempotent deletion. Success
+requires every batch response to contain no per-object `Errors`; a mixed-success
+S3 response becomes a generic retry-visible failure without exposing keys or
+AWS error bodies. An empty key list is a successful no-op returning zero. An
+empty individual key is forbidden.
 
 | Status | Body | Meaning |
 | --- | --- | --- |
-| `200` | `{"deleted_count":2}` | All supplied keys were accepted and submitted for deletion. |
-| `400` | `{"code":"INVALID_REQUEST"}` | Invocation shape or an empty/ambiguous key is invalid. |
-| `403` | `{"code":"FORBIDDEN_KEY"}` | At least one key is outside this user's owned prefixes. |
-| `500` | `{"code":"INTERNAL_ERROR"}` | Unexpected S3 or runtime failure. |
+| `200` | `{"deleted_count":2}` | All unique keys were deleted with no per-object errors; an empty list returns `0`. |
+| `400` | `{"code":"INVALID_REQUEST"}` | The invocation shape is invalid. |
+| `403` | `{"code":"FORBIDDEN_KEY"}` | At least one key is empty or outside this user's owned prefixes. |
+| `500` | `{"code":"INTERNAL_ERROR"}` | S3 reported per-object errors, or another runtime failure occurred. |

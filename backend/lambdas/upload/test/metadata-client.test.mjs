@@ -38,3 +38,63 @@ test('maps unsuccessful metadata and connection failures to dependency unavailab
   });
   await assert.rejects(() => createMetadataClient({ baseUrl: 'http://127.0.0.1:1' }).reserveUpload(record), { code: 'DEPENDENCY_UNAVAILABLE' });
 });
+
+test('aborts a stalled reservation after the default five-second deadline', async () => {
+  let scheduledCallback;
+  let scheduledMilliseconds;
+  const clearedTimers = [];
+  let requestSignal;
+  const fetchImpl = async (_endpoint, options) => {
+    requestSignal = options.signal;
+    return new Promise((_resolve, reject) => {
+      options.signal.addEventListener('abort', () => {
+        const error = new Error('aborted');
+        error.name = 'AbortError';
+        reject(error);
+      });
+      scheduledCallback();
+    });
+  };
+  const client = createMetadataClient({
+    baseUrl: 'https://metadata.example',
+    fetchImpl,
+    setTimeoutImpl: (callback, milliseconds) => {
+      scheduledCallback = callback;
+      scheduledMilliseconds = milliseconds;
+      return 'reservation-timeout';
+    },
+    clearTimeoutImpl: (timer) => clearedTimers.push(timer),
+  });
+
+  await assert.rejects(
+    () => client.reserveUpload(record),
+    { code: 'DEPENDENCY_UNAVAILABLE' },
+  );
+
+  assert.equal(scheduledMilliseconds, 5_000);
+  assert.equal(requestSignal.aborted, true);
+  assert.deepEqual(clearedTimers, ['reservation-timeout']);
+});
+
+test('keeps the abort deadline active while decoding a duplicate response', async () => {
+  const order = [];
+  const client = createMetadataClient({
+    baseUrl: 'https://metadata.example',
+    fetchImpl: async () => ({
+      status: 409,
+      json: async () => {
+        order.push('decode duplicate');
+        return { existing_file_id: 'existing-file' };
+      },
+    }),
+    setTimeoutImpl: () => 'reservation-timeout',
+    clearTimeoutImpl: () => order.push('clear deadline'),
+  });
+
+  await assert.rejects(
+    () => client.reserveUpload(record),
+    { code: 'DUPLICATE_FILE', existing_file_id: 'existing-file' },
+  );
+
+  assert.deepEqual(order, ['decode duplicate', 'clear deadline']);
+});

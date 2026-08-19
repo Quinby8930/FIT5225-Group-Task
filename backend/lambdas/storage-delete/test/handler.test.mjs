@@ -106,3 +106,38 @@ test('S3 adapter constructs a private-bucket DeleteObjects request', async () =>
     Delete: { Objects: [{ Key: 'originals/user-1/file-1/a.jpg' }] },
   });
 });
+
+test('S3 adapter rejects an HTTP-successful response with per-object errors', async () => {
+  class DeleteObjectsCommand {
+    constructor(input) {
+      this.input = input;
+    }
+  }
+  const deleteKeys = createS3DeleteKeys({
+    client: {
+      send: async () => ({
+        Deleted: [{ Key: 'originals/user-1/file-1/removed.jpg' }],
+        Errors: [{
+          Key: 'originals/user-1/file-1/private.jpg',
+          Code: 'AccessDenied',
+          Message: 'sensitive AWS error body',
+        }],
+      }),
+    },
+    bucket: 'private-media',
+    DeleteObjectsCommand,
+  });
+
+  await assert.rejects(
+    () => deleteKeys([
+      'originals/user-1/file-1/removed.jpg',
+      'originals/user-1/file-1/private.jpg',
+    ]),
+    (error) => (
+      error?.code === 'STORAGE_DELETE_FAILED'
+      && !error.message.includes('private.jpg')
+      && !error.message.includes('AccessDenied')
+      && !error.message.includes('sensitive AWS error body')
+    ),
+  );
+});

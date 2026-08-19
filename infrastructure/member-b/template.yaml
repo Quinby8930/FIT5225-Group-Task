@@ -113,7 +113,9 @@ Resources:
         - Statement:
             - Effect: Allow
               Action: s3:GetObject
-              Resource: !Sub ${MediaBucket.Arn}/originals/*
+              Resource:
+                - !Sub ${MediaBucket.Arn}/originals/*
+                - !Sub ${MediaBucket.Arn}/processing/*
             - Effect: Allow
               Action: s3:PutObject
               Resource:
@@ -173,6 +175,14 @@ Resources:
       AuthorizerId: !Ref ExistingJwtAuthorizerId
       Target: !Sub integrations/${UploadIntegration}
 
+  UploadPreflightRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref ExistingHttpApiId
+      RouteKey: OPTIONS /upload-url
+      AuthorizationType: NONE
+      Target: !Sub integrations/${UploadIntegration}
+
   UploadInvokePermission:
     Type: AWS::Lambda::Permission
     Properties:
@@ -180,6 +190,14 @@ Resources:
       FunctionName: !Ref UploadFunction
       Principal: apigateway.amazonaws.com
       SourceArn: !Sub arn:${AWS::Partition}:execute-api:${AWS::Region}:${AWS::AccountId}:${ExistingHttpApiId}/*/POST/upload-url
+
+  UploadPreflightInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref UploadFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub arn:${AWS::Partition}:execute-api:${AWS::Region}:${AWS::AccountId}:${ExistingHttpApiId}/*/OPTIONS/upload-url
 
 Outputs:
   MediaBucketName:

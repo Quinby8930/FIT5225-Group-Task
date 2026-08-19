@@ -27,8 +27,12 @@ Python 3.12 with Pillow and pytest, FFmpeg process adapter, AWS SAM/CloudFormati
 - Accept only JPEG, PNG, WebP, MP4, and QuickTime uploads.
 - Validate a Base64-encoded 32-byte SHA-256 digest before reservation.
 - Default pre-signed PUT expiry is 300 seconds.
+- Bind the declared content length, content type, and checksum to the PUT
+  signature without asking browser code to set `Content-Length` manually.
 - Generate thumbnails within 512 x 512 pixels at JPEG quality 82.
+- Reject decoded images above 40,000,000 pixels.
 - Extract video at exactly one frame per second.
+- Bound FFmpeg to 840 seconds and reject more than 900 sampled frames.
 - Trigger processing only for the `originals/` prefix.
 - Do not commit model weights, archives, credentials, tokens, or endpoint secrets.
 - Keep Member C inference and Member D storage choices behind HTTP contracts.
@@ -154,9 +158,11 @@ Expected: FAIL because `createUploadService` is not implemented.
 
 The service calls `reserveUpload(record)` before `presignUpload(record)`. The
 metadata adapter maps HTTP `409` to `DUPLICATE_FILE`. The presigner signs
-`PutObjectCommand` with `Bucket`, `Key`, `ContentType`, and `ChecksumSHA256`.
-The handler parses API Gateway JSON, reads `claims.sub`, and maps known errors
-to their status codes without logging secrets or URLs.
+`PutObjectCommand` with `Bucket`, `Key`, `ContentType`, `ContentLength`, and
+`ChecksumSHA256`, with content type/length signable and checksum unhoistable.
+The metadata reservation uses an abortable five-second deadline. The handler
+parses API Gateway JSON, reads `claims.sub`, and maps known errors to their
+status codes without logging secrets or URLs.
 
 - [ ] **Step 8: Run all upload tests and verify GREEN**
 
@@ -242,7 +248,8 @@ Expected: collection fails because `media_pipeline` modules do not exist.
 Use `urllib.parse.unquote_plus` for event keys. Reject non-`originals/` keys
 and paths that do not contain user, file, and filename components. Use Pillow
 `thumbnail((512, 512))`, convert transparency against white to RGB, and save an
-optimized JPEG at quality 82.
+optimized JPEG at quality 82. Map Pillow decompression-bomb signals and the
+40,000,000-pixel project ceiling to `INVALID_MEDIA` before full decode.
 
 - [ ] **Step 4: Run event/image tests and verify GREEN**
 
@@ -283,13 +290,15 @@ Expected: FAIL because the video adapter and pipeline are absent.
 
 - [ ] **Step 7: Implement video, HTTP, storage, pipeline, and Lambda adapters**
 
-`build_ffmpeg_command` must include `-vf fps=1`. `extract_frames` runs with
-`check=True`, verifies at least one frame, and raises
+`build_ffmpeg_command` must include `-vf fps=1` and request at most cap+1
+frames. `extract_frames` runs with `check=True` and an 840-second timeout,
+verifies at least one frame, rejects more than the 900-frame cap, and raises
 `FRAME_EXTRACTION_FAILED` otherwise. `MediaPipeline` acquires the metadata
 lease before downloading, uses deterministic S3 keys, calls inference once,
 records completion, records bounded failure diagnostics, and deletes uploaded
-frame keys in `finally`. `handler.py` constructs boto3/HTTP adapters from
-environment variables and processes every S3 record.
+frame keys in `finally`. S3 deletion adapters treat non-empty per-object
+`Errors` as retry-visible failures. `handler.py` constructs boto3/HTTP adapters
+from environment variables and processes every S3 record.
 
 - [ ] **Step 8: Write and implement guarded storage deletion with a RED/GREEN cycle**
 
@@ -376,7 +385,10 @@ functions and a Python 3.12 processing function. Give upload only
 `s3:PutObject` on `originals/*`; give processing only required get/put/delete
 prefix actions; give storage-delete only `s3:DeleteObject`. Integrate the
 upload Lambda with the existing API through `AWS::ApiGatewayV2::Integration`,
-`Route`, and `Permission` resources using API and authorizer parameters.
+JWT-protected POST `Route`, unauthenticated OPTIONS `Route`, and method-scoped
+`Permission` resources using API and authorizer parameters. Processing
+`s3:GetObject` covers both `originals/*` and signed frame reads under
+`processing/*`.
 
 - [ ] **Step 4: Add exact API, local-test, manual AWS, and sample-event documents**
 
@@ -412,4 +424,3 @@ step. Confirm no credential-like values or model weights are tracked. Confirm
 the branch is ahead by no more than four commits; use a fifth commit only for
 review fixes that cannot be folded into the preceding commit without rewriting
 published history. Do not push.
-

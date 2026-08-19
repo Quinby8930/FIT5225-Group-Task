@@ -33,7 +33,8 @@ test('reserves the exact metadata record before creating the pre-signed URL', as
     {
       kind: 'presign',
       input: {
-        objectKey: 'originals/user-456/file-123/wombat.jpg', contentType: 'image/jpeg', checksumSha256: request.checksum_sha256,
+        objectKey: 'originals/user-456/file-123/wombat.jpg', contentType: 'image/jpeg',
+        checksumSha256: request.checksum_sha256, sizeBytes: 2849132,
       },
     },
   ]);
@@ -54,16 +55,31 @@ test('does not pre-sign when duplicate reservation fails', async () => {
   assert.equal(presigned, false);
 });
 
-test('creates a checksum-bound PutObject command with the default 300-second expiry', async () => {
+test('binds the declared size and required headers to the 300-second PUT signature', async () => {
   let commandInput;
-  let expiresIn;
+  let signingOptions;
   class PutObjectCommand { constructor(input) { commandInput = input; } }
   const presignUpload = createS3Presigner({
     client: {}, bucket: 'private-originals', PutObjectCommand,
-    getSignedUrl: async (_client, _command, options) => { expiresIn = options.expiresIn; return 'https://signed.example'; },
+    getSignedUrl: async (_client, _command, options) => { signingOptions = options; return 'https://signed.example'; },
   });
-  const url = await presignUpload({ objectKey: 'originals/user/file/wombat.jpg', contentType: 'image/jpeg', checksumSha256: request.checksum_sha256 });
+  const url = await presignUpload({
+    objectKey: 'originals/user/file/wombat.jpg',
+    contentType: 'image/jpeg',
+    checksumSha256: request.checksum_sha256,
+    sizeBytes: 2849132,
+  });
   assert.equal(url, 'https://signed.example');
-  assert.deepEqual(commandInput, { Bucket: 'private-originals', Key: 'originals/user/file/wombat.jpg', ContentType: 'image/jpeg', ChecksumSHA256: request.checksum_sha256 });
-  assert.equal(expiresIn, 300);
+  assert.deepEqual(commandInput, {
+    Bucket: 'private-originals',
+    Key: 'originals/user/file/wombat.jpg',
+    ContentType: 'image/jpeg',
+    ContentLength: 2849132,
+    ChecksumSHA256: request.checksum_sha256,
+  });
+  assert.deepEqual(signingOptions, {
+    expiresIn: 300,
+    signableHeaders: new Set(['content-type', 'content-length']),
+    unhoistableHeaders: new Set(['x-amz-checksum-sha256']),
+  });
 });
