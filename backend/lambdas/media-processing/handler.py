@@ -16,6 +16,12 @@ def create_handler(dependencies):
         if not isinstance(records, list):
             raise MediaPipelineError("INVALID_S3_EVENT", "Invalid S3 media event")
 
+        get_remaining_time_in_millis = getattr(
+            context, "get_remaining_time_in_millis", None
+        )
+        if not callable(get_remaining_time_in_millis):
+            get_remaining_time_in_millis = None
+
         results = []
         for raw_record in records:
             if media_bucket_name:
@@ -24,7 +30,12 @@ def create_handler(dependencies):
                     raise MediaPipelineError(
                         "INVALID_S3_EVENT", "S3 event bucket does not match configuration"
                     )
-            results.append(pipeline.process_record(raw_record))
+            results.append(
+                pipeline.process_record(
+                    raw_record,
+                    get_remaining_time_in_millis=get_remaining_time_in_millis,
+                )
+            )
         return {"results": results}
 
     return invoke

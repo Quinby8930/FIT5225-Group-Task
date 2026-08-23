@@ -32,7 +32,8 @@ Python 3.12 with Pillow and pytest, FFmpeg process adapter, AWS SAM/CloudFormati
 - Generate thumbnails within 512 x 512 pixels at JPEG quality 82.
 - Reject decoded images above 40,000,000 pixels.
 - Extract video at exactly one frame per second.
-- Bound FFmpeg to 840 seconds and reject more than 900 sampled frames.
+- Bound FFmpeg to at most 600 seconds, scale frames to 1,024 pixels, and reject
+  more than 900 sampled frames or 2 GiB of extracted output.
 - Trigger processing only for the `originals/` prefix.
 - Do not commit model weights, archives, credentials, tokens, or endpoint secrets.
 - Keep Member C inference and Member D storage choices behind HTTP contracts.
@@ -290,9 +291,10 @@ Expected: FAIL because the video adapter and pipeline are absent.
 
 - [ ] **Step 7: Implement video, HTTP, storage, pipeline, and Lambda adapters**
 
-`build_ffmpeg_command` must include `-vf fps=1` and request at most cap+1
-frames. `extract_frames` runs with `check=True` and an 840-second timeout,
-verifies at least one frame, rejects more than the 900-frame cap, and raises
+`build_ffmpeg_command` must sample at `fps=1`, apply the scale/JPEG limits, use
+only local protocols, and request at most cap+1 frames. `extract_frames` runs
+with `check=True` and at most a 600-second timeout, verifies at least one frame,
+rejects more than the 900-frame or 2-GiB cap, and raises
 `FRAME_EXTRACTION_FAILED` otherwise. `MediaPipeline` acquires the metadata
 lease before downloading, uses deterministic S3 keys, calls inference once,
 records completion, records bounded failure diagnostics, and deletes uploaded

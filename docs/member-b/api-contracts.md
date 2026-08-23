@@ -4,6 +4,9 @@ These JSON/HTTP boundaries let Member B integrate with Member C and Member D
 without depending on their hosting provider, model implementation, or database.
 All internal HTTP requests use `Content-Type: application/json` and add
 `X-Internal-Api-Key` only when `INTERNAL_API_KEY` is configured.
+`METADATA_API_BASE_URL` and `INFERENCE_API_URL` must be valid HTTPS URLs;
+clients reject plaintext or malformed endpoint configuration before sending a
+request. JSON dependency responses are limited to 1 MiB.
 
 ## Ownership
 
@@ -98,6 +101,8 @@ POST {METADATA_API_BASE_URL}/internal/uploads/reserve
   boundary.
 - The upload boundary aborts a stalled reservation request after five seconds
   and maps abort or network failure to `DEPENDENCY_UNAVAILABLE`.
+- A `409` duplicate response is read with the same 1 MiB JSON limit and strict
+  UTF-8 decoding; oversized or malformed bodies map to `DEPENDENCY_UNAVAILABLE`.
 
 A reservation can be committed as `pending_upload` even if pre-signing fails or
 the response containing the upload URL never reaches the browser. Before live
@@ -129,7 +134,8 @@ POST {METADATA_API_BASE_URL}/internal/files/{file_id}/processing
 download. Member D must return `false` when the file is already completed. A
 failed or lease-expired interrupted attempt must be re-acquirable with the same
 sequencer; an active attempt must not be granted twice. Transport, non-success,
-invalid JSON, and malformed responses are retryable dependency failures.
+invalid UTF-8/JSON, oversized JSON, and malformed responses are retryable
+dependency failures.
 
 ### Complete processing
 
@@ -173,10 +179,12 @@ PUT {METADATA_API_BASE_URL}/internal/files/{file_id}/failed
 ```
 
 The message is truncated to 240 characters. Locally reportable error codes are
-`INVALID_MEDIA`, `FRAME_EXTRACTION_FAILED`, and `INFERENCE_FAILED`. Member D
-must return a successful status with a JSON object. Metadata failures remain
-retryable so S3/Lambda delivery can retry. The failure PUT is idempotent for a
-replayed processing attempt.
+`INVALID_MEDIA`, `FRAME_EXTRACTION_FAILED`, `INFERENCE_FAILED`, and
+`PROCESSING_TIME_BUDGET_EXHAUSTED`. The last code is retryable: Member D's
+failed transition must clear the active lease and permit the same S3 event to
+acquire processing again. Member D must return a successful status with a JSON
+object. Metadata failures remain retryable so S3/Lambda delivery can retry. The
+failure PUT is idempotent for a replayed processing attempt.
 
 ## Member C inference contract
 
@@ -198,9 +206,19 @@ POST {INFERENCE_API_URL}/infer
 For an image, `media_type` is `image` and `image_urls` contains one temporary
 GET URL for the original. For a video it contains the one-frame-per-second
 temporary images in lexical order. Image decoding is capped at 40,000,000
-pixels. Video extraction times out after 840 seconds and rejects more than 900
-sampled frames (about 15 minutes at one frame per second) rather than silently
-truncating a longer video.
+pixels. Video extraction samples one frame per second, scales each frame so its
+longest dimension is at most 1,024 pixels without upscaling, and writes JPEGs
+at FFmpeg quality 5. Extraction times out after at most 600 seconds, rejects
+more than 900 sampled frames (about 15 minutes), and rejects more than 2 GiB of
+total frame output rather than silently truncating a longer video. FFmpeg is
+non-interactive and can read only local `file`/`pipe` protocols.
+
+The processing Lambda reserves 180 seconds from its reported remaining time
+for frame upload, inference, status reporting, and cleanup. It recalculates the
+FFmpeg timeout from that budget and rechecks the reserve before every frame
+upload and before inference. Budget exhaustion deletes all frames already
+uploaded under `processing/`, records the retryable failed transition to clear
+the lease, and then lets the exception escape so Lambda delivery can retry.
 
 Successful JSON response:
 
@@ -213,7 +231,8 @@ Successful JSON response:
 ```
 
 `tags` must be an object, `detections` a list, and `model_version` a non-empty
-string. A transport, HTTP, JSON, or schema failure maps to `INFERENCE_FAILED`.
+string. A transport, HTTP, invalid UTF-8/JSON, response-over-1-MiB, or schema
+failure maps to `INFERENCE_FAILED`.
 
 ## Guarded storage deletion
 

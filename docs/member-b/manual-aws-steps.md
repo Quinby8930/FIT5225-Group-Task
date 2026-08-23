@@ -10,8 +10,9 @@ deployment approval.
 - Protected upload handler behavior and checksum-bound S3 pre-signing.
 - Per-user duplicate reservation through Member D's HTTP contract.
 - S3 event parsing, 40 MP-bounded image thumbnails, one-frame-per-second video
-  sampling with an 840-second/900-frame bound, Member C inference calls, Member
-  D status calls, and temporary-frame cleanup.
+  sampling with a 600-second/900-frame bound, 1,024-pixel scaling, a 2 GiB
+  extracted-frame ceiling, Lambda time-budget checks, Member C inference calls,
+  Member D status calls, and temporary-frame cleanup.
 - Guarded, prefix-scoped storage deletion for Member D.
 - Private-bucket SAM resources, prefix-filtered notification, least-privilege
   S3 IAM statements, and API Gateway v2 route resources.
@@ -50,17 +51,22 @@ tokens into documentation.
 
 ### 3. Obtain Member C and Member D endpoint values
 
-Ask Member C for the reachable inference base URL and Member D for the
-reachable metadata base URL. Validate their ownership and the JSON contracts
-in [`api-contracts.md`](api-contracts.md). Keep these as deployment parameter
-values; do not replace the parameters with guessed or fake endpoints.
+Ask Member C for the reachable HTTPS inference base URL and Member D for the
+reachable HTTPS metadata base URL. Plain HTTP values are rejected by both the
+SAM parameters and runtime clients because internal credentials and media
+metadata must be protected in transit. Validate endpoint ownership and the JSON
+contracts in [`api-contracts.md`](api-contracts.md). Keep these as deployment
+parameter values; do not replace the parameters with guessed or fake endpoints.
 
 Before live integration, agree with Member D on recovery or cleanup for a
 committed `pending_upload` reservation when pre-signing fails or the browser
 never receives the URL. Also confirm the lease semantics: completed files
 return `should_process:false`, failed or expired interrupted work is
 re-acquirable with the same sequencer, and completion/failure PUTs are
-idempotent. Do not invent a replay or lease-token endpoint to fill this gate.
+idempotent. In particular, `PROCESSING_TIME_BUDGET_EXHAUSTED` must clear the
+lease through the existing failed transition so the Lambda retry is not
+mistaken for a completed duplicate. Do not invent a replay or lease-token
+endpoint to fill this gate.
 
 If the team uses an internal API key, pass it using the course-approved secret
 workflow. Do not put the value in Git, documentation, screenshots, chat, or a

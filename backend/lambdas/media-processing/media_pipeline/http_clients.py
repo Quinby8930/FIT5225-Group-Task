@@ -1,14 +1,39 @@
 import json
 from urllib.error import HTTPError, URLError
-from urllib.parse import quote
+from urllib.parse import quote, urlsplit
 from urllib.request import Request, urlopen
 
 from .errors import MediaPipelineError
 
 
+MAX_JSON_RESPONSE_BYTES = 1024 * 1024
+
+
+def _validated_https_base_url(base_url):
+    value = str(base_url)
+    try:
+        parsed = urlsplit(value)
+        port = parsed.port
+        valid = (
+            parsed.scheme.lower() == "https"
+            and bool(parsed.hostname)
+            and (port is None or port > 0)
+            and parsed.username is None
+            and parsed.password is None
+            and not parsed.query
+            and not parsed.fragment
+            and not any(character.isspace() for character in value)
+        )
+    except ValueError:
+        valid = False
+    if not valid:
+        raise ValueError("base_url must be a valid HTTPS URL")
+    return value.rstrip("/")
+
+
 class _JsonHttpClient:
     def __init__(self, base_url, *, internal_api_key=None, timeout=10):
-        self.base_url = base_url.rstrip("/")
+        self.base_url = _validated_https_base_url(base_url)
         self.internal_api_key = internal_api_key
         self.timeout = timeout
 
@@ -24,9 +49,22 @@ class _JsonHttpClient:
         )
         try:
             with urlopen(request, timeout=self.timeout) as response:
-                body = response.read()
-            return json.loads(body)
-        except (HTTPError, URLError, TimeoutError, OSError, json.JSONDecodeError) as error:
+                body = response.read(MAX_JSON_RESPONSE_BYTES + 1)
+            if len(body) > MAX_JSON_RESPONSE_BYTES:
+                raise MediaPipelineError(
+                    error_code,
+                    "HTTP dependency response exceeded the size limit",
+                    retryable=retryable,
+                )
+            return json.loads(body.decode("utf-8"))
+        except (
+            HTTPError,
+            URLError,
+            TimeoutError,
+            OSError,
+            UnicodeDecodeError,
+            json.JSONDecodeError,
+        ) as error:
             raise MediaPipelineError(
                 error_code,
                 "HTTP dependency request failed",

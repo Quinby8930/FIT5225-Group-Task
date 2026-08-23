@@ -28,9 +28,13 @@ node --test backend/lambdas/upload/test/*.test.mjs backend/lambdas/storage-delet
 
 The Python suite replaces external HTTP/S3 boundaries with behavior fakes. Its
 video adapter tests inject a command runner or frame extractor, so unit tests
-verify the exact `fps=1` FFmpeg command, 840-second timeout, 900-frame cap, and
-cleanup behavior without invoking a local FFmpeg executable. Image tests cover
-the 40,000,000-pixel ceiling and Pillow decompression-bomb mapping.
+verify the local-only, non-interactive `fps=1` FFmpeg command, 600-second
+maximum timeout, 1,024-pixel scale, JPEG quality, 900-frame/2-GiB caps, Lambda
+time reserve, and cleanup behavior without invoking a local FFmpeg executable.
+HTTP tests use injected dependency responses to verify HTTPS-only configuration,
+the 1-MiB response cap, and invalid UTF-8 mapping without contacting Member C or
+Member D. Image tests cover the 40,000,000-pixel ceiling and Pillow
+decompression-bomb mapping.
 
 To run suites separately:
 

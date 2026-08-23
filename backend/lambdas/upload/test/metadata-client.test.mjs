@@ -1,42 +1,115 @@
 import assert from 'node:assert/strict';
-import http from 'node:http';
 import test from 'node:test';
 
 import { createMetadataClient } from '../metadata-client.mjs';
 
 const record = { file_id: 'new-file', user_id: 'user-1', checksum: Buffer.alloc(32, 7).toString('base64'), filename: 'wombat.jpg', file_type: 'image', content_type: 'image/jpeg', size_bytes: 12, object_key: 'originals/user-1/new-file/wombat.jpg', status: 'pending_upload' };
 
-async function withServer(responder, run) {
-  const server = http.createServer(responder);
-  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
-  try {
-    await run(`http://127.0.0.1:${server.address().port}`);
-  } finally {
-    await new Promise((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
-  }
-}
-
 test('POSTs the reservation contract, serializes JSON, and sends the optional internal key', async () => {
-  await withServer(async (req, res) => {
-    let body = ''; for await (const chunk of req) body += chunk;
-    assert.equal(req.method, 'POST'); assert.equal(req.url, '/internal/uploads/reserve');
-    assert.equal(req.headers['content-type'], 'application/json'); assert.equal(req.headers['x-internal-api-key'], 'secret');
-    assert.deepEqual(JSON.parse(body), record);
-    res.writeHead(201).end();
-  }, async (baseUrl) => createMetadataClient({ baseUrl, internalApiKey: 'secret' }).reserveUpload(record));
+  let request;
+  const fetchImpl = async (endpoint, options) => {
+    request = { endpoint, options };
+    return { status: 201 };
+  };
+
+  await createMetadataClient({
+    baseUrl: 'https://metadata.example/service',
+    internalApiKey: 'secret',
+    fetchImpl,
+  }).reserveUpload(record);
+
+  assert.equal(request.endpoint, 'https://metadata.example/service/internal/uploads/reserve');
+  assert.equal(request.options.method, 'POST');
+  assert.equal(request.options.headers['Content-Type'], 'application/json');
+  assert.equal(request.options.headers['X-Internal-Api-Key'], 'secret');
+  assert.deepEqual(JSON.parse(request.options.body), record);
+  assert.equal(request.options.redirect, 'error');
 });
 
 test('maps a metadata duplicate response to the existing file identifier', async () => {
-  await withServer((_req, res) => res.writeHead(409, { 'Content-Type': 'application/json' }).end(JSON.stringify({ existing_file_id: 'existing-file' })), async (baseUrl) => {
-    await assert.rejects(() => createMetadataClient({ baseUrl }).reserveUpload(record), (error) => error?.code === 'DUPLICATE_FILE' && error.existing_file_id === 'existing-file');
+  const fetchImpl = async () => new Response(
+    JSON.stringify({ existing_file_id: 'existing-file' }),
+    { status: 409, headers: { 'Content-Type': 'application/json' } },
+  );
+  await assert.rejects(
+    () => createMetadataClient({ baseUrl: 'https://metadata.example', fetchImpl }).reserveUpload(record),
+    (error) => error?.code === 'DUPLICATE_FILE' && error.existing_file_id === 'existing-file',
+  );
+});
+
+test('stops reading an oversized duplicate response at one MiB', async () => {
+  let deliveredBytes = 0;
+  let cancelled = false;
+  const reader = {
+    async read(view) {
+      view.fill(0x20);
+      deliveredBytes += view.byteLength;
+      return { done: false, value: view };
+    },
+    async cancel() { cancelled = true; },
+    releaseLock() {},
+  };
+  const fetchImpl = async () => ({
+    status: 409,
+    body: { getReader: () => reader },
   });
+
+  await assert.rejects(
+    () => createMetadataClient({ baseUrl: 'https://metadata.example', fetchImpl }).reserveUpload(record),
+    { code: 'DEPENDENCY_UNAVAILABLE' },
+  );
+
+  assert.equal(deliveredBytes, 1_048_577);
+  assert.equal(cancelled, true);
+});
+
+test('rejects invalid UTF-8 in a duplicate response', async () => {
+  const invalidBody = Buffer.concat([
+    Buffer.from('{"existing_file_id":"'),
+    Buffer.from([0xff]),
+    Buffer.from('"}'),
+  ]);
+  const fetchImpl = async () => new Response(invalidBody, { status: 409 });
+
+  await assert.rejects(
+    () => createMetadataClient({ baseUrl: 'https://metadata.example', fetchImpl }).reserveUpload(record),
+    { code: 'DEPENDENCY_UNAVAILABLE' },
+  );
 });
 
 test('maps unsuccessful metadata and connection failures to dependency unavailable', async () => {
-  await withServer((_req, res) => res.writeHead(500).end('ignored'), async (baseUrl) => {
-    await assert.rejects(() => createMetadataClient({ baseUrl }).reserveUpload(record), { code: 'DEPENDENCY_UNAVAILABLE' });
-  });
-  await assert.rejects(() => createMetadataClient({ baseUrl: 'http://127.0.0.1:1' }).reserveUpload(record), { code: 'DEPENDENCY_UNAVAILABLE' });
+  await assert.rejects(
+    () => createMetadataClient({
+      baseUrl: 'https://metadata.example',
+      fetchImpl: async () => ({ status: 500 }),
+    }).reserveUpload(record),
+    { code: 'DEPENDENCY_UNAVAILABLE' },
+  );
+  await assert.rejects(
+    () => createMetadataClient({
+      baseUrl: 'https://metadata.example',
+      fetchImpl: async () => { throw new Error('connection unavailable'); },
+    }).reserveUpload(record),
+    { code: 'DEPENDENCY_UNAVAILABLE' },
+  );
+});
+
+test('rejects non-HTTPS metadata configuration before scheduling or sending', () => {
+  for (const baseUrl of ['http://metadata.example', 'ftp://metadata.example', 'not-a-url']) {
+    let fetchCalled = false;
+    let timerCalled = false;
+    assert.throws(
+      () => createMetadataClient({
+        baseUrl,
+        internalApiKey: 'must-not-be-sent',
+        fetchImpl: async () => { fetchCalled = true; },
+        setTimeoutImpl: () => { timerCalled = true; },
+      }),
+      { code: 'INVALID_CONFIGURATION' },
+    );
+    assert.equal(fetchCalled, false);
+    assert.equal(timerCalled, false);
+  }
 });
 
 test('aborts a stalled reservation after the default five-second deadline', async () => {
@@ -78,13 +151,22 @@ test('aborts a stalled reservation after the default five-second deadline', asyn
 
 test('keeps the abort deadline active while decoding a duplicate response', async () => {
   const order = [];
+  const encoded = Buffer.from(JSON.stringify({ existing_file_id: 'existing-file' }));
+  let delivered = false;
   const client = createMetadataClient({
     baseUrl: 'https://metadata.example',
     fetchImpl: async () => ({
       status: 409,
-      json: async () => {
-        order.push('decode duplicate');
-        return { existing_file_id: 'existing-file' };
+      body: {
+        getReader: () => ({
+          async read() {
+            if (delivered) return { done: true };
+            delivered = true;
+            order.push('decode duplicate');
+            return { done: false, value: encoded };
+          },
+          releaseLock() {},
+        }),
       },
     }),
     setTimeoutImpl: () => 'reservation-timeout',

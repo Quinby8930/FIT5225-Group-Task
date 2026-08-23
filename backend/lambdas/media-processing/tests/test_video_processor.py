@@ -6,7 +6,7 @@ from media_pipeline.errors import MediaPipelineError
 from media_pipeline.video_processor import build_ffmpeg_command, extract_frames
 
 
-def test_ffmpeg_command_uses_lambda_binary_and_exactly_one_frame_per_second(tmp_path):
+def test_ffmpeg_command_is_local_noninteractive_scaled_jpeg_and_bounded(tmp_path):
     command = build_ffmpeg_command(
         ffmpeg_path="/opt/bin/ffmpeg",
         input_path=tmp_path / "input.mp4",
@@ -14,7 +14,14 @@ def test_ffmpeg_command_uses_lambda_binary_and_exactly_one_frame_per_second(tmp_
     )
 
     assert command[0] == "/opt/bin/ffmpeg"
-    assert command[command.index("-vf") + 1] == "fps=1"
+    assert command.index("-nostdin") < command.index("-i")
+    assert command[command.index("-protocol_whitelist") + 1] == "file,pipe"
+    assert command.index("-protocol_whitelist") < command.index("-i")
+    assert command[command.index("-vf") + 1] == (
+        "fps=1,scale=w='min(1024,iw)':h='min(1024,ih)':"
+        "force_original_aspect_ratio=decrease"
+    )
+    assert command[command.index("-q:v") + 1] == "5"
     assert command[command.index("-frames:v") + 1] == "901"
     assert command[-1] == str(tmp_path / "frame-%06d.jpg")
 
@@ -41,8 +48,8 @@ def test_extract_frames_runs_checked_command_and_returns_real_frames_in_lexical_
     ]
     command, options = calls[0]
     assert command[0] == "/opt/bin/ffmpeg"
-    assert command[command.index("-vf") + 1] == "fps=1"
-    assert options == {"check": True, "timeout": 840}
+    assert command[command.index("-vf") + 1].startswith("fps=1,")
+    assert options == {"check": True, "timeout": 600}
 
 
 def test_extract_frames_maps_checked_process_failure(tmp_path):
@@ -100,8 +107,78 @@ def test_extract_frames_requests_cap_plus_one_and_rejects_an_over_limit_video(
         )
 
     command, options = calls[0]
-    assert command[command.index("-vf") + 1] == "fps=1"
+    assert command[command.index("-vf") + 1].startswith("fps=1,")
     assert command[command.index("-frames:v") + 1] == "3"
     assert command[-1] == str(output_dir / "frame-%06d.jpg")
     assert options == {"check": True, "timeout": 30}
     assert caught.value.code == "FRAME_EXTRACTION_FAILED"
+
+
+@pytest.mark.parametrize(
+    ("frame_sizes", "max_output_bytes", "should_succeed"),
+    [
+        ([6, 4], 10, True),
+        ([6, 5], 10, False),
+    ],
+)
+def test_extract_frames_enforces_total_output_size_budget(
+    tmp_path,
+    frame_sizes,
+    max_output_bytes,
+    should_succeed,
+):
+    output_dir = tmp_path / "frames"
+
+    def sized_runner(command, **options):
+        for number, size in enumerate(frame_sizes, start=1):
+            (output_dir / f"frame-{number:06}.jpg").write_bytes(b"x" * size)
+
+    if should_succeed:
+        frames = extract_frames(
+            tmp_path / "input.mp4",
+            output_dir,
+            runner=sized_runner,
+            max_output_bytes=max_output_bytes,
+        )
+        assert [frame.name for frame in frames] == [
+            "frame-000001.jpg",
+            "frame-000002.jpg",
+        ]
+    else:
+        with pytest.raises(MediaPipelineError) as caught:
+            extract_frames(
+                tmp_path / "input.mp4",
+                output_dir,
+                runner=sized_runner,
+                max_output_bytes=max_output_bytes,
+            )
+        assert caught.value.code == "FRAME_EXTRACTION_FAILED"
+
+
+@pytest.mark.parametrize(
+    "override",
+    [
+        {"timeout_seconds": 601},
+        {"max_frames": 901},
+        {"max_output_bytes": 2 * 1024 * 1024 * 1024 + 1},
+    ],
+)
+def test_extract_frames_rejects_configuration_above_hard_runtime_limits(
+    tmp_path,
+    override,
+):
+    runner_called = False
+
+    def runner(command, **options):
+        nonlocal runner_called
+        runner_called = True
+
+    with pytest.raises(ValueError, match="hard limit"):
+        extract_frames(
+            tmp_path / "input.mp4",
+            tmp_path / "frames",
+            runner=runner,
+            **override,
+        )
+
+    assert runner_called is False

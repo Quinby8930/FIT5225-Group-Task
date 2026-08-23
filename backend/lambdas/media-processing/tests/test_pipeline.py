@@ -216,7 +216,7 @@ def fake_thumbnail(source, target):
     Path(target).write_bytes(b"thumbnail")
 
 
-def fake_frames(source, output_dir):
+def fake_frames(source, output_dir, *, timeout_seconds=None):
     output_dir = Path(output_dir)
     output_dir.mkdir()
     first = output_dir / "frame-000001.jpg"
@@ -354,6 +354,70 @@ def test_video_pipeline_records_bounded_inference_failure_and_cleans_frames():
         "processing/user-1/file-1/frames/frame-000002.jpg",
     ]
     assert order.index("delete") < order.index("fail")
+
+
+def test_video_pipeline_reserves_finalization_time_from_ffmpeg_timeout():
+    pipeline, _, _, _, _ = make_pipeline(content_type="video/mp4")
+    observed_timeouts = []
+
+    def recording_frames(source, output_dir, *, timeout_seconds):
+        observed_timeouts.append(timeout_seconds)
+        return fake_frames(source, output_dir, timeout_seconds=timeout_seconds)
+
+    pipeline.extract_frames = recording_frames
+
+    pipeline.process_record(
+        s3_record("wombat.mp4"),
+        get_remaining_time_in_millis=lambda: 700_000,
+    )
+
+    assert observed_timeouts == [520.0]
+
+
+def test_video_pipeline_stops_between_frame_uploads_and_cleans_uploaded_frames():
+    pipeline, storage, metadata, inference, _ = make_pipeline(content_type="video/mp4")
+    remaining = {"milliseconds": 900_000}
+    real_upload = storage.upload
+
+    def upload_then_reduce_budget(bucket, key, source, content_type):
+        real_upload(bucket, key, source, content_type)
+        remaining["milliseconds"] = 179_999
+
+    storage.upload = upload_then_reduce_budget
+
+    with pytest.raises(MediaPipelineError) as caught:
+        pipeline.process_record(
+            s3_record("wombat.mp4"),
+            get_remaining_time_in_millis=lambda: remaining["milliseconds"],
+        )
+
+    first_frame_key = "processing/user-1/file-1/frames/frame-000001.jpg"
+    assert caught.value.code == "PROCESSING_TIME_BUDGET_EXHAUSTED"
+    assert caught.value.retryable is True
+    assert [upload[1] for upload in storage.uploads] == [first_frame_key]
+    assert storage.deleted_keys == [first_frame_key]
+    assert inference.calls == []
+    assert metadata.completed == []
+    assert metadata.failed[0][1]["error_code"] == "PROCESSING_TIME_BUDGET_EXHAUSTED"
+    assert storage.order.index("delete") < storage.order.index("fail")
+
+
+def test_video_pipeline_does_not_download_when_only_finalization_reserve_remains():
+    pipeline, storage, metadata, inference, _ = make_pipeline(content_type="video/mp4")
+
+    with pytest.raises(MediaPipelineError) as caught:
+        pipeline.process_record(
+            s3_record("wombat.mp4"),
+            get_remaining_time_in_millis=lambda: 180_000,
+        )
+
+    assert caught.value.code == "PROCESSING_TIME_BUDGET_EXHAUSTED"
+    assert caught.value.retryable is True
+    assert storage.downloads == []
+    assert storage.uploads == []
+    assert inference.calls == []
+    assert metadata.completed == []
+    assert metadata.failed[0][1]["error_code"] == "PROCESSING_TIME_BUDGET_EXHAUSTED"
 
 
 def test_unsupported_content_type_records_invalid_media_without_downloading():

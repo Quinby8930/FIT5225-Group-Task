@@ -251,11 +251,15 @@ objects under `processing/` as a recovery control.
   warnings/errors and larger decoded dimensions map to `INVALID_MEDIA`.
 - The executable path is configured by `FFMPEG_PATH`, defaulting to
   `/opt/bin/ffmpeg` in Lambda.
-- FFmpeg has an 840-second subprocess timeout, below the Lambda's 900-second
-  timeout.
+- FFmpeg has a 600-second maximum subprocess timeout. The pipeline derives a
+  shorter timeout when needed so at least 180 seconds of the Lambda's
+  900-second limit remain for upload, inference, status calls, and cleanup.
 - FFmpeg extracts at most 901 samples to detect overflow; more than the
   900-frame processing cap (about 15 minutes at one frame per second) is
   rejected rather than truncated.
+- Frames are scaled without upscaling so their longest dimension is at most
+  1,024 pixels, use JPEG quality 5, and have a 2-GiB aggregate output cap.
+- FFmpeg is non-interactive and its input protocols are limited to `file,pipe`.
 - Image decoding errors map to `INVALID_MEDIA`.
 - Video command failures or an empty frame set map to
   `FRAME_EXTRACTION_FAILED`.

@@ -38,8 +38,8 @@ Member B has added a locally verified media-ingestion boundary:
   contract.
 - Private S3 object layout and `originals/`-only event processing.
 - Aspect-ratio-preserving image thumbnails with a 40 MP decode ceiling and
-  bounded video extraction at exactly one frame per second (840-second timeout,
-  900-frame cap).
+  bounded video extraction at exactly one frame per second (600-second maximum,
+  1,024-pixel scale, 900-frame/2-GiB caps, and a 180-second finalization reserve).
 - Provider-neutral HTTP contracts for Member C inference and Member D metadata
   state, plus guarded storage deletion.
 - AWS SAM resources for the media bucket, three Lambda functions, scoped IAM,

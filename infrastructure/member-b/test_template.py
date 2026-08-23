@@ -1,3 +1,4 @@
+import re
 from pathlib import Path
 
 import pytest
@@ -66,12 +67,39 @@ def test_template_declares_required_parameters(template):
     assert parameters["AllowedOrigin"]["Default"] == "http://localhost:3000"
     assert "Default" not in parameters["MetadataApiBaseUrl"]
     assert "Default" not in parameters["InferenceApiUrl"]
+    for name in ("MetadataApiBaseUrl", "InferenceApiUrl"):
+        assert "AllowedPattern" in parameters[name]
+        assert "HTTPS" in parameters[name]["ConstraintDescription"]
     assert parameters["InternalApiKey"] == {
         "Type": "String",
         "NoEcho": True,
         "Default": "",
     }
     assert parameters["FfmpegLayerArn"]["Default"] == ""
+
+
+def test_endpoint_parameter_patterns_require_an_https_host_and_base_path(template):
+    valid_urls = [
+        "https://metadata.example",
+        "https://metadata.example:8443/service",
+        "https://api-id.execute-api.ap-southeast-2.amazonaws.com/prod",
+    ]
+    invalid_urls = [
+        "http://metadata.example",
+        "https:///missing-host",
+        "https://user:password@metadata.example",
+        "https://metadata.example/path?query=value",
+        "https://metadata.example/path#fragment",
+        "https://-invalid-host.example",
+        "https://metadata.example:0/path",
+        "https://metadata.example:65536/path",
+        "https://metadata.example:invalid/path",
+    ]
+
+    for name in ("MetadataApiBaseUrl", "InferenceApiUrl"):
+        pattern = re.compile(template["Parameters"][name]["AllowedPattern"])
+        assert all(pattern.fullmatch(value) for value in valid_urls)
+        assert all(not pattern.fullmatch(value) for value in invalid_urls)
 
 
 def test_media_bucket_is_private_encrypted_and_recoverable(template):

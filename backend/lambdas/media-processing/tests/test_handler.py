@@ -18,9 +18,11 @@ def record(bucket, key):
 class RecordingPipeline:
     def __init__(self):
         self.records = []
+        self.remaining_time_providers = []
 
-    def process_record(self, item):
+    def process_record(self, item, *, get_remaining_time_in_millis=None):
         self.records.append(item)
+        self.remaining_time_providers.append(get_remaining_time_in_millis)
         return {"status": "completed", "file_id": item["s3"]["object"]["key"]}
 
 
@@ -41,6 +43,28 @@ def test_create_handler_processes_every_record_in_order():
             {"status": "completed", "file_id": "originals/user-1/file-2/two.jpg"},
         ]
     }
+    assert pipeline.remaining_time_providers == [None, None]
+
+
+def test_create_handler_passes_one_shared_lambda_time_provider_to_every_record():
+    pipeline = RecordingPipeline()
+    first = record("private-media", "originals/user-1/file-1/one.jpg")
+    second = record("private-media", "originals/user-1/file-2/two.jpg")
+
+    class Context:
+        def get_remaining_time_in_millis(self):
+            return 900_000
+
+    context = Context()
+    invoke = handler_module.create_handler(
+        {"pipeline": pipeline, "media_bucket_name": "private-media"}
+    )
+
+    invoke({"Records": [first, second]}, context)
+
+    assert len(pipeline.remaining_time_providers) == 2
+    assert pipeline.remaining_time_providers[0] is pipeline.remaining_time_providers[1]
+    assert pipeline.remaining_time_providers[0]() == 900_000
 
 
 def test_create_handler_rejects_a_record_from_a_different_configured_bucket():

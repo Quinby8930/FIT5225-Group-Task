@@ -3,7 +3,9 @@
 This directory defines the private AWS boundary for media upload,
 preprocessing, and guarded storage deletion. It connects `POST /upload-url` to
 the existing HTTP API and JWT authorizer, and sends metadata and inference
-requests only through deployment-time HTTP endpoint parameters.
+requests only through deployment-time HTTPS endpoint parameters. The template
+rejects plaintext endpoint values, and both runtime clients validate HTTPS
+again before sending an optional internal API key.
 
 No AWS deployment was performed while preparing these repository artifacts.
 The template has local structural coverage; account-specific validation and
@@ -31,8 +33,8 @@ deployment remain manual steps.
 | `ExistingHttpApiId` | No | `2dd2aqb32j` | Existing API Gateway HTTP API to receive `POST /upload-url`. |
 | `ExistingJwtAuthorizerId` | Yes | None | Authorizer ID already configured on that HTTP API. |
 | `AllowedOrigin` | No | `http://localhost:3000` | Exact browser origin allowed by Lambda responses and S3 CORS. |
-| `MetadataApiBaseUrl` | Yes | None | Member D base URL used for reservation and processing status calls. |
-| `InferenceApiUrl` | Yes | None | Member C base URL; the processing client appends `/infer`. |
+| `MetadataApiBaseUrl` | Yes | None | Member D HTTPS base URL used for reservation and processing status calls. |
+| `InferenceApiUrl` | Yes | None | Member C HTTPS base URL; the processing client appends `/infer`. |
 | `InternalApiKey` | No | Empty, `NoEcho` | Optional shared internal HTTP credential; provide it only through an approved deployment secret-handling process. |
 | `FfmpegLayerArn` | No | Empty | ARN of a compatible layer that exposes `/opt/bin/ffmpeg`; omitted when empty. |
 | `MaxUploadBytes` | No | `262144000` | Maximum accepted upload size passed to the upload handler. |
@@ -92,7 +94,7 @@ Before any deployment, the student must obtain approval and supply:
 
 1. An active AWS Academy session and the course-approved AWS region.
 2. The real authorizer ID for HTTP API `2dd2aqb32j`.
-3. Reachable Member C inference and Member D metadata endpoint values.
+3. Reachable HTTPS Member C inference and Member D metadata endpoint values.
 4. An approved, architecture-compatible FFmpeg Lambda layer whose executable
    is `/opt/bin/ffmpeg`.
 5. Any optional internal API key through the approved secret-handling process,
