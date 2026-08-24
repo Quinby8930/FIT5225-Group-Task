@@ -1,0 +1,379 @@
+# Integration Guide — Database & Query API (Member D)
+
+这份文档是**唯一的对接依据**。成员 A/B/C/E 只要照这里做，就能和数据库/查询层无缝对接，不需要读代码。
+
+---
+
+## 1. 谁需要看这份文档
+
+| 成员 | 需要对接什么 | 看哪一节 |
+|------|-------------|----------|
+| **C (ML)** | 输出 tags 给数据库 | §2 标签命名 + §4.1 |
+| **B (上传/存储)** | 写库（reserve/complete 状态机）+ 删 storage | §3 数据 schema + §4.2 + §5.7 |
+| **A (认证)** | 保护所有公开端点 | §4.3 |
+| **E (前端)** | 调用查询/编辑/订阅/通知 API | §5 API 契约（含 §5.8 订阅通知） |
+| **E (通知体验)** | 实现通知投递（SNS/邮件/推送） | §4.4 NotificationPublisher |
+
+---
+
+## 2. 标签命名契约（最重要，最容易错）
+
+数据库里 `tags` 是「**团队简化名 → 数量**」的映射。简化名 = `labels.txt`
+通用名的**最后一个单词**，**不是**科学名，也**不是**完整通用名。
+
+**三个一错就废的坑：**
+
+| 科学名（SpeciesNet 输出） | 正确的标签名（存库用这个） | ❌ 错误写法 |
+|---------------------------|------------------------------|-------------|
+| `Vombatus_ursinus` | `"wombat"` | `"common wombat"` / `"Vombatus_ursinus"` |
+| `Gymnorhina_tibicen` | `"magpie"` | `"australian magpie"` |
+| `Canis_familiaris` / `Canis_dingo` | `"dingo"`（两个都→dingo） | `"canis familiaris"` |
+| `Macropus_giganteus` | `"kangaroo"`（eastern gray kangaroo） | `"eastern gray kangaroo"` |
+| `Vulpes_vulpes` | `"fox"`（red fox） | `"red fox"` |
+
+规则一句话：**取 labels.txt 通用名最后一个词**。单词名（`dingo`、`cattle`、
+`human`）保持不变。匹配大小写不敏感。
+
+**成员 C 不要自己写转换**，用共享工具：
+
+```python
+from app.species import get_mapper
+mapper = get_mapper()
+mapper.common_name("Vombatus_ursinus")   # -> "wombat"
+mapper.common_name("Canis_familiaris")   # -> "dingo"
+```
+
+`samples` 的 `tags` 长这样：
+
+```json
+{"dingo": 2, "wombat": 1}
+```
+
+---
+
+## 3. 数据 schema（FileRecord）
+
+数据库每条记录对应 DynamoDB 表 `PacificBioArchiveFiles`（主键 `file_id`，
+字符串）。存储位置全部用 S3 **key**（`object_key` / `thumbnail_key`），**不是 URL**。
+
+| 字段 | 类型 | 必填 | 说明 |
+|------|------|------|------|
+| `file_id` | string | ✅ | UUID，主键 |
+| `user_id` | string | ✅ | 上传者，用 Cognito `sub`（成员 A 提供） |
+| `file_type` | `"image"` / `"video"` | ✅ | |
+| `object_key` | string | ✅ | 原文件 S3 key，如 `originals/<sub>/<uuid>/a.jpg` |
+| `thumbnail_key` | string | 图片必填 | 视频为 `null` |
+| `filename` | string | | 原始文件名 |
+| `content_type` | string | | MIME，如 `image/jpeg` |
+| `size_bytes` | int | | 字节数 |
+| `tags` | object(string→int) | ✅ | 见 §2 |
+| `detections` | list | | `[{"species": "wombat", "confidence": 0.94}]` |
+| `model_version` | string | | 模型版本，如 `speciesnet-v1` |
+| `checksum` | string | ✅ | SHA-256（Base64），`(user_id, checksum)` 唯一去重 |
+| `status` | enum | ✅ | `pending_upload` / `processing` / `completed` / `failed` |
+| `error_code` / `message` | string | | 失败诊断，`message` 截断到 240 字符 |
+| `processing_sequencer` / `lease_expires_at` | | | 处理租约，见 §5.7 |
+| `upload_time` | string | ✅ | ISO-8601 时间戳 |
+
+**成员 B 不要直接调 `repo.add` 写 completed 记录**，而是走 HTTP 状态机（§5.7）：
+先 `reserve`（`pending_upload`），处理完再 `complete`（`completed`）。只有查询层
+内部的 seed/测试才直接构造 `FileRecord`。
+
+### 3.1 订阅 & 通知数据模型
+
+除了文件表，Member D 还维护两张表（同样 SQLite / DynamoDB 双后端）：
+
+**订阅表 `subscriptions`** —— 用户订阅某个物种标签：
+
+| 字段 | 类型 | 说明 |
+|------|------|------|
+| `user_id` | string | Cognito `sub` |
+| `species` | string | 团队简化名（§2） |
+
+主键 `(user_id, species)`，幂等（重复订阅 = 无操作）。
+
+**通知表 `notifications`** —— 触发器写出的通知记录：
+
+| 字段 | 类型 | 说明 |
+|------|------|------|
+| `notification_id` | string | UUID |
+| `user_id` | string | 被通知的订阅者 |
+| `file_id` | string | 触发通知的文件 |
+| `species` | string | 命中的物种 |
+| `object_key` | string | 该文件原图 key |
+| `created_at` | string | ISO-8601 |
+
+---
+
+## 4. 四个集成插槽（已定义接口，填实现即可）
+
+### 4.1 成员 C — `TagDetector`
+
+接口：`app/tag_detector.py`，方法 `detect(file_name, content: bytes) -> dict[str, int]`。
+
+示例适配器：`examples/speciesnet_detector_example.py`（照抄填 TODO）。
+
+对接要点：返回的 key 必须是 §2 的**简化名**。接好后改 `app/main.py` 一行：
+
+```python
+from examples.speciesnet_detector_example import SpeciesNetDetector
+detector: TagDetector = SpeciesNetDetector()
+```
+
+### 4.2 成员 B — `StorageClient`
+
+接口：`app/storage_client.py`，方法 `delete(user_id: str, keys: list[str]) -> None`。
+
+作用：删文件时成员 D 负责删 DB 记录，同时调 `storage.delete(user_id, keys)` 删
+原图+缩略图（对应成员 B 的 guarded storage-delete Lambda，入参
+`{"user_id": ..., "keys": [...]}`）。批量删除跨多个用户时，D 会按 owner 分组、每个
+owner 单独调用，保证 B 的前缀所有权校验（`originals/{user_id}/...`）通过。两边不留孤儿。
+
+### 4.3 成员 A — `get_current_user`
+
+每个**公开**路由都已经 `Depends(get_current_user)`，现在返回写死的 `"demo-user"`。
+内部状态机端点（§5.7）**不加**认证依赖，只由成员 B 的 Lambda 内部调用。
+
+真实 Cognito 配置（成员 A 提供，已写进 `examples/cognito_auth_example.py`）：
+
+| 参数 | 值 |
+|------|-----|
+| User Pool ID | `ap-southeast-2_1hGEJyYO7` |
+| Region | `ap-southeast-2` |
+| App Client ID | `65dgspco2djehpbpunc13t2oml` |
+| Issuer | `https://cognito-idp.ap-southeast-2.amazonaws.com/ap-southeast-2_1hGEJyYO7` |
+| JWKS | `https://cognito-idp.ap-southeast-2.amazonaws.com/ap-southeast-2_1hGEJyYO7/.well-known/jwks.json` |
+
+示例实现支持两种部署模式：
+
+1. **Lambda 模式**：API Gateway 的 `CognitoJWTAuthorizer` 已验过 token，直接读
+   `event["requestContext"]["authorizer"]["jwt"]["claims"]["sub"]`。
+2. **本地模式**：用 `cognitojwt` 自己验 Bearer token（本地开发加这个依赖）。
+
+接好后：未登录请求自动 401，且 `sub` 会一路流到 `FileRecord.user_id`。
+**成员 B 写库时 `user_id` 必须用 `claims.sub`，不是 email。**
+
+### 4.4 成员 E — `NotificationPublisher`（通知投递）
+
+接口：`app/notification_client.py`，方法 `publish(notification) -> None`。
+
+作用：新文件 `complete` 时，Member D 的触发器会匹配所有订阅并写一条通知记录，
+然后调 `publisher.publish(notification)` 真正送达用户。**投递通道（SNS / 邮件 /
+推送 / 站内 UI）由成员 E 实现**，D 只负责「触发」+「持久化」+「查询」。接好后改
+`app/main.py` 一行：
+
+```python
+from examples.sns_notification_example import SNSNotificationPublisher
+publisher: NotificationPublisher = SNSNotificationPublisher()
+```
+
+通知数据模型见 §3.1，订阅/通知端点见 §5.8。
+
+---
+
+## 5. API 契约（成员 E 前端照此调用）
+
+Base URL：本地 `http://localhost:8000`；云端是 API Gateway HTTP API
+`PacificBioArchive-HTTP-API`（API ID `2dd2aqb32j`，成员 A 提供），所有公开路由都挂
+`CognitoJWTAuthorizer`，请求头带 `Authorization: Bearer <id_token>`。
+
+统一错误格式：`{"detail": "<message>"}`，未认证 `401`，资源不存在 `404`。
+
+**路由对齐**（成员 A 文档里的简称 → 我们的完整路径）：
+
+| 成员 A 文档写法 | 我们的实际路径 | 说明 |
+|-----------------|----------------|------|
+| `POST /query` | `POST /query/by-tags` | 按 tags + 最低数量（AND） |
+| — | `POST /query/by-species` | 按单个物种（A 文档未列） |
+| — | `GET /query/by-thumbnail` | 缩略图 key→原图 key（A 文档未列） |
+| `POST /query-by-file` | `POST /query/by-file` | 一致 |
+| `POST /tags` | `POST /tags/edit` | 批量加/删 tag |
+| `DELETE /files` | `POST /files/delete` | 批量删除 |
+
+### 5.1 按标签查询（含最低数量，AND）
+
+```
+POST /query/by-tags
+{"tags": {"dingo": 1, "wombat": 1}}
+```
+
+响应（图片给缩略图 key，视频给原图 key）：
+
+```json
+{"results": ["thumbnails/u1/a1.jpg", "originals/u1/v1.mp4"], "count": 2}
+```
+
+### 5.2 按物种查询（≥1 只）
+
+```
+POST /query/by-species
+{"species": "magpie"}
+```
+
+响应同上。
+
+### 5.3 缩略图 key → 原图 key
+
+```
+GET /query/by-thumbnail?key=thumbnails%2Fu1%2Fa1.jpg
+```
+
+响应：`{"original_key": "originals/u1/a1.jpg", "file_id": "f1"}`
+
+### 5.4 按上传文件查询（不落库）
+
+```
+POST /query/by-file        (multipart/form-data, 字段名 file)
+```
+
+响应：`{"results": [...], "count": N}`。上传的查询文件**不会**被存进数据库。
+
+### 5.5 批量改标签
+
+```
+POST /tags/edit
+{"keys": ["originals/u1/a1.jpg"], "tags": ["dingo"], "operation": 1}
+```
+
+`operation`：`1`=添加，`0`=删除。删除不存在的 tag 会被忽略（不报错）。
+
+响应：`{"updated": 1, "matched_keys": ["originals/u1/a1.jpg"]}`
+
+### 5.6 批量删除
+
+```
+POST /files/delete
+{"keys": ["originals/u1/a5.jpg"]}
+```
+
+响应：`{"deleted_db_records": 1, "storage_objects_removed": 2}`
+
+### 5.7 内部元数据状态机（成员 B 上传/处理 Lambda 调用）
+
+这 4 个端点对应成员 B 的 `docs/member-b/api-contracts.md`，**不加认证**（内部），
+是成员 B 写库的唯一入口。
+
+**① 预约上传（reserve）**
+
+```
+POST /internal/uploads/reserve
+{"file_id": "<uuid>", "user_id": "<cognito-sub>", "checksum": "<base64 sha256>",
+ "filename": "wombat.jpg", "file_type": "image", "content_type": "image/jpeg",
+ "size_bytes": 2849132, "object_key": "originals/<sub>/<uuid>/wombat.jpg",
+ "status": "pending_upload"}
+```
+
+- `201` → 预约成功，落一条 `pending_upload` 记录。
+- `409` → `(user_id, checksum)` 已存在，返回 `{"existing_file_id": "<uuid>"}`。
+
+**② 获取处理租约（processing）**
+
+```
+POST /internal/files/{file_id}/processing
+{"user_id": "<sub>", "object_key": "originals/.../wombat.jpg", "sequencer": "<S3事件序列号>"}
+```
+
+- `200 {"should_process": true}` → 可以处理（刚预约 / 上次失败 / 租约已过期）。
+- `200 {"should_process": false}` → 已完成，或已有活跃租约（不重复处理）。
+- 租约窗口 900 秒（对应成员 B 处理 Lambda 的 900s 超时）。
+
+**③ 完成处理（complete，幂等 PUT）**
+
+```
+PUT /internal/files/{file_id}/complete
+{"user_id": "<sub>", "file_type": "image",
+ "original_key": "originals/.../wombat.jpg",
+ "thumbnail_key": "thumbnails/.../thumbnail.jpg",     // 视频为 null
+ "tags": {"wombat": 2},
+ "detections": [{"species": "wombat", "confidence": 0.94}],
+ "model_version": "speciesnet-v1", "status": "completed"}
+```
+
+- `200 {}` → 已标记 `completed`。重复调用幂等，不重复生效。
+
+**④ 记录失败（failed，幂等 PUT）**
+
+```
+PUT /internal/files/{file_id}/failed
+{"user_id": "<sub>", "error_code": "FRAME_EXTRACTION_FAILED",
+ "message": "<诊断信息，自动截断到 240 字符>", "status": "failed"}
+```
+
+- `200 {}` → 已标记 `failed`。`error_code` 取值：`INVALID_MEDIA` /
+  `FRAME_EXTRACTION_FAILED` / `INFERENCE_FAILED`。已 `completed` 的文件不会被降级为 `failed`。
+
+### 5.8 订阅 & 通知（成员 E 前端调用）
+
+**订阅一个物种**
+
+```
+POST /notifications/subscribe
+{"user_id": "<sub>", "species": "wombat"}
+```
+
+- `201 {"user_id": ..., "species": ..., "subscribed": true}`（幂等，重复订阅无副作用）。
+
+**取消订阅**
+
+```
+DELETE /notifications/subscribe?user_id=<sub>&species=wombat
+```
+
+- `200 {"user_id": ..., "species": ..., "subscribed": false}`（幂等）。
+
+**列出我的订阅**
+
+```
+GET /notifications/subscriptions?user_id=<sub>
+```
+
+- `200 {"species": ["wombat", "magpie"], "count": 2}`
+
+**列出我的通知**
+
+```
+GET /notifications?user_id=<sub>
+```
+
+- `200 {"notifications": [{"notification_id": ..., "user_id": ..., "file_id": ...,
+  "species": "wombat", "object_key": "...", "created_at": "..."}], "count": 1}`（新的在前）
+
+**触发时机**：当成员 B 对某个文件调用 `complete`（§5.7③）且该文件的 `tags` 里有
+数量 ≥1 的物种时，Member D 会为**每个订阅了该物种的用户**写一条通知并调
+`NotificationPublisher.publish` 投递（§4.4）。完成是幂等的，所以重放不会重复通知。
+
+---
+
+## 6. 端到端流程（谁在哪个节点做什么）
+
+```
+用户上传文件
+   └─> 成员 B 上传 Lambda：POST /internal/uploads/reserve（去重 + 预约，§5.7①）
+          └─> S3 存原图 → ObjectCreated 事件触发处理 Lambda
+          └─> 处理 Lambda：POST /internal/files/{id}/processing（取租约，§5.7②）
+          └─> 抽帧/生成缩略图（成员 B）→ 调成员 C /infer 识别（§4.1）→ 得到 tags
+          └─> 处理 Lambda：PUT /internal/files/{id}/complete（写结果，§5.7③）
+                └─> 成员 D 触发器：匹配订阅 → 写通知 + publish（§5.8）
+                └─> 失败则 PUT /internal/files/{id}/failed（§5.7④）
+用户查询
+   └─> 前端（成员 E）→ 成员 A 验证 token → 成员 D 的查询端点（§5.1–5.4）
+用户订阅/查看通知
+   └─> 前端（成员 E）→ POST /notifications/subscribe、GET /notifications（§5.8）
+用户删除
+   └─> 成员 D 删 DB 记录 + 按 owner 调成员 B 的 StorageClient 删 S3 对象（§4.2）
+```
+
+---
+
+## 7. 本地快速验证
+
+```bash
+cd db-query-api
+pip install -r requirements.txt
+python seed.py
+python -m uvicorn app.main:app --reload --port 8000
+# 打开 http://localhost:8000/docs 有每个端点的在线调试表单
+# 或导入 postman_collection.json
+```
+
+跑测试：`python -m pytest tests/ -v`
