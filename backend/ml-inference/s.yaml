@@ -1,0 +1,46 @@
+edition: 3.0.0
+name: pacific-bioarchive-ml
+access: default
+
+vars:
+  region: ap-southeast-1
+  image: registry.example.com/pacific-bioarchive/ml-inference:v1
+
+resources:
+  ml_inference:
+    component: fc3
+    props:
+      region: ${vars.region}
+      functionName: pacific-bioarchive-ml
+      description: Pacific BioArchive member C ML inference service
+      runtime: custom-container
+      timeout: 60
+      memorySize: 4096
+      cpu: 2
+      diskSize: 2048
+      caPort: 9000
+      internetAccess: true
+      instanceConcurrency: 2
+      customContainerConfig:
+        image: ${vars.image}
+        command: ["python", "-m", "app"]
+        args: []
+      environmentVariables:
+        PORT: "9000"
+        INFERENCE_BACKEND: speciesnet
+        ANIMAL_DETECTOR: megadetector
+        MODEL_VERSION: v1
+        MODEL_PATH: /app/models/model.pt
+        DETECTOR_MODEL_PATH: /app/models/mdv5a.pt
+        LABELS_PATH: /app/config/labels.txt
+        MAX_SOURCE_URLS: "900"
+        INTERNAL_API_KEY: ${env(INTERNAL_API_KEY)}
+      triggers:
+        - triggerName: http
+          triggerType: http
+          qualifier: LATEST
+          triggerConfig:
+            authType: anonymous
+            methods:
+              - GET
+              - POST

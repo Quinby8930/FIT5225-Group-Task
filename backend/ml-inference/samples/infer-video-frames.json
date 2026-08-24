@@ -1,0 +1,8 @@
+{
+  "file_id": "11111111-2222-4333-8444-555555555555",
+  "media_type": "video",
+  "image_urls": [
+    "https://temporary-frame-url-1.example/frame.jpg",
+    "https://temporary-frame-url-2.example/frame.jpg"
+  ]
+}

@@ -1,0 +1,4 @@
+-r requirements.txt
+-r requirements-model-runtime.txt
+pytest>=8.0,<9
+pytest-cov>=5.0,<7
