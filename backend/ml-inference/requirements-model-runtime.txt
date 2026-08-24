@@ -1,0 +1,3 @@
+# The supplied model.pt pickle imports onnx2torch during torch.load.
+onnx==1.22.0
+onnx2torch==1.5.15

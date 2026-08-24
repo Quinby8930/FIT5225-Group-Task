@@ -1,0 +1,14 @@
+__pycache__/
+*.py[cod]
+.DS_Store
+.pytest_cache/
+.coverage
+coverage.xml
+.venv/
+venv/
+.env
+models/*.pt
+models/*.pth
+models/*.onnx
+logs/
+*.log

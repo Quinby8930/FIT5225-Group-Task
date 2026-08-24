@@ -1,0 +1,538 @@
+{
+  "model_version": "provided-v1",
+  "detector_mode": "megadetector",
+  "image_count": 30,
+  "top1_matches": 27,
+  "top1_accuracy": 0.9,
+  "total_elapsed_ms": 27392.55,
+  "results": [
+    {
+      "file": "test_images/Alectura_lathami_1.JPG",
+      "expected_label": "Alectura_lathami",
+      "predicted_label": "Alectura_lathami",
+      "match": true,
+      "tags": {
+        "Alectura_lathami": 1
+      },
+      "detections": [
+        {
+          "species": "Alectura_lathami",
+          "confidence": 0.999954
+        }
+      ],
+      "elapsed_ms": 1104.6
+    },
+    {
+      "file": "test_images/Alectura_lathami_2.JPG",
+      "expected_label": "Alectura_lathami",
+      "predicted_label": "Alectura_lathami",
+      "match": true,
+      "tags": {
+        "Alectura_lathami": 1
+      },
+      "detections": [
+        {
+          "species": "Alectura_lathami",
+          "confidence": 0.999984
+        }
+      ],
+      "elapsed_ms": 876.53
+    },
+    {
+      "file": "test_images/Bos_taurus_1.JPG",
+      "expected_label": "Bos_taurus",
+      "predicted_label": "Bos_taurus",
+      "match": true,
+      "tags": {
+        "Bos_taurus": 6
+      },
+      "detections": [
+        {
+          "species": "Bos_taurus",
+          "confidence": 0.999948
+        },
+        {
+          "species": "Bos_taurus",
+          "confidence": 0.999412
+        },
+        {
+          "species": "Bos_taurus",
+          "confidence": 1.0
+        },
+        {
+          "species": "Bos_taurus",
+          "confidence": 0.9982
+        },
+        {
+          "species": "Bos_taurus",
+          "confidence": 0.999956
+        },
+        {
+          "species": "Bos_taurus",
+          "confidence": 0.999977
+        }
+      ],
+      "elapsed_ms": 1559.88
+    },
+    {
+      "file": "test_images/Bos_taurus_2.JPG",
+      "expected_label": "Bos_taurus",
+      "predicted_label": "Bos_taurus",
+      "match": true,
+      "tags": {
+        "Bos_taurus": 8
+      },
+      "detections": [
+        {
+          "species": "Bos_taurus",
+          "confidence": 1.0
+        },
+        {
+          "species": "Bos_taurus",
+          "confidence": 1.0
+        },
+        {
+          "species": "Bos_taurus",
+          "confidence": 0.999999
+        },
+        {
+          "species": "Bos_taurus",
+          "confidence": 0.999997
+        },
+        {
+          "species": "Bos_taurus",
+          "confidence": 1.0
+        },
+        {
+          "species": "Bos_taurus",
+          "confidence": 1.0
+        },
+        {
+          "species": "Bos_taurus",
+          "confidence": 1.0
+        },
+        {
+          "species": "Bos_taurus",
+          "confidence": 1.0
+        }
+      ],
+      "elapsed_ms": 1863.48
+    },
+    {
+      "file": "test_images/Canis_familiaris_3.JPG",
+      "expected_label": "Canis_familiaris",
+      "predicted_label": "Canis_familiaris",
+      "match": true,
+      "tags": {
+        "Canis_familiaris": 1
+      },
+      "detections": [
+        {
+          "species": "Canis_familiaris",
+          "confidence": 0.732644
+        }
+      ],
+      "elapsed_ms": 763.84
+    },
+    {
+      "file": "test_images/Canis_familiaris_4.JPG",
+      "expected_label": "Canis_familiaris",
+      "predicted_label": "Canis_dingo",
+      "match": false,
+      "tags": {
+        "Canis_dingo": 1
+      },
+      "detections": [
+        {
+          "species": "Canis_dingo",
+          "confidence": 0.998667
+        }
+      ],
+      "elapsed_ms": 878.78
+    },
+    {
+      "file": "test_images/Casuarius_casuarius_1.JPG",
+      "expected_label": "Casuarius_casuarius",
+      "predicted_label": "Casuarius_casuarius",
+      "match": true,
+      "tags": {
+        "Casuarius_casuarius": 1
+      },
+      "detections": [
+        {
+          "species": "Casuarius_casuarius",
+          "confidence": 1.0
+        }
+      ],
+      "elapsed_ms": 823.99
+    },
+    {
+      "file": "test_images/Casuarius_casuarius_2.JPG",
+      "expected_label": "Casuarius_casuarius",
+      "predicted_label": "Casuarius_casuarius",
+      "match": true,
+      "tags": {
+        "Casuarius_casuarius": 1
+      },
+      "detections": [
+        {
+          "species": "Casuarius_casuarius",
+          "confidence": 1.0
+        }
+      ],
+      "elapsed_ms": 877.09
+    },
+    {
+      "file": "test_images/Felis_catus_3.JPG",
+      "expected_label": "Felis_catus",
+      "predicted_label": "Felis_catus",
+      "match": true,
+      "tags": {
+        "Felis_catus": 1
+      },
+      "detections": [
+        {
+          "species": "Felis_catus",
+          "confidence": 0.996559
+        }
+      ],
+      "elapsed_ms": 865.72
+    },
+    {
+      "file": "test_images/Felis_catus_4.JPG",
+      "expected_label": "Felis_catus",
+      "predicted_label": "Varanus_varius",
+      "match": false,
+      "tags": {
+        "Varanus_varius": 1
+      },
+      "detections": [
+        {
+          "species": "Varanus_varius",
+          "confidence": 0.999312
+        }
+      ],
+      "elapsed_ms": 767.43
+    },
+    {
+      "file": "test_images/Heteromyias_cinereifrons_1.JPG",
+      "expected_label": "Heteromyias_cinereifrons",
+      "predicted_label": "Heteromyias_cinereifrons",
+      "match": true,
+      "tags": {
+        "Heteromyias_cinereifrons": 1
+      },
+      "detections": [
+        {
+          "species": "Heteromyias_cinereifrons",
+          "confidence": 1.0
+        }
+      ],
+      "elapsed_ms": 819.03
+    },
+    {
+      "file": "test_images/Heteromyias_cinereifrons_2.JPG",
+      "expected_label": "Heteromyias_cinereifrons",
+      "predicted_label": "Heteromyias_cinereifrons",
+      "match": true,
+      "tags": {
+        "Heteromyias_cinereifrons": 1
+      },
+      "detections": [
+        {
+          "species": "Heteromyias_cinereifrons",
+          "confidence": 0.999931
+        }
+      ],
+      "elapsed_ms": 805.2
+    },
+    {
+      "file": "test_images/Hypsiprymnodon_moschatus_1.JPG",
+      "expected_label": "Hypsiprymnodon_moschatus",
+      "predicted_label": "Hypsiprymnodon_moschatus",
+      "match": true,
+      "tags": {
+        "Hypsiprymnodon_moschatus": 1
+      },
+      "detections": [
+        {
+          "species": "Hypsiprymnodon_moschatus",
+          "confidence": 0.997337
+        }
+      ],
+      "elapsed_ms": 826.72
+    },
+    {
+      "file": "test_images/Hypsiprymnodon_moschatus_2.JPG",
+      "expected_label": "Hypsiprymnodon_moschatus",
+      "predicted_label": "Hypsiprymnodon_moschatus",
+      "match": true,
+      "tags": {
+        "Hypsiprymnodon_moschatus": 1
+      },
+      "detections": [
+        {
+          "species": "Hypsiprymnodon_moschatus",
+          "confidence": 0.999999
+        }
+      ],
+      "elapsed_ms": 829.38
+    },
+    {
+      "file": "test_images/Hypsiprymnodon_moschatus_3.JPG",
+      "expected_label": "Hypsiprymnodon_moschatus",
+      "predicted_label": "Hypsiprymnodon_moschatus",
+      "match": true,
+      "tags": {
+        "Hypsiprymnodon_moschatus": 1
+      },
+      "detections": [
+        {
+          "species": "Hypsiprymnodon_moschatus",
+          "confidence": 0.999617
+        }
+      ],
+      "elapsed_ms": 800.46
+    },
+    {
+      "file": "test_images/Megapodius_reinwardt_1.JPG",
+      "expected_label": "Megapodius_reinwardt",
+      "predicted_label": "Megapodius_reinwardt",
+      "match": true,
+      "tags": {
+        "Megapodius_reinwardt": 1
+      },
+      "detections": [
+        {
+          "species": "Megapodius_reinwardt",
+          "confidence": 0.99999
+        }
+      ],
+      "elapsed_ms": 816.51
+    },
+    {
+      "file": "test_images/Megapodius_reinwardt_2.JPG",
+      "expected_label": "Megapodius_reinwardt",
+      "predicted_label": "Megapodius_reinwardt",
+      "match": true,
+      "tags": {
+        "Megapodius_reinwardt": 1
+      },
+      "detections": [
+        {
+          "species": "Megapodius_reinwardt",
+          "confidence": 0.999871
+        }
+      ],
+      "elapsed_ms": 912.97
+    },
+    {
+      "file": "test_images/Megapodius_reinwardt_3.JPG",
+      "expected_label": "Megapodius_reinwardt",
+      "predicted_label": "Megapodius_reinwardt",
+      "match": true,
+      "tags": {
+        "Megapodius_reinwardt": 1
+      },
+      "detections": [
+        {
+          "species": "Megapodius_reinwardt",
+          "confidence": 0.999992
+        }
+      ],
+      "elapsed_ms": 884.18
+    },
+    {
+      "file": "test_images/Orthonyx_spaldingii_1.JPG",
+      "expected_label": "Orthonyx_spaldingii",
+      "predicted_label": "Orthonyx_spaldingii",
+      "match": true,
+      "tags": {
+        "Orthonyx_spaldingii": 1
+      },
+      "detections": [
+        {
+          "species": "Orthonyx_spaldingii",
+          "confidence": 1.0
+        }
+      ],
+      "elapsed_ms": 822.62
+    },
+    {
+      "file": "test_images/Orthonyx_spaldingii_2.JPG",
+      "expected_label": "Orthonyx_spaldingii",
+      "predicted_label": "Orthonyx_spaldingii",
+      "match": true,
+      "tags": {
+        "Orthonyx_spaldingii": 1
+      },
+      "detections": [
+        {
+          "species": "Orthonyx_spaldingii",
+          "confidence": 0.999999
+        }
+      ],
+      "elapsed_ms": 800.73
+    },
+    {
+      "file": "test_images/Perameles_nasuta_1.JPG",
+      "expected_label": "Perameles_nasuta",
+      "predicted_label": "Perameles_nasuta",
+      "match": true,
+      "tags": {
+        "Perameles_nasuta": 1
+      },
+      "detections": [
+        {
+          "species": "Perameles_nasuta",
+          "confidence": 0.999971
+        }
+      ],
+      "elapsed_ms": 883.77
+    },
+    {
+      "file": "test_images/Perameles_nasuta_2.JPG",
+      "expected_label": "Perameles_nasuta",
+      "predicted_label": "Perameles_nasuta",
+      "match": true,
+      "tags": {
+        "Perameles_nasuta": 1
+      },
+      "detections": [
+        {
+          "species": "Perameles_nasuta",
+          "confidence": 0.999996
+        }
+      ],
+      "elapsed_ms": 809.6
+    },
+    {
+      "file": "test_images/Perameles_nasuta_3.JPG",
+      "expected_label": "Perameles_nasuta",
+      "predicted_label": "Wallabia_bicolor",
+      "match": false,
+      "tags": {
+        "Wallabia_bicolor": 1
+      },
+      "detections": [
+        {
+          "species": "Wallabia_bicolor",
+          "confidence": 0.657966
+        }
+      ],
+      "elapsed_ms": 786.94
+    },
+    {
+      "file": "test_images/Sus_scrofa_1.JPG",
+      "expected_label": "Sus_scrofa",
+      "predicted_label": "Sus_scrofa",
+      "match": true,
+      "tags": {
+        "Sus_scrofa": 1
+      },
+      "detections": [
+        {
+          "species": "Sus_scrofa",
+          "confidence": 1.0
+        }
+      ],
+      "elapsed_ms": 892.51
+    },
+    {
+      "file": "test_images/Sus_scrofa_2.JPG",
+      "expected_label": "Sus_scrofa",
+      "predicted_label": "Sus_scrofa",
+      "match": true,
+      "tags": {
+        "Sus_scrofa": 1
+      },
+      "detections": [
+        {
+          "species": "Sus_scrofa",
+          "confidence": 1.0
+        }
+      ],
+      "elapsed_ms": 880.98
+    },
+    {
+      "file": "test_images/Thylogale_stigmatica_1.JPG",
+      "expected_label": "Thylogale_stigmatica",
+      "predicted_label": "Thylogale_stigmatica",
+      "match": true,
+      "tags": {
+        "Thylogale_stigmatica": 1
+      },
+      "detections": [
+        {
+          "species": "Thylogale_stigmatica",
+          "confidence": 0.999921
+        }
+      ],
+      "elapsed_ms": 825.23
+    },
+    {
+      "file": "test_images/Thylogale_stigmatica_2.JPG",
+      "expected_label": "Thylogale_stigmatica",
+      "predicted_label": "Thylogale_stigmatica",
+      "match": true,
+      "tags": {
+        "Thylogale_stigmatica": 1
+      },
+      "detections": [
+        {
+          "species": "Thylogale_stigmatica",
+          "confidence": 0.998703
+        }
+      ],
+      "elapsed_ms": 814.18
+    },
+    {
+      "file": "test_images/Thylogale_stigmatica_3.JPG",
+      "expected_label": "Thylogale_stigmatica",
+      "predicted_label": "Thylogale_stigmatica",
+      "match": true,
+      "tags": {
+        "Thylogale_stigmatica": 1
+      },
+      "detections": [
+        {
+          "species": "Thylogale_stigmatica",
+          "confidence": 0.999845
+        }
+      ],
+      "elapsed_ms": 886.94
+    },
+    {
+      "file": "test_images/Uromys_caudimaculatus_3.JPG",
+      "expected_label": "Uromys_caudimaculatus",
+      "predicted_label": "Uromys_caudimaculatus",
+      "match": true,
+      "tags": {
+        "Uromys_caudimaculatus": 1
+      },
+      "detections": [
+        {
+          "species": "Uromys_caudimaculatus",
+          "confidence": 1.0
+        }
+      ],
+      "elapsed_ms": 795.99
+    },
+    {
+      "file": "test_images/Uromys_caudimaculatus_4.JPG",
+      "expected_label": "Uromys_caudimaculatus",
+      "predicted_label": "Uromys_caudimaculatus",
+      "match": true,
+      "tags": {
+        "Uromys_caudimaculatus": 1
+      },
+      "detections": [
+        {
+          "species": "Uromys_caudimaculatus",
+          "confidence": 0.875116
+        }
+      ],
+      "elapsed_ms": 899.25
+    }
+  ]
+}

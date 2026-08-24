@@ -1,0 +1,11 @@
+services:
+  ml-inference:
+    build: .
+    ports:
+      - "8080:8080"
+    env_file:
+      - .env
+    volumes:
+      - ./models:/app/models:ro
+    restart: unless-stopped
+
