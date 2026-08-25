@@ -32,13 +32,14 @@ is installed.
 
 from __future__ import annotations
 
+import hmac
 from datetime import timedelta
 
-from fastapi import Depends, FastAPI, HTTPException, UploadFile
+from fastapi import Depends, FastAPI, Header, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
-from app.config import settings
+from app.config import Settings, settings
 from app.repository import (
     DynamoDBNotificationRepository,
     NotificationRepository,
@@ -74,6 +75,7 @@ from app.services.query_service import (
     to_display_keys,
 )
 from app.storage_client import StorageClient, StubStorageClient
+from app.species import get_mapper
 from app.tag_detector import StubTagDetector, TagDetector
 from examples.cognito_auth_example import build_get_current_user
 
@@ -89,6 +91,14 @@ app.add_middleware(
 # Processing lease window matches Member B's media-processing Lambda timeout.
 LEASE_SECONDS = 900
 FAILED_MESSAGE_MAX_CHARS = 240
+FORBIDDEN_OWNER_DETAIL = {
+    "code": "FORBIDDEN_OWNER",
+    "message": "media is not owned by the authenticated user",
+}
+METADATA_CONFLICT_DETAIL = {
+    "code": "METADATA_CONFLICT",
+    "message": "request metadata does not match the reserved file",
+}
 
 
 # ---------------------------------------------------------------------------
@@ -149,7 +159,76 @@ def get_publisher() -> NotificationPublisher:
     return publisher
 
 
+def get_settings() -> Settings:
+    return settings
+
+
+def require_internal_api_key(
+    x_internal_api_key: str | None = Header(
+        default=None, alias="X-Internal-Api-Key"
+    ),
+    settings_: Settings = Depends(get_settings),
+) -> None:
+    if not settings_.internal_api_key:
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "code": "INTERNAL_AUTH_NOT_CONFIGURED",
+                "message": "internal API key is not configured",
+            },
+        )
+    if x_internal_api_key is None or not hmac.compare_digest(
+        x_internal_api_key, settings_.internal_api_key
+    ):
+        raise HTTPException(
+            status_code=401,
+            detail={
+                "code": "INVALID_INTERNAL_API_KEY",
+                "message": "invalid internal API key",
+            },
+        )
+
+
 get_current_user = build_get_current_user()
+
+
+def _normalise_species(species: str) -> str:
+    return get_mapper().common_name(species)
+
+
+def _normalise_tags(tags: dict[str, int]) -> dict[str, int]:
+    normalised: dict[str, int] = {}
+    for species, count in tags.items():
+        short_name = _normalise_species(species)
+        normalised[short_name] = normalised.get(short_name, 0) + count
+    return normalised
+
+
+def _normalise_detections(detections: list[dict]) -> list[dict]:
+    return [
+        {
+            **detection,
+            "species": _normalise_species(detection["species"]),
+        }
+        if isinstance(detection.get("species"), str)
+        else dict(detection)
+        for detection in detections
+    ]
+
+
+def _require_matching_metadata(
+    record: FileRecord,
+    *,
+    user_id: str,
+    object_key: str | None = None,
+    file_type: str | None = None,
+) -> None:
+    if (
+        record.user_id != user_id
+        or (object_key is not None and record.object_key != object_key)
+        or (file_type is not None and record.file_type != file_type)
+    ):
+        raise HTTPException(status_code=409, detail=METADATA_CONFLICT_DETAIL)
 
 
 # ---------------------------------------------------------------------------
@@ -222,10 +301,13 @@ def edit_tags(
     _user: str = Depends(get_current_user),
 ) -> dict:
     records = repo_.by_keys(body.keys)
+    if any(record.user_id != _user for record in records):
+        raise HTTPException(status_code=403, detail=FORBIDDEN_OWNER_DETAIL)
+    normalised_tags = [_normalise_species(tag) for tag in body.tags]
     updated = 0
     for record in records:
         tags = dict(record.tags)
-        for tag in body.tags:
+        for tag in normalised_tags:
             if body.operation == 1:  # add
                 tags[tag] = tags.get(tag, 0) + 1
             else:  # remove — ignore tags that aren't present (spec requirement)
@@ -243,22 +325,23 @@ def delete_files(
     _user: str = Depends(get_current_user),
 ) -> dict:
     records = repo_.by_keys(body.keys)
-    file_ids = [r.file_id for r in records]
-    # Remove both sides: database entries AND storage objects.
-    removed_db = repo_.delete_by_ids(file_ids)
-    # Group objects by owner so Member B's guarded delete Lambda can enforce its
-    # per-user key-prefix ownership check (originals/{user_id}/...).
-    by_owner: dict[str, list[str]] = {}
+    if any(record.user_id != _user for record in records):
+        raise HTTPException(status_code=403, detail=FORBIDDEN_OWNER_DETAIL)
+    keys_to_delete: list[str] = []
     for record in records:
         keys = [record.object_key] + (
             [record.thumbnail_key] if record.thumbnail_key else []
         )
-        by_owner.setdefault(record.user_id, []).extend(keys)
-    total_objects = 0
-    for owner, keys in by_owner.items():
-        storage_.delete(owner, keys)
-        total_objects += len(keys)
-    return {"deleted_db_records": removed_db, "storage_objects_removed": total_objects}
+        keys_to_delete.extend(keys)
+    # Delete storage first so a storage failure cannot leave orphaned objects
+    # after their metadata has already disappeared.
+    if keys_to_delete:
+        storage_.delete(_user, keys_to_delete)
+    removed_db = repo_.delete_by_ids([record.file_id for record in records])
+    return {
+        "deleted_db_records": removed_db,
+        "storage_objects_removed": len(keys_to_delete),
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -270,38 +353,37 @@ def subscribe(
     notif_repo_: NotificationRepository = Depends(get_notification_repo),
     _user: str = Depends(get_current_user),
 ) -> dict:
-    notif_repo_.subscribe(body.user_id, body.species)
-    return {"user_id": body.user_id, "species": body.species, "subscribed": True}
+    species = _normalise_species(body.species)
+    notif_repo_.subscribe(_user, species)
+    return {"user_id": _user, "species": species, "subscribed": True}
 
 
 @app.delete("/notifications/subscribe")
 def unsubscribe(
-    user_id: str,
     species: str,
     notif_repo_: NotificationRepository = Depends(get_notification_repo),
     _user: str = Depends(get_current_user),
 ) -> dict:
-    notif_repo_.unsubscribe(user_id, species)
-    return {"user_id": user_id, "species": species, "subscribed": False}
+    species = _normalise_species(species)
+    notif_repo_.unsubscribe(_user, species)
+    return {"user_id": _user, "species": species, "subscribed": False}
 
 
 @app.get("/notifications/subscriptions", response_model=SubscriptionListResponse)
 def list_subscriptions(
-    user_id: str,
     notif_repo_: NotificationRepository = Depends(get_notification_repo),
     _user: str = Depends(get_current_user),
 ) -> SubscriptionListResponse:
-    species = notif_repo_.subscriptions(user_id)
+    species = notif_repo_.subscriptions(_user)
     return SubscriptionListResponse(species=species, count=len(species))
 
 
 @app.get("/notifications", response_model=NotificationListResponse)
 def list_notifications(
-    user_id: str,
     notif_repo_: NotificationRepository = Depends(get_notification_repo),
     _user: str = Depends(get_current_user),
 ) -> NotificationListResponse:
-    notifications = notif_repo_.notifications(user_id)
+    notifications = notif_repo_.notifications(_user)
     return NotificationListResponse(notifications=notifications, count=len(notifications))
 
 
@@ -312,6 +394,7 @@ def list_notifications(
 def reserve_upload(
     body: ReserveRequest,
     repo_: FileRepository = Depends(get_repo),
+    _internal_auth: None = Depends(require_internal_api_key),
 ) -> JSONResponse:
     existing = repo_.find_by_user_checksum(body.user_id, body.checksum)
     if existing is not None:
@@ -346,10 +429,14 @@ def acquire_processing(
     file_id: str,
     body: ProcessingRequest,
     repo_: FileRepository = Depends(get_repo),
+    _internal_auth: None = Depends(require_internal_api_key),
 ) -> dict:
     record = repo_.get(file_id)
     if record is None:
         raise HTTPException(status_code=404, detail="file not found")
+    _require_matching_metadata(
+        record, user_id=body.user_id, object_key=body.object_key
+    )
     if record.status == "completed":
         return {"should_process": False}
     now = utcnow()
@@ -370,26 +457,35 @@ def complete_processing(
     repo_: FileRepository = Depends(get_repo),
     notif_repo_: NotificationRepository = Depends(get_notification_repo),
     publisher_: NotificationPublisher = Depends(get_publisher),
+    _internal_auth: None = Depends(require_internal_api_key),
 ) -> dict:
     record = repo_.get(file_id)
     if record is None:
         raise HTTPException(status_code=404, detail="file not found")
+    _require_matching_metadata(
+        record,
+        user_id=body.user_id,
+        object_key=body.original_key,
+        file_type=body.file_type,
+    )
     if record.status == "completed":
         return {}  # idempotent: replaying completion is a no-op
+    tags = _normalise_tags(body.tags)
+    detections = _normalise_detections(body.detections)
     repo_.mark_completed(
         file_id,
         body.original_key,
         body.thumbnail_key,
         body.file_type,
-        body.tags,
-        body.detections,
+        tags,
+        detections,
         body.model_version,
     )
     # Notification trigger: notify every user subscribed to a species this file
     # newly detected. Runs only on the completed transition, so replays do not
     # produce duplicates.
     notifications = build_notifications(
-        file_id, body.original_key, body.tags, notif_repo_.subscribers_for_species
+        file_id, body.original_key, tags, notif_repo_.subscribers_for_species
     )
     for notification in notifications:
         notif_repo_.add_notification(notification)
@@ -402,10 +498,12 @@ def fail_processing(
     file_id: str,
     body: FailedRequest,
     repo_: FileRepository = Depends(get_repo),
+    _internal_auth: None = Depends(require_internal_api_key),
 ) -> dict:
     record = repo_.get(file_id)
     if record is None:
         raise HTTPException(status_code=404, detail="file not found")
+    _require_matching_metadata(record, user_id=body.user_id)
     if record.status == "completed":
         return {}  # never downgrade a completed file
     repo_.mark_failed(file_id, body.error_code, body.message[:FAILED_MESSAGE_MAX_CHARS])

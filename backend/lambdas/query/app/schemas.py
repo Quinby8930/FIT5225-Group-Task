@@ -104,7 +104,8 @@ class SubscribeRequest(BaseModel):
     user receives a notification.
     """
 
-    user_id: str
+    model_config = {"extra": "forbid"}
+
     species: str
 
 

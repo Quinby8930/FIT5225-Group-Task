@@ -23,6 +23,7 @@ use a GSI, but Scan is correct and simple for this assignment's data size.
 from __future__ import annotations
 
 from datetime import datetime
+from decimal import Decimal
 from typing import Optional
 
 from app.repository.base import DuplicateError, FileRepository
@@ -31,6 +32,48 @@ from app.schemas import FileRecord
 
 def _dt(value: Optional[str]) -> Optional[datetime]:
     return datetime.fromisoformat(value) if value else None
+
+
+def _scan_all(table, **kwargs) -> list[dict]:
+    items: list[dict] = []
+    while True:
+        response = table.scan(**kwargs)
+        items.extend(response.get("Items", []))
+        last_key = response.get("LastEvaluatedKey")
+        if not last_key:
+            return items
+        kwargs = {**kwargs, "ExclusiveStartKey": last_key}
+
+
+def _query_all(table, **kwargs) -> list[dict]:
+    items: list[dict] = []
+    while True:
+        response = table.query(**kwargs)
+        items.extend(response.get("Items", []))
+        last_key = response.get("LastEvaluatedKey")
+        if not last_key:
+            return items
+        kwargs = {**kwargs, "ExclusiveStartKey": last_key}
+
+
+def _float_to_decimal(value):
+    if isinstance(value, float):
+        return Decimal(str(value))
+    if isinstance(value, list):
+        return [_float_to_decimal(item) for item in value]
+    if isinstance(value, dict):
+        return {key: _float_to_decimal(item) for key, item in value.items()}
+    return value
+
+
+def _decimal_to_float(value):
+    if isinstance(value, Decimal):
+        return float(value)
+    if isinstance(value, list):
+        return [_decimal_to_float(item) for item in value]
+    if isinstance(value, dict):
+        return {key: _decimal_to_float(item) for key, item in value.items()}
+    return value
 
 
 class DynamoDBRepository(FileRepository):
@@ -63,7 +106,7 @@ class DynamoDBRepository(FileRepository):
             ),
             "upload_time": record.upload_time.isoformat(),
         }
-        return {k: v for k, v in item.items() if v is not None}
+        return _float_to_decimal({k: v for k, v in item.items() if v is not None})
 
     @staticmethod
     def _from_item(item: dict) -> FileRecord:
@@ -77,7 +120,7 @@ class DynamoDBRepository(FileRepository):
             content_type=item.get("content_type") or "",
             size_bytes=int(item.get("size_bytes") or 0),
             tags=item.get("tags") or {},
-            detections=item.get("detections") or [],
+            detections=_decimal_to_float(item.get("detections") or []),
             model_version=item.get("model_version") or "",
             checksum=item["checksum"],
             status=item.get("status") or "completed",
@@ -105,8 +148,7 @@ class DynamoDBRepository(FileRepository):
             raise DuplicateError(existing.file_id if existing else None) from exc
 
     def all(self) -> list[FileRecord]:
-        response = self._table.scan()
-        return [self._from_item(i) for i in response.get("Items", [])]
+        return [self._from_item(item) for item in _scan_all(self._table)]
 
     def get(self, file_id: str) -> Optional[FileRecord]:
         response = self._table.get_item(Key={"file_id": file_id})
@@ -114,37 +156,37 @@ class DynamoDBRepository(FileRepository):
         return self._from_item(item) if item else None
 
     def by_thumbnail_key(self, key: str) -> Optional[FileRecord]:
-        response = self._table.scan(
+        items = _scan_all(
+            self._table,
             FilterExpression="thumbnail_key = :k",
             ExpressionAttributeValues={":k": key},
         )
-        items = response.get("Items", [])
         return self._from_item(items[0]) if items else None
 
     def by_keys(self, keys: list[str]) -> list[FileRecord]:
         # DynamoDB has no OR/IN across two attributes; filter over the scan.
         wanted = set(keys)
         return [
-            self._from_item(i)
-            for i in self.all()
-            if i.get("object_key") in wanted or i.get("thumbnail_key") in wanted
+            record
+            for record in self.all()
+            if record.object_key in wanted or record.thumbnail_key in wanted
         ]
 
     def find_by_user_checksum(
         self, user_id: str, checksum: str
     ) -> Optional[FileRecord]:
-        response = self._table.scan(
+        items = _scan_all(
+            self._table,
             FilterExpression="user_id = :u AND checksum = :c",
             ExpressionAttributeValues={":u": user_id, ":c": checksum},
         )
-        items = response.get("Items", [])
         return self._from_item(items[0]) if items else None
 
     def update_tags(self, file_id: str, tags: dict[str, int]) -> None:
         self._table.update_item(
             Key={"file_id": file_id},
             UpdateExpression="SET tags = :t",
-            ExpressionAttributeValues={":t": tags},
+            ExpressionAttributeValues={":t": _float_to_decimal(tags)},
         )
 
     def mark_processing(
@@ -179,7 +221,7 @@ class DynamoDBRepository(FileRepository):
             ":o": original_key,
             ":ft": file_type,
             ":t": tags,
-            ":d": detections,
+            ":d": _float_to_decimal(detections),
             ":m": model_version,
         }
         set_expr = (

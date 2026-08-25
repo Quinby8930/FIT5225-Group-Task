@@ -22,6 +22,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
+from app.repository.dynamodb_repo import _query_all, _scan_all
 from app.schemas import Notification
 
 
@@ -174,18 +175,20 @@ class DynamoDBNotificationRepository(NotificationRepository):
         )
 
     def subscriptions(self, user_id: str) -> list[str]:
-        response = self._subscriptions.query(
+        items = _query_all(
+            self._subscriptions,
             KeyConditionExpression="user_id = :u",
             ExpressionAttributeValues={":u": user_id},
         )
-        return sorted(i["species"] for i in response.get("Items", []))
+        return sorted(item["species"] for item in items)
 
     def subscribers_for_species(self, species: str) -> list[str]:
-        response = self._subscriptions.scan(
+        items = _scan_all(
+            self._subscriptions,
             FilterExpression="species = :s",
             ExpressionAttributeValues={":s": species},
         )
-        return sorted(i["user_id"] for i in response.get("Items", []))
+        return sorted(item["user_id"] for item in items)
 
     def add_notification(self, notification: Notification) -> None:
         self._notifications.put_item(
@@ -200,11 +203,11 @@ class DynamoDBNotificationRepository(NotificationRepository):
         )
 
     def notifications(self, user_id: str) -> list[Notification]:
-        response = self._notifications.query(
+        items = _query_all(
+            self._notifications,
             KeyConditionExpression="user_id = :u",
             ExpressionAttributeValues={":u": user_id},
         )
-        items = response.get("Items", [])
         result = [
             Notification(
                 notification_id=i["notification_id"],

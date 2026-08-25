@@ -11,6 +11,9 @@ from dataclasses import dataclass
 
 @dataclass(frozen=True)
 class Settings:
+    # Shared secret used only by Member B when calling Member D's internal API.
+    internal_api_key: str = os.getenv("INTERNAL_API_KEY", "")
+
     # Which repository backend to use: "sqlite" (local) or "dynamodb" (cloud).
     repository_backend: str = os.getenv("REPO_BACKEND", "sqlite")
 

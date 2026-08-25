@@ -124,15 +124,20 @@ detector: TagDetector = SpeciesNetDetector()
 
 接口：`app/storage_client.py`，方法 `delete(user_id: str, keys: list[str]) -> None`。
 
-作用：删文件时成员 D 负责删 DB 记录，同时调 `storage.delete(user_id, keys)` 删
-原图+缩略图（对应成员 B 的 guarded storage-delete Lambda，入参
-`{"user_id": ..., "keys": [...]}`）。批量删除跨多个用户时，D 会按 owner 分组、每个
-owner 单独调用，保证 B 的前缀所有权校验（`originals/{user_id}/...`）通过。两边不留孤儿。
+作用：删文件时成员 D 先调 `storage.delete(user_id, keys)` 删除原图+缩略图，成功后
+再删 DB 记录（对应成员 B 的 guarded storage-delete Lambda，入参
+`{"user_id": ..., "keys": [...]}`）。公开删除只允许 Cognito `sub` 与记录 owner
+一致；请求中只要有一条外部 owner 记录，整批返回 `403 FORBIDDEN_OWNER` 且不产生副作用。
 
 ### 4.3 成员 A — `get_current_user`
 
-每个**公开**路由都已经 `Depends(get_current_user)`，现在返回写死的 `"demo-user"`。
-内部状态机端点（§5.7）**不加**认证依赖，只由成员 B 的 Lambda 内部调用。
+每个**公开**路由都使用 `Depends(get_current_user)`。标签编辑、文件删除、订阅和通知
+操作都只使用已验证的 Cognito `sub`，不接受客户端提供的 `user_id`。
+
+内部状态机端点（§5.7）由成员 B 的 Lambda 调用，并统一要求
+`X-Internal-Api-Key`。D 的环境变量 `INTERNAL_API_KEY` 未设置/为空时返回 `503`；
+其 `detail.code` 为 `INTERNAL_AUTH_NOT_CONFIGURED`。header 缺失或不匹配时返回
+`401`，其 `detail.code` 为 `INVALID_INTERNAL_API_KEY`。B 和 D 必须配置相同的非空 secret。
 
 真实 Cognito 配置（成员 A 提供，已写进 `examples/cognito_auth_example.py`）：
 
@@ -177,7 +182,9 @@ Base URL：本地 `http://localhost:8000`；云端是 API Gateway HTTP API
 `PacificBioArchive-HTTP-API`（API ID `2dd2aqb32j`，成员 A 提供），所有公开路由都挂
 `CognitoJWTAuthorizer`，请求头带 `Authorization: Bearer <id_token>`。
 
-统一错误格式：`{"detail": "<message>"}`，未认证 `401`，资源不存在 `404`。
+统一错误格式使用 FastAPI `detail`。owner 冲突返回
+`{"detail":{"code":"FORBIDDEN_OWNER","message":"media is not owned by the authenticated user"}}`；
+内部保留元数据冲突返回 `409` 且 `detail.code` 为 `METADATA_CONFLICT`。
 
 **路由对齐**（成员 A 文档里的简称 → 我们的完整路径）：
 
@@ -239,6 +246,9 @@ POST /tags/edit
 
 响应：`{"updated": 1, "matched_keys": ["originals/u1/a1.jpg"]}`
 
+记录 owner 必须等于当前 Cognito `sub`；外部 owner 或混合 owner 请求整批返回 `403`，
+且任何记录都不会被修改。传入的科学名会通过 `get_mapper().common_name()` 转成团队短名。
+
 ### 5.6 批量删除
 
 ```
@@ -248,10 +258,15 @@ POST /files/delete
 
 响应：`{"deleted_db_records": 1, "storage_objects_removed": 2}`
 
+记录 owner 必须等于当前 Cognito `sub`；外部 owner 或混合 owner 请求整批返回 `403`。
+storage 删除发生在 metadata 删除之前，因此 storage 失败时 DB 记录仍保留。
+
 ### 5.7 内部元数据状态机（成员 B 上传/处理 Lambda 调用）
 
-这 4 个端点对应成员 B 的 `docs/member-b/api-contracts.md`，**不加认证**（内部），
-是成员 B 写库的唯一入口。
+这 4 个端点对应成员 B 的 `docs/member-b/api-contracts.md`，是成员 B 写库的唯一入口。
+每个请求都必须带 `X-Internal-Api-Key: <shared-secret>`。服务端未配置 secret 返回 `503`；
+`detail.code` 为 `INTERNAL_AUTH_NOT_CONFIGURED`。header 缺失/错误返回 `401`，
+`detail.code` 为 `INVALID_INTERNAL_API_KEY`。
 
 **① 预约上传（reserve）**
 
@@ -276,6 +291,7 @@ POST /internal/files/{file_id}/processing
 - `200 {"should_process": true}` → 可以处理（刚预约 / 上次失败 / 租约已过期）。
 - `200 {"should_process": false}` → 已完成，或已有活跃租约（不重复处理）。
 - 租约窗口 900 秒（对应成员 B 处理 Lambda 的 900s 超时）。
+- `user_id` 或 `object_key` 与 reserve 记录不一致 → `409 METADATA_CONFLICT`，状态不变。
 
 **③ 完成处理（complete，幂等 PUT）**
 
@@ -290,6 +306,9 @@ PUT /internal/files/{file_id}/complete
 ```
 
 - `200 {}` → 已标记 `completed`。重复调用幂等，不重复生效。
+- `user_id`、`original_key` 或 `file_type` 与 reserve 记录不一致 →
+  `409 METADATA_CONFLICT`，状态不变。
+- `tags` key 和每条 detection 的 `species` 在写库/通知前统一映射为团队短名。
 
 **④ 记录失败（failed，幂等 PUT）**
 
@@ -301,6 +320,7 @@ PUT /internal/files/{file_id}/failed
 
 - `200 {}` → 已标记 `failed`。`error_code` 取值：`INVALID_MEDIA` /
   `FRAME_EXTRACTION_FAILED` / `INFERENCE_FAILED`。已 `completed` 的文件不会被降级为 `failed`。
+- `user_id` 与 reserve 记录不一致 → `409 METADATA_CONFLICT`，状态不变。
 
 ### 5.8 订阅 & 通知（成员 E 前端调用）
 
@@ -308,7 +328,7 @@ PUT /internal/files/{file_id}/failed
 
 ```
 POST /notifications/subscribe
-{"user_id": "<sub>", "species": "wombat"}
+{"species": "wombat"}
 ```
 
 - `201 {"user_id": ..., "species": ..., "subscribed": true}`（幂等，重复订阅无副作用）。
@@ -316,7 +336,7 @@ POST /notifications/subscribe
 **取消订阅**
 
 ```
-DELETE /notifications/subscribe?user_id=<sub>&species=wombat
+DELETE /notifications/subscribe?species=wombat
 ```
 
 - `200 {"user_id": ..., "species": ..., "subscribed": false}`（幂等）。
@@ -324,7 +344,7 @@ DELETE /notifications/subscribe?user_id=<sub>&species=wombat
 **列出我的订阅**
 
 ```
-GET /notifications/subscriptions?user_id=<sub>
+GET /notifications/subscriptions
 ```
 
 - `200 {"species": ["wombat", "magpie"], "count": 2}`
@@ -332,7 +352,7 @@ GET /notifications/subscriptions?user_id=<sub>
 **列出我的通知**
 
 ```
-GET /notifications?user_id=<sub>
+GET /notifications
 ```
 
 - `200 {"notifications": [{"notification_id": ..., "user_id": ..., "file_id": ...,
@@ -341,6 +361,7 @@ GET /notifications?user_id=<sub>
 **触发时机**：当成员 B 对某个文件调用 `complete`（§5.7③）且该文件的 `tags` 里有
 数量 ≥1 的物种时，Member D 会为**每个订阅了该物种的用户**写一条通知并调
 `NotificationPublisher.publish` 投递（§4.4）。完成是幂等的，所以重放不会重复通知。
+订阅/取消订阅的 `species` 也会在持久化前统一映射为团队短名。
 
 ---
 
@@ -348,7 +369,7 @@ GET /notifications?user_id=<sub>
 
 ```
 用户上传文件
-   └─> 成员 B 上传 Lambda：POST /internal/uploads/reserve（去重 + 预约，§5.7①）
+   └─> 成员 B 上传 Lambda：带 X-Internal-Api-Key 调 POST /internal/uploads/reserve（去重 + 预约，§5.7①）
           └─> S3 存原图 → ObjectCreated 事件触发处理 Lambda
           └─> 处理 Lambda：POST /internal/files/{id}/processing（取租约，§5.7②）
           └─> 抽帧/生成缩略图（成员 B）→ 调成员 C /infer 识别（§4.1）→ 得到 tags
