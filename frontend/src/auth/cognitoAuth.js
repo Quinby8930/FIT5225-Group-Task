@@ -1,4 +1,4 @@
-import { cognitoConfig } from "./cognitoConfig";
+import { cognitoConfig } from "./cognitoConfig.js";
 
 const TOKEN_STORAGE_KEY = "pacificBioArchive.tokens";
 const PKCE_STORAGE_KEY = "pacificBioArchive.pkce";
@@ -54,8 +54,21 @@ export async function buildLoginUrl(identityProvider) {
   return `${cognitoConfig.domain}/oauth2/authorize?${params.toString()}`;
 }
 
+export async function buildSignUpUrl() {
+  const url = new URL(`${cognitoConfig.domain}/signup`);
+  url.searchParams.set("client_id", cognitoConfig.clientId);
+  url.searchParams.set("response_type", "code");
+  url.searchParams.set("scope", cognitoConfig.scopes.join(" "));
+  url.searchParams.set("redirect_uri", cognitoConfig.redirectSignIn);
+  return url.toString();
+}
+
 export async function signIn() {
   window.location.assign(await buildLoginUrl());
+}
+
+export async function signUp() {
+  window.location.assign(await buildSignUpUrl());
 }
 
 export async function signInWithProvider(providerName) {
@@ -175,5 +188,10 @@ export function getCurrentUser() {
     return null;
   }
 
-  return parseJwt(tokens.id_token);
+  const user = parseJwt(tokens.id_token);
+  if (!user?.exp || user.exp * 1000 <= Date.now()) {
+    clearTokens();
+    return null;
+  }
+  return user;
 }

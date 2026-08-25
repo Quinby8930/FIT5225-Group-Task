@@ -35,6 +35,7 @@ from __future__ import annotations
 from datetime import timedelta
 
 from fastapi import Depends, FastAPI, HTTPException, UploadFile
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
 from app.config import settings
@@ -61,7 +62,11 @@ from app.schemas import (
     TagQueryRequest,
     utcnow,
 )
-from app.notification_client import NotificationPublisher, StubNotificationPublisher
+from app.notification_client import (
+    NotificationPublisher,
+    SNSNotificationPublisher,
+    StubNotificationPublisher,
+)
 from app.services.notification_service import build_notifications
 from app.services.query_service import (
     filter_by_min_counts,
@@ -73,6 +78,13 @@ from app.tag_detector import StubTagDetector, TagDetector
 from examples.cognito_auth_example import build_get_current_user
 
 app = FastAPI(title="Pacific BioArchive — Database & Query API", version="1.0.0")
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=list(settings.cors_origins),
+    allow_credentials=False,
+    allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+    allow_headers=["Authorization", "Content-Type"],
+)
 
 # Processing lease window matches Member B's media-processing Lambda timeout.
 LEASE_SECONDS = 900
@@ -104,7 +116,17 @@ repo: FileRepository = _build_repository()
 notif_repo: NotificationRepository = _build_notification_repository()
 detector: TagDetector = StubTagDetector()
 storage: StorageClient = StubStorageClient()
-publisher: NotificationPublisher = StubNotificationPublisher()
+def _build_publisher() -> NotificationPublisher:
+    if settings.notification_publisher == "sns":
+        return SNSNotificationPublisher(
+            region=settings.aws_region,
+            topic_arn=settings.sns_topic_arn,
+            topic_arn_template=settings.sns_topic_arn_template,
+        )
+    return StubNotificationPublisher()
+
+
+publisher: NotificationPublisher = _build_publisher()
 
 
 def get_repo() -> FileRepository:

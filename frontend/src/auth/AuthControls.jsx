@@ -3,6 +3,7 @@ import {
   getCurrentUser,
   signIn,
   signInWithGoogle,
+  signUp,
   signOut,
 } from "./cognitoAuth";
 
@@ -12,6 +13,9 @@ export default function AuthControls() {
   if (!user) {
     return (
       <section className="auth-actions">
+        <button type="button" className="secondary-button" onClick={signUp}>
+          Create account
+        </button>
         <button type="button" onClick={signIn}>
           Sign in
         </button>

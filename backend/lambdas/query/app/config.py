@@ -27,5 +27,20 @@ class Settings:
     )
     aws_region: str = os.getenv("AWS_REGION", "ap-southeast-2")
 
+    # Browser origins allowed to call the query API during local/cloud demos.
+    cors_origins: tuple[str, ...] = tuple(
+        origin.strip()
+        for origin in os.getenv(
+            "CORS_ORIGINS",
+            "http://localhost:3000,http://127.0.0.1:3000",
+        ).split(",")
+        if origin.strip()
+    )
+
+    # Notification delivery. Use "stub" locally or "sns" in AWS.
+    notification_publisher: str = os.getenv("NOTIFICATION_PUBLISHER", "stub")
+    sns_topic_arn: str = os.getenv("SNS_TOPIC_ARN", "")
+    sns_topic_arn_template: str = os.getenv("SNS_TOPIC_ARN_TEMPLATE", "")
+
 
 settings = Settings()

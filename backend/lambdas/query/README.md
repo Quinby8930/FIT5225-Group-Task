@@ -100,9 +100,10 @@ The query API code is unchanged — only the repository backend swaps
   with `build_get_current_user()` from `examples/cognito_auth_example.py`
   (real Cognito params already filled in) — every public route already depends on it.
 - **Member E (notifications):** replace `StubNotificationPublisher` with a real
-  SNS/email/push implementation (`examples/sns_notification_example.py`). Member D
-  owns the trigger + durable records + subscription/notification endpoints;
-  Member E owns the delivery UX on top.
+  SNS/email/push implementation. This repo now includes an SNS publisher that
+  is enabled with `NOTIFICATION_PUBLISHER=sns` plus either `SNS_TOPIC_ARN` or
+  `SNS_TOPIC_ARN_TEMPLATE`. Member D owns the trigger + durable records +
+  subscription/notification endpoints; Member E owns the delivery UX on top.
 
 ## Cloud database setup (for the AWS operator)
 

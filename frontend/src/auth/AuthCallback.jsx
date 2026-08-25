@@ -14,6 +14,7 @@ export default function AuthCallback() {
         setUser(getCurrentUser());
         setStatus("Signed in successfully.");
         window.history.replaceState({}, document.title, "/");
+        window.setTimeout(() => window.location.assign("/"), 500);
       })
       .catch((error) => {
         if (!active) return;

@@ -1,21 +1,30 @@
-import { apiConfig } from "../auth/cognitoConfig";
-import { getAuthorizationHeader } from "../auth/cognitoAuth";
+import { apiConfig } from "../auth/cognitoConfig.js";
+import { clearTokens, getAuthorizationHeader } from "../auth/cognitoAuth.js";
 
 export async function apiRequest(path, options = {}) {
+  const isFormData =
+    typeof FormData !== "undefined" && options.body instanceof FormData;
+  const headers = {
+    ...getAuthorizationHeader(),
+    ...(isFormData ? {} : { "Content-Type": "application/json" }),
+    ...(options.headers || {}),
+  };
+
   const response = await fetch(`${apiConfig.baseUrl}${path}`, {
     ...options,
-    headers: {
-      "Content-Type": "application/json",
-      ...getAuthorizationHeader(),
-      ...(options.headers || {}),
-    },
+    headers,
   });
 
   const text = await response.text();
   const data = text ? JSON.parse(text) : null;
 
   if (!response.ok) {
-    throw new Error(data?.message || `API request failed: ${response.status}`);
+    if (response.status === 401) {
+      clearTokens();
+    }
+    throw new Error(
+      data?.message || data?.detail || `API request failed: ${response.status}`
+    );
   }
 
   return data;

@@ -1,0 +1,43 @@
+# Member E Frontend
+
+This React/Vite app is the Member E deliverable for the Pacific BioArchive UI
+and integration workflow.
+
+## Configuration
+
+Create `frontend/.env.local` when using non-default endpoints:
+
+```text
+VITE_API_BASE_URL=http://localhost:8000
+VITE_ASSET_BASE_URL=https://<bucket-or-cloudfront-host>
+VITE_COGNITO_REGION=ap-southeast-2
+VITE_COGNITO_USER_POOL_ID=ap-southeast-2_1hGEJyYO7
+VITE_COGNITO_CLIENT_ID=65dgspco2djehpbpunc13t2oml
+VITE_COGNITO_DOMAIN=https://ap-southeast-21hgejyyo7.auth.ap-southeast-2.amazoncognito.com
+VITE_COGNITO_REDIRECT_SIGN_IN=http://localhost:3000/callback
+VITE_COGNITO_REDIRECT_SIGN_OUT=http://localhost:3000/logout
+```
+
+`VITE_ASSET_BASE_URL` is optional. When it is set, S3 keys returned by Member D
+are displayed as images or links by prefixing the asset host.
+
+## Run
+
+```powershell
+npm install
+npm run dev
+```
+
+The Cognito app client must allow `http://localhost:3000/callback` as a callback
+URL and `http://localhost:3000/logout` as a sign-out URL.
+
+## Verify
+
+```powershell
+npm test
+npm run build
+```
+
+The E2E-style test mocks browser `fetch` and checks the real request shapes for
+upload pre-signing, S3 PUT, tag query, bulk tag edit, deletion, and
+subscription creation.

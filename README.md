@@ -70,6 +70,23 @@ The Member D database has not been deployed from this repository. Live DynamoDB,
 Lambda, and API Gateway wiring remains in the manual handoff (see
 `docs/member-d/database-setup.md`).
 
+Member E has added the frontend and integration console:
+
+- React/Vite UI for Cognito sign-up/sign-in/sign-out, upload, query, thumbnail
+  lookup, query-by-file, bulk tag editing, bulk deletion, tag subscriptions, and
+  notification inbox.
+- Authenticated browser API client that sends Cognito ID tokens to protected
+  routes, handles 401 cleanup, supports multipart query files, and performs the
+  checksum/pre-signed PUT upload flow required by Member B.
+- Environment-based frontend configuration for local or cloud API endpoints,
+  Cognito values, and optional asset URL prefixing for thumbnail previews.
+- Local E2E-style tests for the Member E browser workflow and form parsing,
+  plus CORS wiring for local frontend-to-query-API integration.
+- Optional SNS notification publisher for email delivery, enabled by
+  `NOTIFICATION_PUBLISHER=sns`.
+- User guide, architecture notes, and demo evidence checklist under
+  `docs/member-e/`.
+
 ### Member B architecture
 
 ```text
@@ -122,6 +139,21 @@ Handoff references:
 - [Integration guide (tag names, schema, API contract)](backend/lambdas/query/INTEGRATION.md)
 - [DynamoDB infrastructure](infrastructure/member-d/README.md)
 - [Database setup for the AWS operator](docs/member-d/database-setup.md)
+
+### Member E verification
+
+Run from the frontend directory:
+
+```powershell
+npm test
+npm run build
+```
+
+Handoff references:
+
+- [Frontend setup](frontend/README.md)
+- [Member E user guide](docs/member-e/user-guide.md)
+- [Member E architecture notes](docs/member-e/architecture.md)
 
 ## Local frontend start
 
