@@ -1,11 +1,12 @@
 # Member B AWS SAM infrastructure
 
 This directory defines the private AWS boundary for media upload,
-preprocessing, and guarded storage deletion. It connects `POST /upload-url` to
-the existing HTTP API and JWT authorizer, and sends metadata and inference
-requests only through deployment-time HTTPS endpoint parameters. The template
-rejects plaintext endpoint values, and both runtime clients validate HTTPS
-again before sending an optional internal API key.
+preprocessing, authenticated temporary asset access, and guarded storage
+deletion. It connects `POST /upload-url` and `POST /asset-urls` to the existing
+HTTP API and JWT authorizer, and sends metadata and inference requests only
+through deployment-time HTTPS endpoint parameters. The template rejects
+plaintext endpoint values, and both runtime clients validate HTTPS again before
+sending an optional internal API key.
 
 No AWS deployment was performed while preparing these repository artifacts.
 The template has local structural coverage; account-specific validation and
@@ -22,9 +23,11 @@ deployment remain manual steps.
   and processing frames, and delete processing frames.
 - A Node.js 20 storage-delete Lambda with delete access only to `originals/*`,
   `thumbnails/*`, and `processing/*`.
-- API Gateway v2 integration, protected JWT POST route, unauthenticated OPTIONS
-  preflight route, and method-scoped Lambda invoke permissions for the existing
-  HTTP API.
+- A Node.js 20 asset-URL Lambda with read access only to `originals/*` and
+  `thumbnails/*`; it signs at most 100 current-user keys for 15 minutes.
+- API Gateway v2 integrations, protected JWT POST routes, unauthenticated
+  OPTIONS preflight routes, and method-scoped Lambda invoke permissions for the
+  existing HTTP API.
 
 ## Parameters
 
@@ -50,10 +53,11 @@ no invented or environment-specific endpoint value.
 | `UploadFunctionArn` | Upload Lambda ARN. |
 | `MediaProcessingFunctionArn` | Processing Lambda ARN. |
 | `StorageDeleteFunctionArn` | Guarded storage-delete Lambda ARN for Member D integration. |
+| `AssetUrlsFunctionArn` | Authenticated private-asset URL Lambda ARN. |
 
 ## Package and tool dependencies
 
-- Node.js 20 for both Node Lambda test suites.
+- Node.js 20 for all three Node Lambda test suites.
 - Python 3.12 with `pytest`, `PyYAML`, and
   `backend/lambdas/media-processing/requirements.txt` (`Pillow==11.3.0`) for
   local tests.
@@ -61,6 +65,8 @@ no invented or environment-specific endpoint value.
   `backend/lambdas/upload/package.json`.
 - `@aws-sdk/client-s3` from
   `backend/lambdas/storage-delete/package.json`.
+- `@aws-sdk/client-s3` and `@aws-sdk/s3-request-presigner` from
+  `backend/lambdas/asset-urls/package.json`.
 - AWS SAM CLI for `sam validate --lint` and `sam build --use-container`, plus a
   running Docker installation for the container build. The container is
   required because Pillow includes native Lambda dependencies. Lambda's Python

@@ -36,14 +36,17 @@ Member B has added a locally verified media-ingestion boundary:
 - Authenticated S3 upload pre-signing bound to declared length, content type,
   and checksum, with per-user duplicate reservation through Member D's metadata
   contract.
+- Authenticated, ownership-checked S3 download pre-signing for private originals
+  and thumbnails, returned in batches of at most 100 keys.
 - Private S3 object layout and `originals/`-only event processing.
 - Aspect-ratio-preserving image thumbnails with a 40 MP decode ceiling and
   bounded video extraction at exactly one frame per second (600-second maximum,
   1,024-pixel scale, 900-frame/2-GiB caps, and a 180-second finalization reserve).
 - Provider-neutral HTTP contracts for Member C inference and Member D metadata
   state, plus guarded storage deletion.
-- AWS SAM resources for the media bucket, three Lambda functions, scoped IAM,
-  the protected `POST /upload-url`, and unauthenticated browser preflight.
+- AWS SAM resources for the media bucket, four Lambda functions, scoped IAM,
+  protected `POST /upload-url` and `POST /asset-urls` routes, and unauthenticated
+  browser preflight.
 
 The Member B infrastructure has not been deployed from this repository. Live
 AWS, Cognito, FFmpeg-layer, and Member C/D endpoint verification remains in the
@@ -78,8 +81,9 @@ Member E has added the frontend and integration console:
 - Authenticated browser API client that sends Cognito ID tokens to protected
   routes, handles 401 cleanup, supports multipart query files, and performs the
   checksum/pre-signed PUT upload flow required by Member B.
-- Environment-based frontend configuration for local or cloud API endpoints,
-  Cognito values, and optional asset URL prefixing for thumbnail previews.
+- Environment-based frontend configuration for local or cloud API endpoints and
+  Cognito values, with private thumbnail/original previews obtained from B's
+  authenticated temporary-URL endpoint.
 - Local E2E-style tests for the Member E browser workflow and form parsing,
   plus CORS wiring for local frontend-to-query-API integration.
 - Optional SNS notification publisher for email delivery, enabled by
@@ -94,6 +98,7 @@ Authenticated browser -> POST /upload-url -> private S3 originals/
   -> S3 ObjectCreated event -> media processing Lambda
   -> Member C /infer + Member D processing status
   -> private thumbnails/ and cleaned processing/ frames
+Authenticated browser -> POST /asset-urls -> 15-minute S3 GET URLs
 ```
 
 ### Member B verification
@@ -102,7 +107,7 @@ Run from the repository root with dependencies already installed:
 
 ```powershell
 python -m pytest infrastructure/member-b/test_template.py backend/lambdas/media-processing/tests -q
-node --test backend/lambdas/upload/test/*.test.mjs backend/lambdas/storage-delete/test/*.test.mjs
+node --test backend/lambdas/upload/test/*.test.mjs backend/lambdas/storage-delete/test/*.test.mjs backend/lambdas/asset-urls/test/*.test.mjs
 Set-Location frontend
 node node_modules/vite/bin/vite.js build
 Set-Location ..

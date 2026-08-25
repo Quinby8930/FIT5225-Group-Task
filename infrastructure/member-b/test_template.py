@@ -169,6 +169,11 @@ def test_function_runtime_and_handler_contracts(template):
     assert storage_delete["CodeUri"] == "../../backend/lambdas/storage-delete/"
     assert storage_delete["Handler"] == "index.handler"
 
+    asset_urls = _properties(template, "AssetUrlsFunction")
+    assert asset_urls["Runtime"] == "nodejs20.x"
+    assert asset_urls["CodeUri"] == "../../backend/lambdas/asset-urls/"
+    assert asset_urls["Handler"] == "index.handler"
+
 
 def test_function_environment_names_match_production_handlers(template):
     expected = {
@@ -187,6 +192,7 @@ def test_function_environment_names_match_production_handlers(template):
             "FFMPEG_PATH",
         },
         "StorageDeleteFunction": {"MEDIA_BUCKET_NAME"},
+        "AssetUrlsFunction": {"MEDIA_BUCKET_NAME", "ALLOWED_ORIGIN"},
     }
     for function, names in expected.items():
         variables = _properties(template, function)["Environment"]["Variables"]
@@ -249,6 +255,65 @@ def test_upload_options_route_is_unauthenticated_and_method_scoped(template):
     }
 
 
+def test_asset_urls_routes_use_jwt_and_scoped_invoke_permissions(template):
+    integration = _properties(template, "AssetUrlsIntegration")
+    assert integration == {
+        "ApiId": {"Ref": "ExistingHttpApiId"},
+        "IntegrationType": "AWS_PROXY",
+        "IntegrationMethod": "POST",
+        "IntegrationUri": {
+            "Fn::Sub": (
+                "arn:${AWS::Partition}:apigateway:${AWS::Region}:lambda:path/"
+                "2015-03-31/functions/${AssetUrlsFunction.Arn}/invocations"
+            )
+        },
+        "PayloadFormatVersion": "2.0",
+    }
+
+    route = _properties(template, "AssetUrlsRoute")
+    assert route == {
+        "ApiId": {"Ref": "ExistingHttpApiId"},
+        "RouteKey": "POST /asset-urls",
+        "AuthorizationType": "JWT",
+        "AuthorizerId": {"Ref": "ExistingJwtAuthorizerId"},
+        "Target": {"Fn::Sub": "integrations/${AssetUrlsIntegration}"},
+    }
+
+    preflight = _properties(template, "AssetUrlsPreflightRoute")
+    assert preflight == {
+        "ApiId": {"Ref": "ExistingHttpApiId"},
+        "RouteKey": "OPTIONS /asset-urls",
+        "AuthorizationType": "NONE",
+        "Target": {"Fn::Sub": "integrations/${AssetUrlsIntegration}"},
+    }
+
+    post_permission = _properties(template, "AssetUrlsInvokePermission")
+    assert post_permission == {
+        "Action": "lambda:InvokeFunction",
+        "FunctionName": {"Ref": "AssetUrlsFunction"},
+        "Principal": "apigateway.amazonaws.com",
+        "SourceArn": {
+            "Fn::Sub": (
+                "arn:${AWS::Partition}:execute-api:${AWS::Region}:${AWS::AccountId}:"
+                "${ExistingHttpApiId}/*/POST/asset-urls"
+            )
+        },
+    }
+
+    options_permission = _properties(template, "AssetUrlsPreflightInvokePermission")
+    assert options_permission == {
+        "Action": "lambda:InvokeFunction",
+        "FunctionName": {"Ref": "AssetUrlsFunction"},
+        "Principal": "apigateway.amazonaws.com",
+        "SourceArn": {
+            "Fn::Sub": (
+                "arn:${AWS::Partition}:execute-api:${AWS::Region}:${AWS::AccountId}:"
+                "${ExistingHttpApiId}/*/OPTIONS/asset-urls"
+            )
+        },
+    }
+
+
 def test_s3_policies_are_limited_to_owned_bucket_prefixes(template):
     expected = {
         "UploadFunction": [
@@ -292,6 +357,16 @@ def test_s3_policies_are_limited_to_owned_bucket_prefixes(template):
                 ],
             }
         ],
+        "AssetUrlsFunction": [
+            {
+                "Effect": "Allow",
+                "Action": "s3:GetObject",
+                "Resource": [
+                    {"Fn::Sub": "${MediaBucket.Arn}/originals/*"},
+                    {"Fn::Sub": "${MediaBucket.Arn}/thumbnails/*"},
+                ],
+            }
+        ],
     }
     for function, wanted_statements in expected.items():
         policies = _properties(template, function)["Policies"]
@@ -310,5 +385,8 @@ def test_outputs_expose_bucket_and_function_arns(template):
         },
         "StorageDeleteFunctionArn": {
             "Value": {"Fn::GetAtt": "StorageDeleteFunction.Arn"}
+        },
+        "AssetUrlsFunctionArn": {
+            "Value": {"Fn::GetAtt": "AssetUrlsFunction.Arn"}
         },
     }

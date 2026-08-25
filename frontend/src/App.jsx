@@ -1,8 +1,7 @@
-import React, { useEffect, useMemo, useState } from "react";
+import React, { useEffect, useMemo, useRef, useState } from "react";
 import { getAuthTest } from "./api/apiClient";
 import {
   deleteFiles,
-  displayUrlForKey,
   editTags,
   queryByFile,
   queryBySpecies,
@@ -10,6 +9,7 @@ import {
   queryByThumbnail,
   listNotifications,
   listSubscriptions,
+  requestAssetUrls,
   subscribeToSpecies,
   unsubscribeFromSpecies,
   uploadMedia,
@@ -18,6 +18,15 @@ import AuthCallback from "./auth/AuthCallback";
 import AuthControls from "./auth/AuthControls";
 import { getCurrentUser, signIn } from "./auth/cognitoAuth";
 import { parseKeyList, parseSpeciesList, parseTagCounts } from "./lib/forms";
+import {
+  assetExpiryDelay,
+  indexAssetUrls,
+  nextAssetRefreshDelay,
+  nextAssetRetryDelay,
+  ownedAssetKeys,
+  requestAssetUrlBatches,
+  unexpiredAssetUrls,
+} from "./lib/assetUrls.mjs";
 
 const tabs = [
   ["upload", "Upload"],
@@ -40,8 +49,8 @@ function Field({ label, children }) {
   );
 }
 
-function ResultCard({ resultKey, selected, onToggle, onOpenOriginal }) {
-  const url = displayUrlForKey(resultKey);
+function ResultCard({ resultKey, assetUrl, selected, onToggle, onOpenOriginal }) {
+  const url = assetUrl;
   const isImage = /\.(jpg|jpeg|png|webp)$/i.test(resultKey);
   const kind = resultKey.includes(".mp4") || resultKey.includes(".mov") ? "video" : "image";
 
@@ -139,27 +148,179 @@ function UploadPanel({ onStatus }) {
   );
 }
 
-function QueryPanel({ results, selectedKeys, setResults, toggleKey, onStatus }) {
+function QueryPanel({ userId, results, selectedKeys, setResults, toggleKey, onStatus }) {
   const [tagText, setTagText] = useState("dingo:1, wombat:1");
   const [species, setSpecies] = useState("wombat");
   const [thumbnailKey, setThumbnailKey] = useState("");
   const [queryFile, setQueryFile] = useState(null);
+  const [assetUrls, setAssetUrls] = useState({});
+  const requestVersion = useRef(0);
+  const refreshTimer = useRef(null);
+  const expiryTimer = useRef(null);
 
-  async function run(action) {
+  function clearAssetTimers() {
+    if (refreshTimer.current !== null) {
+      window.clearTimeout(refreshTimer.current);
+      refreshTimer.current = null;
+    }
+    if (expiryTimer.current !== null) {
+      window.clearTimeout(expiryTimer.current);
+      expiryTimer.current = null;
+    }
+  }
+
+  useEffect(() => () => {
+    requestVersion.current += 1;
+    clearAssetTimers();
+  }, []);
+
+  function scheduleAssetExpiry(indexed, version) {
+    const delay = assetExpiryDelay(indexed);
+    if (delay === null) return;
+
+    expiryTimer.current = window.setTimeout(() => {
+      expiryTimer.current = null;
+      if (version === requestVersion.current) {
+        const remaining = unexpiredAssetUrls(indexed);
+        setAssetUrls(remaining);
+        onStatus({
+          type: "error",
+          message: "Expired temporary media links were removed. Retry the query if they do not recover.",
+        });
+        scheduleAssetExpiry(remaining, version);
+      }
+    }, delay);
+  }
+
+  function scheduleAssetRetry(keys, allKeys, version, currentAssets, attempt, error) {
+    if (version !== requestVersion.current) return;
+
+    const delay = nextAssetRetryDelay(currentAssets, attempt);
+    onStatus({
+      type: "error",
+      message: delay === null
+        ? `Temporary media link refresh failed: ${error.message}`
+        : `Temporary media link refresh failed; retrying: ${error.message}`,
+    });
+    if (delay === null) return;
+
+    refreshTimer.current = window.setTimeout(() => {
+      refreshTimer.current = null;
+      loadSignedAssetUrls(keys, version, currentAssets, allKeys, attempt + 1)
+        .then((failedBatches) => {
+          if (version !== requestVersion.current) return;
+          if (failedBatches) {
+            onStatus({ type: "error", message: "Some temporary media links could not be refreshed." });
+          } else {
+            onStatus({ type: "success", message: "Temporary media links refreshed." });
+          }
+        })
+        .catch((retryError) => {
+          scheduleAssetRetry(keys, allKeys, version, currentAssets, attempt + 1, retryError);
+        });
+    }, delay);
+  }
+
+  async function loadSignedAssetUrls(
+    keys,
+    version,
+    currentAssets = {},
+    allKeys = keys,
+    retryAttempt = 0
+  ) {
+    const signableKeys = ownedAssetKeys(userId, keys);
+    if (!signableKeys.length) {
+      if (version === requestVersion.current && !Object.keys(currentAssets).length) {
+        setAssetUrls({});
+      }
+      return 0;
+    }
+
+    const outcomes = await requestAssetUrlBatches(signableKeys, requestAssetUrls);
+    if (version !== requestVersion.current) return null;
+
+    const successful = outcomes.filter((outcome) => outcome.status === "fulfilled");
+    const failed = outcomes.filter((outcome) => outcome.status === "rejected");
+    const indexed = Object.assign(
+      unexpiredAssetUrls(currentAssets),
+      ...successful.map((outcome) => indexAssetUrls(outcome.response, outcome.signedAt))
+    );
+    setAssetUrls(indexed);
+
+    clearAssetTimers();
+    scheduleAssetExpiry(indexed, version);
+    if (failed.length) {
+      scheduleAssetRetry(
+        failed.flatMap((outcome) => outcome.keys),
+        allKeys,
+        version,
+        indexed,
+        retryAttempt,
+        failed[0].error
+      );
+    } else {
+      const delay = nextAssetRefreshDelay(indexed);
+      if (delay !== null) {
+        refreshTimer.current = window.setTimeout(() => {
+          refreshTimer.current = null;
+          loadSignedAssetUrls(allKeys, version, indexed, allKeys)
+            .then((failedBatches) => {
+              if (version === requestVersion.current && failedBatches) {
+                onStatus({ type: "error", message: "Some temporary media links could not be refreshed." });
+              }
+            })
+            .catch((error) => {
+              scheduleAssetRetry(allKeys, allKeys, version, indexed, 0, error);
+            });
+        }, delay);
+      }
+    }
+    return failed.length;
+  }
+
+  async function run(action, successMessage) {
+    const version = requestVersion.current + 1;
+    requestVersion.current = version;
+    clearAssetTimers();
+    setAssetUrls({});
     onStatus({ type: "info", message: "Querying..." });
     try {
       const data = await action();
-      setResults(data.results || []);
-      onStatus({ type: "success", message: `${data.count ?? data.results?.length ?? 0} result(s).` });
+      if (version !== requestVersion.current) return;
+
+      const keys = data.results || [];
+      setResults(keys);
+      const failedBatches = await loadSignedAssetUrls(keys, version);
+      if (version !== requestVersion.current) return;
+
+      if (failedBatches) {
+        onStatus({
+          type: "error",
+          message: `${failedBatches} media preview batch(es) failed; the remaining results are still available.`,
+        });
+      } else {
+        onStatus({
+          type: "success",
+          message: successMessage || `${data.count ?? keys.length} result(s).`,
+        });
+      }
     } catch (error) {
-      onStatus({ type: "error", message: error.message });
+      if (version === requestVersion.current) {
+        onStatus({ type: "error", message: error.message });
+      }
     }
   }
 
   async function openOriginal(key) {
     try {
       const data = await queryByThumbnail(key);
-      window.open(displayUrlForKey(data.original_key) || data.original_key, "_blank", "noreferrer");
+      if (!ownedAssetKeys(userId, [data.original_key]).length) {
+        throw new Error("This original belongs to another user and cannot be opened with your session.");
+      }
+      const urls = indexAssetUrls(await requestAssetUrls([data.original_key]));
+      const url = urls[data.original_key]?.url;
+      if (!url) throw new Error("A temporary asset URL was not returned.");
+      window.open(url, "_blank", "noreferrer");
     } catch (error) {
       onStatus({ type: "error", message: error.message });
     }
@@ -201,13 +362,10 @@ function QueryPanel({ results, selectedKeys, setResults, toggleKey, onStatus }) 
             className="stack"
             onSubmit={async (event) => {
               event.preventDefault();
-              try {
+              run(async () => {
                 const data = await queryByThumbnail(thumbnailKey);
-                setResults([data.original_key]);
-                onStatus({ type: "success", message: `Original file: ${data.file_id}` });
-              } catch (error) {
-                onStatus({ type: "error", message: error.message });
-              }
+                return { ...data, results: [data.original_key], count: 1 };
+              }, "Original file found.");
             }}
           >
             <Field label="Thumbnail key">
@@ -245,6 +403,7 @@ function QueryPanel({ results, selectedKeys, setResults, toggleKey, onStatus }) 
             <ResultCard
               key={key}
               resultKey={key}
+              assetUrl={assetUrls[key]?.url || ""}
               selected={selectedKeys.includes(key)}
               onToggle={toggleKey}
               onOpenOriginal={openOriginal}
@@ -494,6 +653,7 @@ export default function App() {
           {activeTab === "upload" && <UploadPanel onStatus={setStatus} />}
           {activeTab === "query" && (
             <QueryPanel
+              userId={user.sub}
               results={results}
               selectedKeys={selectedKeys}
               setResults={setResults}

@@ -23,7 +23,7 @@ process when any prerequisite is missing.
 
 ```powershell
 python -m pytest infrastructure/member-b/test_template.py backend/lambdas/media-processing/tests -q
-node --test backend/lambdas/upload/test/*.test.mjs backend/lambdas/storage-delete/test/*.test.mjs
+node --test backend/lambdas/upload/test/*.test.mjs backend/lambdas/storage-delete/test/*.test.mjs backend/lambdas/asset-urls/test/*.test.mjs
 ```
 
 The Python suite replaces external HTTP/S3 boundaries with behavior fakes. Its
@@ -43,6 +43,7 @@ python -m pytest infrastructure/member-b/test_template.py -q
 python -m pytest backend/lambdas/media-processing/tests -q
 node --test backend/lambdas/upload/test/*.test.mjs
 node --test backend/lambdas/storage-delete/test/*.test.mjs
+node --test backend/lambdas/asset-urls/test/*.test.mjs
 ```
 
 ## Frontend regression build
@@ -53,7 +54,8 @@ dependencies:
 
 ```powershell
 Set-Location frontend
-node node_modules/vite/bin/vite.js build
+npm test
+npm run build
 Set-Location ..
 ```
 
@@ -91,9 +93,11 @@ Local verification covers validation, duplicate mapping, object keys, IAM and
 template structure, S3-event parsing, bounded thumbnail/video behavior,
 one-frame-per-second command construction, pipeline idempotency, HTTP
 serialization/timeouts, per-object deletion errors, failure handling, and
-temporary-object cleanup.
+temporary-object cleanup. The asset-URL suite verifies JWT subject ownership,
+100-key request bounds, `originals/` and `thumbnails/` prefix isolation,
+15-minute GET signatures, CORS, and generic error responses.
 
 Only the manual AWS workflow can verify the deployed authorizer, real browser
-CORS, pre-signed PUT behavior, S3 notification delivery, Lambda layer binary,
-CloudWatch execution, and live Member C/D integration. See
+CORS, pre-signed PUT/GET behavior, S3 notification delivery, Lambda layer
+binary, CloudWatch execution, and live Member C/D integration. See
 [`manual-aws-steps.md`](manual-aws-steps.md).

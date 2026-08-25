@@ -13,6 +13,7 @@ request. JSON dependency responses are limited to 1 MiB.
 | Boundary | Caller | Owner |
 | --- | --- | --- |
 | `POST /upload-url` | Authenticated frontend | Member B |
+| `POST /asset-urls` | Authenticated frontend | Member B |
 | `POST /internal/uploads/reserve` | Member B upload Lambda | Member D |
 | Processing/complete/failed metadata endpoints | Member B processing Lambda | Member D |
 | `POST /infer` | Member B processing Lambda | Member C |
@@ -72,6 +73,58 @@ returns `204` for the configured origin, while POST remains JWT-protected.
 | `409` | `DUPLICATE_FILE` | Member D already reserved this user's checksum; `existing_file_id` is included when supplied. |
 | `503` | `DEPENDENCY_UNAVAILABLE` | The metadata reservation did not complete. |
 | `500` | `INTERNAL_ERROR` | Pre-signing or another unexpected operation failed. |
+
+## Protected private asset URLs
+
+```http
+POST /asset-urls
+Authorization: Bearer <Cognito ID token>
+Content-Type: application/json
+```
+
+```json
+{
+  "keys": [
+    "thumbnails/cognito-sub/11111111-2222-4333-8444-555555555555/thumbnail.jpg",
+    "originals/cognito-sub/11111111-2222-4333-8444-555555555555/wombat.jpg"
+  ]
+}
+```
+
+The verified Cognito `sub` is the only user identifier used for authorization.
+The endpoint accepts at most 100 keys, removes duplicates while preserving
+first-seen order, and signs only non-empty objects below
+`originals/{sub}/` or `thumbnails/{sub}/`. Cross-user keys, incomplete
+prefixes, and internal `processing/` frames are rejected before any URL is
+created. Each key is also limited to the S3 maximum of 1,024 UTF-8 bytes. The
+S3 bucket remains private.
+
+Success (`200`):
+
+```json
+{
+  "assets": [
+    {
+      "key": "thumbnails/cognito-sub/11111111-2222-4333-8444-555555555555/thumbnail.jpg",
+      "url": "https://temporary-presigned-get-url",
+      "expires_in": 900
+    }
+  ]
+}
+```
+
+The URL is an HTTPS bearer credential valid for 15 minutes. Responses include
+`Cache-Control: no-store`. The frontend refreshes displayed URLs shortly before
+expiry and must not persist or log them. An empty key list returns `200
+{"assets":[]}`. The unauthenticated `OPTIONS /asset-urls` route returns `204`
+for the configured browser origin.
+
+| Status | Code | Meaning |
+| --- | --- | --- |
+| `400` | `INVALID_REQUEST` | JSON, key types, 1,024-byte key size, or the 100-key limit is invalid. |
+| `401` | `UNAUTHENTICATED` | The verified JWT `sub` claim is absent. |
+| `403` | `FORBIDDEN_KEY` | At least one key is outside the authenticated user's readable prefixes. |
+| `500` | `INTERNAL_ERROR` | S3 signing or another unexpected operation failed. |
 
 ## Member D metadata contracts
 

@@ -74,6 +74,23 @@ test("member E browser flow calls the agreed upload, query, edit, delete and not
       );
     }
 
+    if (String(url).endsWith("/asset-urls")) {
+      assert.equal(options.headers.Authorization.startsWith("Bearer "), true);
+      assert.deepEqual(JSON.parse(options.body), {
+        keys: ["thumbnails/user-123/file-1.jpg"],
+      });
+      return new Response(
+        JSON.stringify({
+          assets: [{
+            key: "thumbnails/user-123/file-1.jpg",
+            url: "https://signed.example.test/thumbnail.jpg",
+            expires_in: 900,
+          }],
+        }),
+        { status: 200 }
+      );
+    }
+
     if (String(url).endsWith("/tags/edit")) {
       assert.deepEqual(JSON.parse(options.body), {
         keys: ["originals/user-123/file-1/wombat.jpg"],
@@ -119,6 +136,16 @@ test("member E browser flow calls the agreed upload, query, edit, delete and not
     count: 1,
   });
   assert.deepEqual(
+    await mediaApi.requestAssetUrls(["thumbnails/user-123/file-1.jpg"]),
+    {
+      assets: [{
+        key: "thumbnails/user-123/file-1.jpg",
+        url: "https://signed.example.test/thumbnail.jpg",
+        expires_in: 900,
+      }],
+    }
+  );
+  assert.deepEqual(
     await mediaApi.editTags(["originals/user-123/file-1/wombat.jpg"], ["wombat"], 1),
     { updated: 1 }
   );
@@ -131,5 +158,5 @@ test("member E browser flow calls the agreed upload, query, edit, delete and not
     species: "wombat",
     subscribed: true,
   });
-  assert.equal(calls.length, 6);
+  assert.equal(calls.length, 7);
 });

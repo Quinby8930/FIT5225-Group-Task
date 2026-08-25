@@ -161,6 +161,27 @@ Resources:
                 - !Sub ${MediaBucket.Arn}/thumbnails/*
                 - !Sub ${MediaBucket.Arn}/processing/*
 
+  AssetUrlsFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: ../../backend/lambdas/asset-urls/
+      Handler: index.handler
+      Runtime: nodejs20.x
+      Timeout: 15
+      MemorySize: 256
+      Environment:
+        Variables:
+          MEDIA_BUCKET_NAME: !Ref MediaBucket
+          ALLOWED_ORIGIN: !Ref AllowedOrigin
+      Policies:
+        - AWSLambdaBasicExecutionRole
+        - Statement:
+            - Effect: Allow
+              Action: s3:GetObject
+              Resource:
+                - !Sub ${MediaBucket.Arn}/originals/*
+                - !Sub ${MediaBucket.Arn}/thumbnails/*
+
   UploadIntegration:
     Type: AWS::ApiGatewayV2::Integration
     Properties:
@@ -203,6 +224,48 @@ Resources:
       Principal: apigateway.amazonaws.com
       SourceArn: !Sub arn:${AWS::Partition}:execute-api:${AWS::Region}:${AWS::AccountId}:${ExistingHttpApiId}/*/OPTIONS/upload-url
 
+  AssetUrlsIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref ExistingHttpApiId
+      IntegrationType: AWS_PROXY
+      IntegrationMethod: POST
+      IntegrationUri: !Sub arn:${AWS::Partition}:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${AssetUrlsFunction.Arn}/invocations
+      PayloadFormatVersion: '2.0'
+
+  AssetUrlsRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref ExistingHttpApiId
+      RouteKey: POST /asset-urls
+      AuthorizationType: JWT
+      AuthorizerId: !Ref ExistingJwtAuthorizerId
+      Target: !Sub integrations/${AssetUrlsIntegration}
+
+  AssetUrlsPreflightRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref ExistingHttpApiId
+      RouteKey: OPTIONS /asset-urls
+      AuthorizationType: NONE
+      Target: !Sub integrations/${AssetUrlsIntegration}
+
+  AssetUrlsInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref AssetUrlsFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub arn:${AWS::Partition}:execute-api:${AWS::Region}:${AWS::AccountId}:${ExistingHttpApiId}/*/POST/asset-urls
+
+  AssetUrlsPreflightInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref AssetUrlsFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub arn:${AWS::Partition}:execute-api:${AWS::Region}:${AWS::AccountId}:${ExistingHttpApiId}/*/OPTIONS/asset-urls
+
 Outputs:
   MediaBucketName:
     Value: !Ref MediaBucket
@@ -212,3 +275,5 @@ Outputs:
     Value: !GetAtt MediaProcessingFunction.Arn
   StorageDeleteFunctionArn:
     Value: !GetAtt StorageDeleteFunction.Arn
+  AssetUrlsFunctionArn:
+    Value: !GetAtt AssetUrlsFunction.Arn

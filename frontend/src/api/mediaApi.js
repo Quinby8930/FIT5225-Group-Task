@@ -1,4 +1,3 @@
-import { apiConfig } from "../auth/cognitoConfig.js";
 import { apiRequest } from "./apiClient.js";
 
 function base64FromBuffer(buffer) {
@@ -17,19 +16,6 @@ export async function computeSha256Base64(file) {
 
 export function mediaKind(contentType) {
   return contentType.startsWith("video/") ? "video" : "image";
-}
-
-export function displayUrlForKey(key) {
-  if (!key) {
-    return "";
-  }
-  if (/^https?:\/\//i.test(key)) {
-    return key;
-  }
-  if (!apiConfig.assetBaseUrl) {
-    return "";
-  }
-  return `${apiConfig.assetBaseUrl.replace(/\/$/, "")}/${key.replace(/^\//, "")}`;
 }
 
 export async function requestUploadUrl(file, checksumSha256) {
@@ -60,6 +46,13 @@ export async function uploadMedia(file) {
   const reservation = await requestUploadUrl(file, checksum);
   await putUpload(reservation.upload_url, file, reservation.required_headers);
   return { ...reservation, checksum };
+}
+
+export function requestAssetUrls(keys) {
+  return apiRequest("/asset-urls", {
+    method: "POST",
+    body: JSON.stringify({ keys }),
+  });
 }
 
 export function queryByTags(tags) {

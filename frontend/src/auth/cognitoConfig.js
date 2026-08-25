@@ -23,5 +23,4 @@ export const apiConfig = {
   baseUrl:
     env.VITE_API_BASE_URL ||
     "https://2dd2aqb32j.execute-api.ap-southeast-2.amazonaws.com",
-  assetBaseUrl: env.VITE_ASSET_BASE_URL || "",
 };

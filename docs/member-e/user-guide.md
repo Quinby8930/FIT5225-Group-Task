@@ -27,6 +27,10 @@ npm run dev
 2. Upload an image or video. The UI computes a SHA-256 checksum, requests
    `POST /upload-url`, and uploads to the returned pre-signed URL.
 3. Query by tag counts, for example `dingo:1, wombat:1`.
+   The UI exchanges only your own returned S3 keys through `POST /asset-urls`
+   so private thumbnails can be previewed without making the bucket public.
+   Temporary links refresh automatically while the results remain open;
+   another user's result has no private preview.
 4. Query by species, for example `wombat`.
 5. Paste a thumbnail key and resolve the original file key.
 6. Upload a query image in the Query tab to search by detected tags without

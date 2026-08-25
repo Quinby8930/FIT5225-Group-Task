@@ -8,6 +8,7 @@ deployment approval.
 ## Already implemented and locally verifiable
 
 - Protected upload handler behavior and checksum-bound S3 pre-signing.
+- Protected, current-user-only temporary GET URLs for originals and thumbnails.
 - Per-user duplicate reservation through Member D's HTTP contract.
 - S3 event parsing, 40 MP-bounded image thumbnails, one-frame-per-second video
   sampling with a 600-second/900-frame bound, 1,024-pixel scaling, a 2 GiB
@@ -88,7 +89,7 @@ Pillow's native Lambda dependencies:
 
 ```powershell
 python -m pytest infrastructure/member-b/test_template.py backend/lambdas/media-processing/tests -q
-node --test backend/lambdas/upload/test/*.test.mjs backend/lambdas/storage-delete/test/*.test.mjs
+node --test backend/lambdas/upload/test/*.test.mjs backend/lambdas/storage-delete/test/*.test.mjs backend/lambdas/asset-urls/test/*.test.mjs
 sam validate --template-file infrastructure/member-b/template.yaml --lint
 sam build --use-container --template-file infrastructure/member-b/template.yaml
 ```
@@ -119,12 +120,15 @@ token. From the authenticated UI:
    the same user returns `409` after Member D integration is active.
 4. Verify the browser origin works and an unapproved origin is not granted CORS
    access.
+5. Request `POST /asset-urls` for the uploaded original and generated thumbnail,
+   open the returned HTTPS URLs, and verify a different user's key returns
+   `403` without exposing the key in the response.
 
 ### 7. Collect CloudWatch and S3 evidence
 
 Capture submission-safe screenshots showing:
 
-- the three Lambda functions and successful invocations;
+- the four Lambda functions and successful invocations;
 - the processing trigger filtered to `originals/`;
 - CloudWatch entries that contain no token, API key, request header dump, or
   pre-signed URL;
