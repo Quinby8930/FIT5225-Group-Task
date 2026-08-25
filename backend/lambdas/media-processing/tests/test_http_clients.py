@@ -172,12 +172,72 @@ def test_inference_client_posts_exact_contract_and_validates_response(monkeypatc
         },
     }
     assert request["headers"]["x-internal-api-key"] == "internal-test-key"
+    assert opener.calls[0][1] == 70
+
+
+def test_metadata_timeout_default_remains_ten_seconds(monkeypatch):
+    opener = RecordingUrlOpen([{"should_process": True}])
+    monkeypatch.setattr(http_clients_module, "urlopen", opener)
+
+    MetadataClient("https://metadata.example").begin_processing(
+        "file-1", {"user_id": "user-1"}
+    )
+
+    assert opener.calls[0][1] == 10
+
+
+@pytest.mark.parametrize(
+    "detections",
+    [
+        [{"species": "wombat", "confidence": 0.5}] * 1001,
+        [{}],
+        [{"species": "", "confidence": 0.5}],
+        [{"species": " ", "confidence": 0.5}],
+        [{"species": "w" * 129, "confidence": 0.5}],
+        [{"species": "wombat", "confidence": float("nan")}],
+        [{"species": "wombat", "confidence": float("inf")}],
+        [{"species": "wombat", "confidence": -0.01}],
+        [{"species": "wombat", "confidence": 1.01}],
+        [{"species": "wombat", "confidence": True}],
+    ],
+)
+def test_inference_client_rejects_invalid_detection_contracts(
+    monkeypatch, detections
+):
+    monkeypatch.setattr(
+        http_clients_module,
+        "urlopen",
+        RecordingUrlOpen(
+            [{"tags": {}, "detections": detections, "model_version": "v1"}]
+        ),
+    )
+
+    with pytest.raises(MediaPipelineError) as caught:
+        InferenceClient("https://inference.example").infer(
+            {"file_id": "file-1", "media_type": "image", "image_urls": []}
+        )
+
+    assert caught.value.code == "INFERENCE_FAILED"
+    assert caught.value.retryable is False
+
+
+def test_inference_client_accepts_exact_detection_boundaries(monkeypatch):
+    detections = [
+        {"species": "w" * 128, "confidence": 0.0},
+        *[{"species": "wombat", "confidence": 0.5}] * 998,
+        {"species": "dingo", "confidence": 1.0},
+    ]
+    response = {"tags": {}, "detections": detections, "model_version": "v1"}
+    monkeypatch.setattr(
+        http_clients_module, "urlopen", RecordingUrlOpen([response])
+    )
+
+    assert InferenceClient("https://inference.example").infer({}) == response
 
 
 @pytest.mark.parametrize(
     "response",
     [
-        _http_error(500),
         b"not-json",
         {"tags": [], "detections": [], "model_version": "v1"},
         {"tags": {}, "detections": {}, "model_version": "v1"},
@@ -200,6 +260,55 @@ def test_inference_client_maps_http_json_and_schema_failures(monkeypatch, respon
 
 
 @pytest.mark.parametrize(
+    ("status", "expected_code", "expected_retryable"),
+    [
+        (401, "INFERENCE_AUTH_FAILED", False),
+        (400, "INFERENCE_REJECTED", False),
+        (422, "INFERENCE_REJECTED", False),
+        (500, "INFERENCE_UNAVAILABLE", True),
+        (503, "INFERENCE_UNAVAILABLE", True),
+        (504, "INFERENCE_UNAVAILABLE", True),
+    ],
+)
+def test_inference_client_maps_http_status_taxonomy_without_remote_body(
+    monkeypatch, status, expected_code, expected_retryable
+):
+    error = _http_error(status)
+    error.fp = FakeResponse(b"secret remote diagnostic")
+    monkeypatch.setattr(
+        http_clients_module, "urlopen", RecordingUrlOpen([error])
+    )
+
+    with pytest.raises(MediaPipelineError) as caught:
+        InferenceClient("https://inference.example").infer({})
+
+    assert caught.value.code == expected_code
+    assert caught.value.retryable is expected_retryable
+    assert "secret remote diagnostic" not in str(caught.value)
+
+
+@pytest.mark.parametrize(
+    "failure",
+    [
+        URLError("connection unavailable"),
+        TimeoutError("request timed out"),
+    ],
+)
+def test_inference_client_maps_transport_failure_to_retryable_unavailable(
+    monkeypatch, failure
+):
+    monkeypatch.setattr(
+        http_clients_module, "urlopen", RecordingUrlOpen([failure])
+    )
+
+    with pytest.raises(MediaPipelineError) as caught:
+        InferenceClient("https://inference.example").infer({})
+
+    assert caught.value.code == "INFERENCE_UNAVAILABLE"
+    assert caught.value.retryable is True
+
+
+@pytest.mark.parametrize(
     ("client_factory", "invoke", "expected_code"),
     [
         (
@@ -212,7 +321,7 @@ def test_inference_client_maps_http_json_and_schema_failures(monkeypatch, respon
             lambda client: client.infer(
                 {"file_id": "file-1", "media_type": "image", "image_urls": []}
             ),
-            "INFERENCE_FAILED",
+            "INFERENCE_UNAVAILABLE",
         ),
     ],
 )
@@ -304,3 +413,48 @@ def test_inference_client_caps_json_response_reads_at_one_mib(monkeypatch):
 def test_internal_http_clients_reject_non_https_base_urls(client_type, base_url):
     with pytest.raises(ValueError, match="HTTPS"):
         client_type(base_url, internal_api_key="must-not-be-sent")
+
+
+@pytest.mark.parametrize(
+    ("client", "invoke", "expected_code"),
+    [
+        (
+            MetadataClient("https://metadata.example", internal_api_key="secret-key"),
+            lambda value: value.begin_processing("file-1", {"user_id": "user-1"}),
+            "DEPENDENCY_UNAVAILABLE",
+        ),
+        (
+            InferenceClient("https://inference.example", internal_api_key="secret-key"),
+            lambda value: value.infer({"file_id": "file-1"}),
+            "INFERENCE_UNAVAILABLE",
+        ),
+    ],
+)
+def test_authenticated_clients_reject_redirect_without_forwarding_key(
+    monkeypatch, client, invoke, expected_code
+):
+    handler_type = getattr(http_clients_module, "_NoRedirectHandler", None)
+    assert handler_type is not None
+    assert http_clients_module.urlopen is http_clients_module._open_without_redirect
+    original = client.base_url + "/original"
+    destination = "https://attacker.example/collect"
+    request = http_clients_module.Request(
+        original, headers={"X-Internal-Api-Key": "secret-key"}
+    )
+    assert handler_type().redirect_request(
+        request, None, 302, "redirect", {}, destination
+    ) is None
+
+    redirect = HTTPError(original, 302, "redirect", {"Location": destination}, None)
+    transport = RecordingUrlOpen([redirect, {"should_process": True}])
+    monkeypatch.setattr(http_clients_module, "urlopen", transport)
+
+    with pytest.raises(MediaPipelineError) as caught:
+        invoke(client)
+
+    assert caught.value.code == expected_code
+    assert len(transport.calls) == 1
+    sent = _recorded_request(transport.calls[0][0])
+    assert sent["headers"]["x-internal-api-key"] == "secret-key"
+    assert transport.calls[0][0].full_url.startswith(client.base_url)
+    assert all(call[0].full_url != destination for call in transport.calls)

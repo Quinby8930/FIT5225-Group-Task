@@ -5,6 +5,7 @@ import { createS3Presigner } from './presigner.mjs';
 import { createUploadService } from './service.mjs';
 
 const DEFAULT_MAX_UPLOAD_BYTES = 262_144_000;
+const DEFAULT_MAX_IMAGE_UPLOAD_BYTES = 12_582_912;
 
 function response(statusCode, payload, allowedOrigin) {
   return {
@@ -21,6 +22,7 @@ function response(statusCode, payload, allowedOrigin) {
 
 function errorResponse(error, allowedOrigin) {
   const code = error?.code;
+  if (code === 'FILE_TOO_LARGE') return response(413, { code }, allowedOrigin);
   if (code === 'INVALID_REQUEST' || code === 'UNSUPPORTED_FILE_TYPE' || code === 'INVALID_CHECKSUM') return response(400, { code }, allowedOrigin);
   if (code === 'UNAUTHENTICATED') return response(401, { code }, allowedOrigin);
   if (code === 'DUPLICATE_FILE') return response(409, { code, ...(error.existing_file_id ? { existing_file_id: error.existing_file_id } : {}) }, allowedOrigin);
@@ -28,7 +30,7 @@ function errorResponse(error, allowedOrigin) {
   return response(500, { code: 'INTERNAL_ERROR' }, allowedOrigin);
 }
 
-export function createHandler({ createService, maxUploadBytes = DEFAULT_MAX_UPLOAD_BYTES, allowedOrigin = 'http://localhost:3000' }) {
+export function createHandler({ createService, maxUploadBytes = DEFAULT_MAX_UPLOAD_BYTES, maxImageUploadBytes = DEFAULT_MAX_IMAGE_UPLOAD_BYTES, allowedOrigin = 'http://localhost:3000' }) {
   let service;
   return async function uploadHandler(event = {}) {
     if (event.requestContext?.http?.method === 'OPTIONS' || event.httpMethod === 'OPTIONS') return response(204, undefined, allowedOrigin);
@@ -41,7 +43,7 @@ export function createHandler({ createService, maxUploadBytes = DEFAULT_MAX_UPLO
       return response(400, { code: 'INVALID_REQUEST' }, allowedOrigin);
     }
     try {
-      service ??= createService({ maxBytes: maxUploadBytes });
+      service ??= createService({ maxBytes: maxUploadBytes, maxImageBytes: maxImageUploadBytes });
       return response(200, await service.createUpload({ userId, request }), allowedOrigin);
     } catch (error) {
       return errorResponse(error, allowedOrigin);
@@ -52,6 +54,11 @@ export function createHandler({ createService, maxUploadBytes = DEFAULT_MAX_UPLO
 function configuredMaxBytes() {
   const parsed = Number(process.env.MAX_UPLOAD_BYTES);
   return Number.isInteger(parsed) && parsed > 0 ? parsed : DEFAULT_MAX_UPLOAD_BYTES;
+}
+
+function configuredMaxImageBytes() {
+  const parsed = Number(process.env.MAX_IMAGE_UPLOAD_BYTES);
+  return Number.isInteger(parsed) && parsed > 0 ? parsed : DEFAULT_MAX_IMAGE_UPLOAD_BYTES;
 }
 
 async function createProductionHandler() {
@@ -71,12 +78,14 @@ async function createProductionHandler() {
   });
   return createHandler({
     maxUploadBytes: configuredMaxBytes(),
+    maxImageUploadBytes: configuredMaxImageBytes(),
     allowedOrigin: process.env.ALLOWED_ORIGIN || 'http://localhost:3000',
-    createService: ({ maxBytes }) => createUploadService({
+    createService: ({ maxBytes, maxImageBytes }) => createUploadService({
       createFileId: randomUUID,
       reserveUpload: metadataClient.reserveUpload,
       presignUpload,
       maxBytes,
+      maxImageBytes,
     }),
   });
 }

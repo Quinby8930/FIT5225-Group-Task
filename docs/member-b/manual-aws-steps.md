@@ -43,7 +43,8 @@ change.
 ### 2. Look up the existing JWT authorizer ID
 
 ```powershell
-aws apigatewayv2 get-authorizers --api-id 2dd2aqb32j --region $CourseRegion
+$HttpApiId = Read-Host 'Existing HTTP API ID'
+aws apigatewayv2 get-authorizers --api-id $HttpApiId --region $CourseRegion
 ```
 
 Record only the authorizer ID in the deployment interaction. Verify that it is
@@ -69,9 +70,9 @@ lease through the existing failed transition so the Lambda retry is not
 mistaken for a completed duplicate. Do not invent a replay or lease-token
 endpoint to fill this gate.
 
-If the team uses an internal API key, pass it using the course-approved secret
-workflow. Do not put the value in Git, documentation, screenshots, chat, or a
-saved command line.
+Obtain the team's non-empty shared internal API key and pass the same value to
+Members B, C, and D using the course-approved secret workflow. Do not put the
+value in Git, documentation, screenshots, chat, or a saved command line.
 
 ### 4. Provide the FFmpeg Lambda layer
 
@@ -103,8 +104,11 @@ sam deploy --guided --template-file .aws-sam/build/template.yaml
 ```
 
 Supply the approved region, the existing HTTP API and authorizer, the two
-teammate endpoint values, the approved FFmpeg layer, and the intended browser
-origin when prompted. Review the change set before confirmation.
+teammate endpoint values, the approved FFmpeg layer, the intended browser
+origin, and the required non-empty shared `InternalApiKey` when prompted. The
+template has no live API ID or empty-key default. Do not put the shared key in
+the repository or command-line arguments, and review the change set before
+confirmation.
 
 ### 6. Perform a live Cognito/browser upload test
 

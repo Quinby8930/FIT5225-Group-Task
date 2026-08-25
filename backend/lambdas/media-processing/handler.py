@@ -53,6 +53,7 @@ def _build_dependencies():
     inference = InferenceClient(
         os.environ["INFERENCE_API_URL"],
         internal_api_key=internal_api_key,
+        timeout=int(os.environ.get("INFERENCE_HTTP_TIMEOUT_SECONDS", "70")),
     )
     pipeline = MediaPipeline(
         storage=storage,

@@ -21,13 +21,25 @@ test('rejects malformed request JSON', async () => {
   assert.equal(response.statusCode, 400); assert.deepEqual(body(response), { code: 'INVALID_REQUEST' });
 });
 
-test('returns the upload contract on success and applies the configured maximum size', async () => {
+test('returns the upload contract on success and applies both configured size caps', async () => {
   let received;
   let serviceOptions;
-  const response = await createHandler({ maxUploadBytes: 12, createService: (options) => { serviceOptions = options; return { createUpload: async (input) => { received = input; return { file_id: 'file-1' }; } }; } })(event());
+  const response = await createHandler({ maxUploadBytes: 12, maxImageUploadBytes: 10, createService: (options) => { serviceOptions = options; return { createUpload: async (input) => { received = input; return { file_id: 'file-1' }; } }; } })(event());
   assert.equal(response.statusCode, 200); assert.deepEqual(body(response), { file_id: 'file-1' });
   assert.equal(received.userId, 'user-1'); assert.equal(received.request.size_bytes, 12);
-  assert.deepEqual(serviceOptions, { maxBytes: 12 });
+  assert.deepEqual(serviceOptions, { maxBytes: 12, maxImageBytes: 10 });
+});
+
+test('uses the contract defaults for both upload caps', async () => {
+  let serviceOptions;
+  await createHandler({ createService: (options) => { serviceOptions = options; return { createUpload: async () => ({}) }; } })(event());
+  assert.deepEqual(serviceOptions, { maxBytes: 262_144_000, maxImageBytes: 12_582_912 });
+});
+
+test('maps an over-limit file to HTTP 413', async () => {
+  const error = new Error('too large'); error.code = 'FILE_TOO_LARGE';
+  const response = await createHandler({ createService: () => ({ createUpload: async () => { throw error; } }) })(event());
+  assert.equal(response.statusCode, 413); assert.deepEqual(body(response), { code: 'FILE_TOO_LARGE' });
 });
 
 test('maps duplicate reservations and supplies configured CORS headers', async () => {

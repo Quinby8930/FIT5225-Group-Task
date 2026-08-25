@@ -6,7 +6,7 @@ deletion. It connects `POST /upload-url` and `POST /asset-urls` to the existing
 HTTP API and JWT authorizer, and sends metadata and inference requests only
 through deployment-time HTTPS endpoint parameters. The template rejects
 plaintext endpoint values, and both runtime clients validate HTTPS again before
-sending an optional internal API key.
+sending the required shared internal API key.
 
 No AWS deployment was performed while preparing these repository artifacts.
 The template has local structural coverage; account-specific validation and
@@ -33,12 +33,12 @@ deployment remain manual steps.
 
 | Parameter | Required | Default | Purpose |
 | --- | --- | --- | --- |
-| `ExistingHttpApiId` | No | `2dd2aqb32j` | Existing API Gateway HTTP API to receive `POST /upload-url`. |
+| `ExistingHttpApiId` | Yes | None | Existing API Gateway HTTP API to receive `POST /upload-url`; it must be supplied at deployment. |
 | `ExistingJwtAuthorizerId` | Yes | None | Authorizer ID already configured on that HTTP API. |
 | `AllowedOrigin` | No | `http://localhost:3000` | Exact browser origin allowed by Lambda responses and S3 CORS. |
 | `MetadataApiBaseUrl` | Yes | None | Member D HTTPS base URL used for reservation and processing status calls. |
 | `InferenceApiUrl` | Yes | None | Member C HTTPS base URL; the processing client appends `/infer`. |
-| `InternalApiKey` | No | Empty, `NoEcho` | Optional shared internal HTTP credential; provide it only through an approved deployment secret-handling process. |
+| `InternalApiKey` | Yes | None (`NoEcho`, minimum length 1) | Non-empty shared internal HTTP credential; provide it only through an approved deployment secret-handling process. |
 | `FfmpegLayerArn` | No | Empty | ARN of a compatible layer that exposes `/opt/bin/ffmpeg`; omitted when empty. |
 | `MaxUploadBytes` | No | `262144000` | Maximum accepted upload size passed to the upload handler. |
 
@@ -99,12 +99,13 @@ Complete local regression commands are in
 Before any deployment, the student must obtain approval and supply:
 
 1. An active AWS Academy session and the course-approved AWS region.
-2. The real authorizer ID for HTTP API `2dd2aqb32j`.
+2. The real existing HTTP API ID and its JWT authorizer ID.
 3. Reachable HTTPS Member C inference and Member D metadata endpoint values.
 4. An approved, architecture-compatible FFmpeg Lambda layer whose executable
    is `/opt/bin/ffmpeg`.
-5. Any optional internal API key through the approved secret-handling process,
-   never committed to this repository or copied into documentation.
+5. The same non-empty internal API key used by Members C and D, supplied
+   through the approved secret-handling process, never committed to this
+   repository or copied into documentation.
 6. Approval to build/package/deploy and permission to capture live evidence.
 
 The complete operator checklist is in

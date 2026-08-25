@@ -1,9 +1,9 @@
 import { validateUploadRequest } from './validation.mjs';
 
-export function createUploadService({ createFileId, reserveUpload, presignUpload, maxBytes = 262_144_000, expiresIn = 300 }) {
+export function createUploadService({ createFileId, reserveUpload, presignUpload, maxBytes = 262_144_000, maxImageBytes = 12_582_912, expiresIn = 300 }) {
   return {
     async createUpload({ userId, request }) {
-      const upload = validateUploadRequest(request, maxBytes);
+      const upload = validateUploadRequest(request, { maxBytes, maxImageBytes });
       const fileId = createFileId();
       const objectKey = `originals/${userId}/${fileId}/${upload.filename}`;
       await reserveUpload({

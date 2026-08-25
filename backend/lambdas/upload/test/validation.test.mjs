@@ -40,8 +40,20 @@ test('rejects malformed and noncanonical SHA-256 checksums', () => {
 test('rejects zero, non-integer, and over-limit sizes', () => {
   expectCode(() => validateUploadRequest(request({ size_bytes: 0 })), 'INVALID_REQUEST');
   expectCode(() => validateUploadRequest(request({ size_bytes: 1.5 })), 'INVALID_REQUEST');
-  expectCode(() => validateUploadRequest(request({ size_bytes: 101 }), 100), 'INVALID_REQUEST');
-  assert.equal(validateUploadRequest(request({ size_bytes: 100 }), 100).sizeBytes, 100);
+  expectCode(() => validateUploadRequest(request({ size_bytes: 101 }), { maxBytes: 100, maxImageBytes: 100 }), 'FILE_TOO_LARGE');
+  assert.equal(validateUploadRequest(request({ size_bytes: 100 }), { maxBytes: 100, maxImageBytes: 100 }).sizeBytes, 100);
+});
+
+test('applies the 12 MiB inference cap only to images', () => {
+  const maxImageBytes = 12_582_912;
+  const maxBytes = 262_144_000;
+  const limits = { maxBytes, maxImageBytes };
+
+  assert.equal(validateUploadRequest(request({ size_bytes: maxImageBytes }), limits).sizeBytes, maxImageBytes);
+  expectCode(() => validateUploadRequest(request({ size_bytes: maxImageBytes + 1 }), limits), 'FILE_TOO_LARGE');
+  assert.equal(validateUploadRequest(request({ content_type: 'video/mp4', size_bytes: maxImageBytes + 1 }), limits).sizeBytes, maxImageBytes + 1);
+  assert.equal(validateUploadRequest(request({ content_type: 'video/mp4', size_bytes: maxBytes }), limits).sizeBytes, maxBytes);
+  expectCode(() => validateUploadRequest(request({ content_type: 'video/mp4', size_bytes: maxBytes + 1 }), limits), 'FILE_TOO_LARGE');
 });
 
 test('removes paths and unsafe filename characters', () => {

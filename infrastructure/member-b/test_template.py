@@ -62,7 +62,7 @@ def _as_list(value):
 
 def test_template_declares_required_parameters(template):
     parameters = template["Parameters"]
-    assert parameters["ExistingHttpApiId"]["Default"] == "2dd2aqb32j"
+    assert "Default" not in parameters["ExistingHttpApiId"]
     assert "Default" not in parameters["ExistingJwtAuthorizerId"]
     assert parameters["AllowedOrigin"]["Default"] == "http://localhost:3000"
     assert "Default" not in parameters["MetadataApiBaseUrl"]
@@ -73,9 +73,12 @@ def test_template_declares_required_parameters(template):
     assert parameters["InternalApiKey"] == {
         "Type": "String",
         "NoEcho": True,
-        "Default": "",
+        "MinLength": 1,
     }
     assert parameters["FfmpegLayerArn"]["Default"] == ""
+    assert parameters["MaxUploadBytes"]["Default"] == 262144000
+    assert parameters["MaxImageUploadBytes"]["Default"] == 12582912
+    assert parameters["InferenceHttpTimeoutSeconds"]["Default"] == 70
 
 
 def test_endpoint_parameter_patterns_require_an_https_host_and_base_path(template):
@@ -182,6 +185,7 @@ def test_function_environment_names_match_production_handlers(template):
             "METADATA_API_BASE_URL",
             "INTERNAL_API_KEY",
             "MAX_UPLOAD_BYTES",
+            "MAX_IMAGE_UPLOAD_BYTES",
             "ALLOWED_ORIGIN",
         },
         "MediaProcessingFunction": {
@@ -189,6 +193,7 @@ def test_function_environment_names_match_production_handlers(template):
             "METADATA_API_BASE_URL",
             "INFERENCE_API_URL",
             "INTERNAL_API_KEY",
+            "INFERENCE_HTTP_TIMEOUT_SECONDS",
             "FFMPEG_PATH",
         },
         "StorageDeleteFunction": {"MEDIA_BUCKET_NAME"},
@@ -197,6 +202,13 @@ def test_function_environment_names_match_production_handlers(template):
     for function, names in expected.items():
         variables = _properties(template, function)["Environment"]["Variables"]
         assert set(variables) == names
+
+    upload_variables = _properties(template, "UploadFunction")["Environment"]["Variables"]
+    assert upload_variables["MAX_IMAGE_UPLOAD_BYTES"] == {"Ref": "MaxImageUploadBytes"}
+    processing_variables = _properties(template, "MediaProcessingFunction")["Environment"]["Variables"]
+    assert processing_variables["INFERENCE_HTTP_TIMEOUT_SECONDS"] == {
+        "Ref": "InferenceHttpTimeoutSeconds"
+    }
 
 
 def test_upload_post_route_uses_existing_jwt_authorizer(template):

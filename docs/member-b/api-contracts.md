@@ -2,11 +2,13 @@
 
 These JSON/HTTP boundaries let Member B integrate with Member C and Member D
 without depending on their hosting provider, model implementation, or database.
-All internal HTTP requests use `Content-Type: application/json` and add
-`X-Internal-Api-Key` only when `INTERNAL_API_KEY` is configured.
+All deployed internal HTTP requests use `Content-Type: application/json` and
+send the required non-empty `INTERNAL_API_KEY` as `X-Internal-Api-Key`.
 `METADATA_API_BASE_URL` and `INFERENCE_API_URL` must be valid HTTPS URLs;
 clients reject plaintext or malformed endpoint configuration before sending a
-request. JSON dependency responses are limited to 1 MiB.
+request. Authenticated requests do not follow redirects, so the shared key is
+never forwarded to a second destination. JSON dependency responses are limited
+to 1 MiB.
 
 ## Ownership
 
@@ -36,8 +38,9 @@ Content-Type: application/json
 }
 ```
 
-The checksum is canonical Base64 for the raw 32-byte SHA-256 digest. The
-default size limit is 262,144,000 bytes. Accepted content types are
+The checksum is canonical Base64 for the raw 32-byte SHA-256 digest. Images
+are limited to 12,582,912 bytes so the original remains within C's source
+limit. Videos keep a separate 262,144,000-byte limit. Accepted content types are
 `image/jpeg`, `image/png`, `image/webp`, `video/mp4`, and `video/quicktime`.
 The verified Cognito `sub` becomes `user_id`; callers cannot provide it or
 choose an S3 key.
@@ -70,6 +73,7 @@ returns `204` for the configured origin, while POST remains JWT-protected.
 | `400` | `UNSUPPORTED_FILE_TYPE` | Content type is outside the accepted set. |
 | `400` | `INVALID_CHECKSUM` | Checksum is not canonical Base64 for 32 bytes. |
 | `401` | `UNAUTHENTICATED` | The verified JWT `sub` claim is absent. |
+| `413` | `FILE_TOO_LARGE` | The declared image or video size exceeds its media-specific cap. |
 | `409` | `DUPLICATE_FILE` | Member D already reserved this user's checksum; `existing_file_id` is included when supplied. |
 | `503` | `DEPENDENCY_UNAVAILABLE` | The metadata reservation did not complete. |
 | `500` | `INTERNAL_ERROR` | Pre-signing or another unexpected operation failed. |
@@ -231,13 +235,16 @@ PUT {METADATA_API_BASE_URL}/internal/files/{file_id}/failed
 }
 ```
 
-The message is truncated to 240 characters. Locally reportable error codes are
-`INVALID_MEDIA`, `FRAME_EXTRACTION_FAILED`, `INFERENCE_FAILED`, and
-`PROCESSING_TIME_BUDGET_EXHAUSTED`. The last code is retryable: Member D's
-failed transition must clear the active lease and permit the same S3 event to
-acquire processing again. Member D must return a successful status with a JSON
-object. Metadata failures remain retryable so S3/Lambda delivery can retry. The
-failure PUT is idempotent for a replayed processing attempt.
+The message is truncated to 240 characters. Reportable error codes are
+`INVALID_MEDIA`, `FRAME_EXTRACTION_FAILED`, `INFERENCE_FAILED`,
+`INFERENCE_AUTH_FAILED`, `INFERENCE_REJECTED`, `INFERENCE_UNAVAILABLE`, and
+`PROCESSING_TIME_BUDGET_EXHAUSTED`. B always records the failed transition
+first. A non-retryable error then returns a stable failed result so Lambda does
+not retry a terminal 401/4xx/contract rejection forever. A retryable error
+rethrows only after Member D clears the active lease, permitting the same S3
+event to acquire processing again. Member D must return a successful status
+with a JSON object; failure of that metadata PUT propagates as retryable
+`DEPENDENCY_UNAVAILABLE`. The failure PUT is idempotent for a replayed attempt.
 
 ## Member C inference contract
 
@@ -283,9 +290,21 @@ Successful JSON response:
 }
 ```
 
-`tags` must be an object, `detections` a list, and `model_version` a non-empty
-string. A transport, HTTP, invalid UTF-8/JSON, response-over-1-MiB, or schema
-failure maps to `INFERENCE_FAILED`.
+Species keys and detection species use the team's short wire names, such as
+`dingo`, `wombat`, and `cassowary`, rather than scientific model labels.
+`tags` must be an object and `model_version` a non-empty string. `detections`
+contains at most 1,000 objects; every object has a non-empty species of at most
+128 characters and a finite numeric confidence in `[0,1]`. Invalid UTF-8/JSON,
+a response over 1 MiB, or a malformed schema maps to non-retryable
+`INFERENCE_FAILED`.
+
+C's application deadline is 45 seconds, the Alibaba Function Compute timeout
+is 60 seconds, and B applies a 70-second timeout only to `InferenceClient`;
+metadata clients retain their 10-second default. C HTTP `401` maps to
+non-retryable `INFERENCE_AUTH_FAILED`; other C 4xx responses map to
+non-retryable `INFERENCE_REJECTED`; C 5xx (including `504`), network failures,
+and client timeouts map to retryable `INFERENCE_UNAVAILABLE`. Remote C response
+bodies are never included in B's errors.
 
 ## Guarded storage deletion
 

@@ -1,12 +1,12 @@
 from __future__ import annotations
 
+import hmac
 import json
 import logging
 import os
 import time
 import urllib.error
 import urllib.request
-from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
@@ -16,8 +16,14 @@ from PIL import UnidentifiedImageError
 from .backends.mock import MockInferenceBackend
 from .backends.speciesnet import SpeciesNetBackend
 from .config import Settings
-from .inference import InferenceInputError, InferenceService, InferenceTimeoutError
+from .inference import (
+    InferenceInputError,
+    InferenceResultLimitError,
+    InferenceService,
+    InferenceTimeoutError,
+)
 from .schemas import RequestValidationError, parse_inference_request
+from .species import SpeciesMapper
 
 LOGGER = logging.getLogger("pacific_bioarchive_ml")
 
@@ -74,26 +80,13 @@ def build_fetcher(settings: Settings):
     return fetch_url
 
 
-def _infer_with_timeout(
-    service: InferenceService,
-    request: Any,
-    timeout_seconds: int,
-):
-    executor = ThreadPoolExecutor(max_workers=1)
-    future = executor.submit(service.infer, request)
-    try:
-        return future.result(timeout=timeout_seconds)
-    except FutureTimeoutError as exc:
-        future.cancel()
-        raise InferenceTimeoutError(
-            f"inference exceeded {timeout_seconds} seconds"
-        ) from exc
-    finally:
-        executor.shutdown(wait=False, cancel_futures=True)
-
-
 def build_service(settings: Settings) -> InferenceService:
-    return InferenceService(build_backend(settings), build_fetcher(settings))
+    return InferenceService(
+        build_backend(settings),
+        build_fetcher(settings),
+        SpeciesMapper.from_file(settings.labels_path),
+        max_detections=settings.max_detections,
+    )
 
 
 def _json_bytes(payload: Any) -> bytes:
@@ -125,12 +118,16 @@ class InferenceHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
-    def _authorized(self) -> bool:
+    def _authorization_error(self) -> HTTPStatus | None:
         expected = self.settings.internal_api_key
         if expected is None:
-            return True
+            if self.settings.allow_unauthenticated_inference:
+                return None
+            return HTTPStatus.SERVICE_UNAVAILABLE
         provided = self.headers.get("X-Internal-Api-Key", "")
-        return provided == expected
+        if hmac.compare_digest(provided, expected):
+            return None
+        return HTTPStatus.UNAUTHORIZED
 
     def do_GET(self) -> None:  # noqa: N802
         if self.path == "/health":
@@ -158,8 +155,14 @@ class InferenceHandler(BaseHTTPRequestHandler):
         if self.path != "/infer":
             self._send_json(HTTPStatus.NOT_FOUND, {"error": "not_found"})
             return
-        if not self._authorized():
-            self._send_json(HTTPStatus.UNAUTHORIZED, {"error": "unauthorized"})
+        auth_error = self._authorization_error()
+        if auth_error is not None:
+            error_code = (
+                "internal_auth_not_configured"
+                if auth_error == HTTPStatus.SERVICE_UNAVAILABLE
+                else "unauthorized"
+            )
+            self._send_json(auth_error, {"error": error_code})
             return
 
         content_length = self.headers.get("Content-Length")
@@ -179,10 +182,10 @@ class InferenceHandler(BaseHTTPRequestHandler):
         try:
             payload = json.loads(self.rfile.read(length))
             request = parse_inference_request(payload, self.settings.max_source_urls)
-            result = _infer_with_timeout(
-                self.inference_service,
+            deadline = time.monotonic() + self.settings.request_timeout_seconds
+            result = self.inference_service.infer(
                 request,
-                self.settings.request_timeout_seconds,
+                deadline=deadline,
             )
             response = result.as_dict()
             status = HTTPStatus.OK
@@ -194,6 +197,9 @@ class InferenceHandler(BaseHTTPRequestHandler):
             status = HTTPStatus.UNPROCESSABLE_ENTITY
         except (InferenceInputError, UnidentifiedImageError) as exc:
             response = {"error": "invalid_source", "detail": str(exc)}
+            status = HTTPStatus.UNPROCESSABLE_ENTITY
+        except InferenceResultLimitError as exc:
+            response = {"error": "detection_limit_exceeded", "detail": str(exc)}
             status = HTTPStatus.UNPROCESSABLE_ENTITY
         except InferenceTimeoutError as exc:
             response = {"error": "inference_timeout", "detail": str(exc)}
@@ -216,7 +222,7 @@ class InferenceHandler(BaseHTTPRequestHandler):
 
 
 class InferenceServer(ThreadingHTTPServer):
-    daemon_threads = True
+    daemon_threads = False
 
 
 def create_server(

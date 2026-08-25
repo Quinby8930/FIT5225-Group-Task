@@ -5,7 +5,6 @@ Description: Private media ingestion and preprocessing boundary for Member B.
 Parameters:
   ExistingHttpApiId:
     Type: String
-    Default: 2dd2aqb32j
   ExistingJwtAuthorizerId:
     Type: String
   AllowedOrigin:
@@ -22,13 +21,19 @@ Parameters:
   InternalApiKey:
     Type: String
     NoEcho: true
-    Default: ''
+    MinLength: 1
   FfmpegLayerArn:
     Type: String
     Default: ''
   MaxUploadBytes:
     Type: Number
     Default: 262144000
+  MaxImageUploadBytes:
+    Type: Number
+    Default: 12582912
+  InferenceHttpTimeoutSeconds:
+    Type: Number
+    Default: 70
 
 Conditions:
   HasFfmpegLayer: !Not [!Equals [!Ref FfmpegLayerArn, '']]
@@ -85,6 +90,7 @@ Resources:
           METADATA_API_BASE_URL: !Ref MetadataApiBaseUrl
           INTERNAL_API_KEY: !Ref InternalApiKey
           MAX_UPLOAD_BYTES: !Ref MaxUploadBytes
+          MAX_IMAGE_UPLOAD_BYTES: !Ref MaxImageUploadBytes
           ALLOWED_ORIGIN: !Ref AllowedOrigin
       Policies:
         - AWSLambdaBasicExecutionRole
@@ -111,6 +117,7 @@ Resources:
           METADATA_API_BASE_URL: !Ref MetadataApiBaseUrl
           INFERENCE_API_URL: !Ref InferenceApiUrl
           INTERNAL_API_KEY: !Ref InternalApiKey
+          INFERENCE_HTTP_TIMEOUT_SECONDS: !Ref InferenceHttpTimeoutSeconds
           FFMPEG_PATH: /opt/bin/ffmpeg
       Policies:
         - AWSLambdaBasicExecutionRole

@@ -33,8 +33,13 @@ resources:
         MODEL_PATH: /app/models/model.pt
         DETECTOR_MODEL_PATH: /app/models/mdv5a.pt
         LABELS_PATH: /app/config/labels.txt
+        INFER_TIMEOUT_SECONDS: "45"
+        MAX_IMAGE_BYTES: "12582912"
+        MAX_DETECTIONS: "1000"
         MAX_SOURCE_URLS: "900"
+        MAX_REQUEST_BYTES: "26214400"
         INTERNAL_API_KEY: ${env(INTERNAL_API_KEY)}
+        ALLOW_UNAUTHENTICATED_INFERENCE: "false"
       triggers:
         - triggerName: http
           triggerType: http

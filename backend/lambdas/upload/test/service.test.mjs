@@ -55,6 +55,29 @@ test('does not pre-sign when duplicate reservation fails', async () => {
   assert.equal(presigned, false);
 });
 
+test('threads separate image and video caps into upload validation', async () => {
+  let reserved = false;
+  const service = createUploadService({
+    createFileId: () => 'file-123',
+    reserveUpload: async () => { reserved = true; },
+    presignUpload: async () => 'https://upload.example',
+    maxBytes: 200,
+    maxImageBytes: 100,
+  });
+
+  await assert.rejects(
+    () => service.createUpload({ userId: 'user-456', request: { ...request, size_bytes: 101 } }),
+    { code: 'FILE_TOO_LARGE' },
+  );
+  assert.equal(reserved, false);
+
+  await service.createUpload({
+    userId: 'user-456',
+    request: { ...request, filename: 'wombat.mp4', content_type: 'video/mp4', size_bytes: 200 },
+  });
+  assert.equal(reserved, true);
+});
+
 test('binds the declared size and required headers to the 300-second PUT signature', async () => {
   let commandInput;
   let signingOptions;

@@ -26,10 +26,12 @@ class Settings:
     max_request_bytes: int
     max_source_urls: int
     max_image_bytes: int
+    max_detections: int
     request_timeout_seconds: int
     confidence_threshold: float
     allow_remote_urls: bool
     remote_url_timeout_seconds: int
+    allow_unauthenticated_inference: bool = False
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -54,9 +56,14 @@ class Settings:
             max_request_bytes=_positive_int("MAX_REQUEST_BYTES", 25 * 1024 * 1024),
             max_source_urls=_positive_int("MAX_SOURCE_URLS", 900),
             max_image_bytes=_positive_int("MAX_IMAGE_BYTES", 12 * 1024 * 1024),
+            max_detections=_positive_int("MAX_DETECTIONS", 1000),
             request_timeout_seconds=_positive_int("INFER_TIMEOUT_SECONDS", 45),
             confidence_threshold=confidence,
             allow_remote_urls=os.getenv("ALLOW_REMOTE_URLS", "true").lower()
             in {"1", "true", "yes"},
             remote_url_timeout_seconds=_positive_int("REMOTE_URL_TIMEOUT_SECONDS", 20),
+            allow_unauthenticated_inference=os.getenv(
+                "ALLOW_UNAUTHENTICATED_INFERENCE", "false"
+            ).lower()
+            in {"1", "true", "yes"},
         )

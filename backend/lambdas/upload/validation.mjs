@@ -26,10 +26,16 @@ function isCanonicalChecksum(value) {
   return decoded.length === 32 && decoded.toString('base64') === value;
 }
 
-export function validateUploadRequest(input, maxBytes = 262_144_000) {
+export function validateUploadRequest(
+  input,
+  { maxBytes = 262_144_000, maxImageBytes = 12_582_912 } = {},
+) {
   if (!input || typeof input !== 'object') throw new UploadError('INVALID_REQUEST');
   if (!ALLOWED_CONTENT_TYPES.has(input.content_type)) throw new UploadError('UNSUPPORTED_FILE_TYPE');
-  if (!Number.isInteger(input.size_bytes) || input.size_bytes <= 0 || input.size_bytes > maxBytes) throw new UploadError('INVALID_REQUEST');
+  if (!Number.isInteger(input.size_bytes) || input.size_bytes <= 0) throw new UploadError('INVALID_REQUEST');
+  const fileType = input.content_type.startsWith('image/') ? 'image' : 'video';
+  const sizeLimit = fileType === 'image' ? Math.min(maxBytes, maxImageBytes) : maxBytes;
+  if (input.size_bytes > sizeLimit) throw new UploadError('FILE_TOO_LARGE');
   if (!isCanonicalChecksum(input.checksum_sha256)) throw new UploadError('INVALID_CHECKSUM');
 
   const filename = sanitizeFilename(input.filename);
@@ -40,6 +46,6 @@ export function validateUploadRequest(input, maxBytes = 262_144_000) {
     contentType: input.content_type,
     sizeBytes: input.size_bytes,
     checksumSha256: input.checksum_sha256,
-    fileType: input.content_type.startsWith('image/') ? 'image' : 'video',
+    fileType,
   };
 }

@@ -331,7 +331,7 @@ def test_video_pipeline_uploads_signed_frames_once_and_cleans_them_after_success
     assert all(not path.exists() for path in storage.local_paths)
 
 
-def test_video_pipeline_records_bounded_inference_failure_and_cleans_frames():
+def test_video_pipeline_acknowledges_bounded_inference_failure_and_cleans_frames():
     pipeline, storage, metadata, inference, order = make_pipeline(
         content_type="video/quicktime"
     )
@@ -339,10 +339,13 @@ def test_video_pipeline_records_bounded_inference_failure_and_cleans_frames():
         "INFERENCE_FAILED", "x" * 1000
     )
 
-    with pytest.raises(MediaPipelineError) as caught:
-        pipeline.process_record(s3_record("wombat.mov"))
+    result = pipeline.process_record(s3_record("wombat.mov"))
 
-    assert caught.value.code == "INFERENCE_FAILED"
+    assert result == {
+        "status": "failed",
+        "file_id": "file-1",
+        "error_code": "INFERENCE_FAILED",
+    }
     assert metadata.failed[0][0] == "file-1"
     failure = metadata.failed[0][1]
     assert failure["user_id"] == "user-1"
@@ -354,6 +357,49 @@ def test_video_pipeline_records_bounded_inference_failure_and_cleans_frames():
         "processing/user-1/file-1/frames/frame-000002.jpg",
     ]
     assert order.index("delete") < order.index("fail")
+
+
+@pytest.mark.parametrize("error_code", ["INFERENCE_AUTH_FAILED", "INFERENCE_REJECTED"])
+def test_terminal_inference_categories_mark_failed_and_do_not_retry(error_code):
+    pipeline, _, metadata, inference, order = make_pipeline()
+    inference.error = MediaPipelineError(
+        error_code, "terminal inference rejection", retryable=False
+    )
+
+    result = pipeline.process_record(s3_record())
+
+    assert result == {
+        "status": "failed",
+        "file_id": "file-1",
+        "error_code": error_code,
+    }
+    assert metadata.failed == [
+        (
+            "file-1",
+            {
+                "user_id": "user-1",
+                "error_code": error_code,
+                "message": "terminal inference rejection",
+                "status": "failed",
+            },
+        )
+    ]
+    assert order[-1] == "fail"
+
+
+def test_retryable_inference_unavailable_clears_lease_before_raising_for_retry():
+    pipeline, _, metadata, inference, order = make_pipeline()
+    inference.error = MediaPipelineError(
+        "INFERENCE_UNAVAILABLE", "temporary inference outage", retryable=True
+    )
+
+    with pytest.raises(MediaPipelineError) as caught:
+        pipeline.process_record(s3_record())
+
+    assert caught.value.code == "INFERENCE_UNAVAILABLE"
+    assert caught.value.retryable is True
+    assert metadata.failed[0][1]["error_code"] == "INFERENCE_UNAVAILABLE"
+    assert order[-1] == "fail"
 
 
 def test_video_pipeline_reserves_finalization_time_from_ffmpeg_timeout():
@@ -423,10 +469,13 @@ def test_video_pipeline_does_not_download_when_only_finalization_reserve_remains
 def test_unsupported_content_type_records_invalid_media_without_downloading():
     pipeline, storage, metadata, _, _ = make_pipeline(content_type="text/plain")
 
-    with pytest.raises(MediaPipelineError) as caught:
-        pipeline.process_record(s3_record("notes.txt"))
+    result = pipeline.process_record(s3_record("notes.txt"))
 
-    assert caught.value.code == "INVALID_MEDIA"
+    assert result == {
+        "status": "failed",
+        "file_id": "file-1",
+        "error_code": "INVALID_MEDIA",
+    }
     assert storage.downloads == []
     assert metadata.failed[0][1]["error_code"] == "INVALID_MEDIA"
 

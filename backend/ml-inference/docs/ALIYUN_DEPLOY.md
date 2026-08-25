@@ -24,7 +24,9 @@ Registry image. Keep the registry private.
 
 Set `INTERNAL_API_KEY` in the deployment environment or Alibaba Cloud secret
 manager. It must match the value configured in B's `INTERNAL_API_KEY`.
-Never put the real value in `s.yaml`, `.env`, or a Git commit.
+Never put the real value in `s.yaml`, `.env`, or a Git commit. Keep
+`ALLOW_UNAUTHENTICATED_INFERENCE=false` in `s.yaml`; without a configured key,
+production `/infer` requests fail closed with `503`.
 
 ## Deploy
 

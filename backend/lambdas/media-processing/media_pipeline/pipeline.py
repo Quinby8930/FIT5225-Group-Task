@@ -15,7 +15,10 @@ VIDEO_CONTENT_TYPES = {"video/mp4", "video/quicktime"}
 REPORTABLE_FAILURES = {
     "INVALID_MEDIA",
     "FRAME_EXTRACTION_FAILED",
+    "INFERENCE_AUTH_FAILED",
     "INFERENCE_FAILED",
+    "INFERENCE_REJECTED",
+    "INFERENCE_UNAVAILABLE",
     "PROCESSING_TIME_BUDGET_EXHAUSTED",
 }
 FINALIZATION_RESERVE_MILLIS = 180_000
@@ -120,6 +123,12 @@ class MediaPipeline:
                         "status": "failed",
                     },
                 )
+                if not error.retryable:
+                    return {
+                        "status": "failed",
+                        "file_id": record.file_id,
+                        "error_code": error.code,
+                    }
             raise
 
     @staticmethod

@@ -123,8 +123,8 @@ def test_runtime_dependencies_use_all_environment_contracts_and_default_ffmpeg(
             created["metadata"] = (url, internal_api_key)
 
     class FakeInference:
-        def __init__(self, url, *, internal_api_key):
-            created["inference"] = (url, internal_api_key)
+        def __init__(self, url, *, internal_api_key, timeout):
+            created["inference"] = (url, internal_api_key, timeout)
 
     class FakePipeline:
         def __init__(self, **kwargs):
@@ -139,6 +139,7 @@ def test_runtime_dependencies_use_all_environment_contracts_and_default_ffmpeg(
     monkeypatch.setenv("METADATA_API_BASE_URL", "https://metadata.example")
     monkeypatch.setenv("INFERENCE_API_URL", "https://inference.example")
     monkeypatch.setenv("INTERNAL_API_KEY", "internal-key")
+    monkeypatch.setenv("INFERENCE_HTTP_TIMEOUT_SECONDS", "70")
     monkeypatch.delenv("FFMPEG_PATH", raising=False)
 
     dependencies = handler_module._build_dependencies()
@@ -146,5 +147,9 @@ def test_runtime_dependencies_use_all_environment_contracts_and_default_ffmpeg(
     assert dependencies["media_bucket_name"] == "private-media"
     assert created["storage"] is s3_client
     assert created["metadata"] == ("https://metadata.example", "internal-key")
-    assert created["inference"] == ("https://inference.example", "internal-key")
+    assert created["inference"] == (
+        "https://inference.example",
+        "internal-key",
+        70,
+    )
     assert created["pipeline"]["ffmpeg_path"] == "/opt/bin/ffmpeg"
