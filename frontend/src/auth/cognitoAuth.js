@@ -27,7 +27,7 @@ async function sha256(value) {
   return crypto.subtle.digest("SHA-256", encoded);
 }
 
-export async function buildLoginUrl() {
+export async function buildLoginUrl(identityProvider) {
   const codeVerifier = randomString(64);
   const codeChallenge = base64UrlEncode(await sha256(codeVerifier));
   const state = randomString(32);
@@ -47,11 +47,23 @@ export async function buildLoginUrl() {
     state,
   });
 
+  if (identityProvider) {
+    params.set("identity_provider", identityProvider);
+  }
+
   return `${cognitoConfig.domain}/oauth2/authorize?${params.toString()}`;
 }
 
 export async function signIn() {
   window.location.assign(await buildLoginUrl());
+}
+
+export async function signInWithProvider(providerName) {
+  window.location.assign(await buildLoginUrl(providerName));
+}
+
+export async function signInWithGoogle() {
+  return signInWithProvider(cognitoConfig.externalProviders.google);
 }
 
 export function buildLogoutUrl() {

@@ -24,6 +24,24 @@ button:hover {
   background: #0d55ad;
 }
 
+.secondary-button {
+  background: white;
+  border: 1px solid #1166cc;
+  color: #1166cc;
+}
+
+.secondary-button:hover {
+  background: #eef5ff;
+}
+
+.auth-actions {
+  align-items: center;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.75rem;
+  justify-content: flex-end;
+}
+
 .app-shell {
   margin: 0 auto;
   max-width: 1040px;

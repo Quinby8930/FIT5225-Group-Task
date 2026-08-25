@@ -6,6 +6,9 @@ export const cognitoConfig = {
   redirectSignIn: "http://localhost:3000/callback",
   redirectSignOut: "http://localhost:3000/logout",
   scopes: ["openid", "email", "profile"],
+  externalProviders: {
+    google: "Google",
+  },
 };
 
 export const apiConfig = {

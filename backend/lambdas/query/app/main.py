@@ -24,9 +24,10 @@ The notification trigger lives inside `complete`: when a file finishes
 processing, its tags are matched against every subscription and a notification
 is written for each subscribed user.
 
-Authentication: Member A owns Cognito. Wire the token verification into
-`get_current_user` (currently a placeholder) — every public route already
-depends on it, so nothing else changes once Cognito is connected.
+Authentication: Member A owns Cognito. Public routes use `get_current_user`,
+which reads the verified Cognito `sub` claim from API Gateway in Lambda mode
+and can verify a bearer token locally when the optional local auth dependency
+is installed.
 """
 
 from __future__ import annotations
@@ -69,6 +70,7 @@ from app.services.query_service import (
 )
 from app.storage_client import StorageClient, StubStorageClient
 from app.tag_detector import StubTagDetector, TagDetector
+from examples.cognito_auth_example import build_get_current_user
 
 app = FastAPI(title="Pacific BioArchive — Database & Query API", version="1.0.0")
 
@@ -125,9 +127,7 @@ def get_publisher() -> NotificationPublisher:
     return publisher
 
 
-# Placeholder — replace with Cognito token verification (Member A).
-def get_current_user() -> str:
-    return "demo-user"
+get_current_user = build_get_current_user()
 
 
 # ---------------------------------------------------------------------------

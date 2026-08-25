@@ -56,14 +56,28 @@ Audience: 65dgspco2djehpbpunc13t2oml
 Routes that should be protected:
 
 ```text
-POST /upload
-POST /query
-GET /files
-POST /query-by-file
-POST /tags
-DELETE /files
+POST /upload-url
+POST /query/by-tags
+POST /query/by-species
+GET /query/by-thumbnail
+POST /query/by-file
+POST /tags/edit
+POST /files/delete
 POST /notifications/subscribe
+DELETE /notifications/subscribe
+GET /notifications/subscriptions
+GET /notifications
 GET /auth-test
+```
+
+Internal metadata routes used by Member B's Lambda should not use the browser
+Cognito authorizer:
+
+```text
+POST /internal/uploads/reserve
+POST /internal/files/{file_id}/processing
+PUT /internal/files/{file_id}/complete
+PUT /internal/files/{file_id}/failed
 ```
 
 ## Backend contract
@@ -99,6 +113,7 @@ Member A should capture screenshots for:
 4. Hosted UI sign-up page.
 5. Email verification code.
 6. Successful login redirect to `/callback?code=...`.
-7. HTTP API JWT authorizer.
-8. A protected route returning `401` without a token.
-9. The same route returning `200` with a Cognito token.
+7. Hosted UI showing one external identity provider, such as Google.
+8. HTTP API JWT authorizer.
+9. A protected route returning `401` without a token.
+10. The same route returning `200` with a Cognito token.

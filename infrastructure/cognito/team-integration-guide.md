@@ -22,7 +22,7 @@ frontend/src/auth/cognitoAuth.js
 frontend/src/auth/AuthCallback.jsx
 frontend/src/auth/AuthControls.jsx
 frontend/src/api/apiClient.js
-frontend/src/App.example.jsx
+frontend/src/App.jsx
 ```
 
 Required frontend behavior:
@@ -56,16 +56,31 @@ Then protect it with:
 CognitoJWTAuthorizer
 ```
 
-After that, protect all real application routes:
+After that, protect all real public application routes:
 
 ```text
-POST /upload
-POST /query
-GET /files
-POST /query-by-file
-POST /tags
-DELETE /files
+POST /upload-url
+POST /query/by-tags
+POST /query/by-species
+GET /query/by-thumbnail
+POST /query/by-file
+POST /tags/edit
+POST /files/delete
 POST /notifications/subscribe
+DELETE /notifications/subscribe
+GET /notifications/subscriptions
+GET /notifications
+```
+
+Do not attach the browser Cognito authorizer to Member D's internal metadata
+routes. Those routes are called by Member B's Lambda workflow, not by the
+frontend:
+
+```text
+POST /internal/uploads/reserve
+POST /internal/files/{file_id}/processing
+PUT /internal/files/{file_id}/complete
+PUT /internal/files/{file_id}/failed
 ```
 
 ## Proof for marking
@@ -76,6 +91,7 @@ Member A should commit these files and include screenshots showing:
 2. Cognito Hosted UI can register a user.
 3. Email verification is received.
 4. Login redirects to `/callback?code=...`.
-5. HTTP API has `CognitoJWTAuthorizer`.
-6. A protected route rejects requests without a token.
-7. The same route accepts requests with a token.
+5. Google, or another external identity provider, appears on the Hosted UI.
+6. HTTP API has `CognitoJWTAuthorizer`.
+7. A protected route rejects requests without a token.
+8. The same route accepts requests with a token.

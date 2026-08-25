@@ -107,6 +107,7 @@ def client(tmp_path, monkeypatch):
     main.app.dependency_overrides[main.get_detector] = lambda: _Detector()
     main.app.dependency_overrides[main.get_storage] = lambda: storage
     main.app.dependency_overrides[main.get_publisher] = lambda: publisher
+    main.app.dependency_overrides[main.get_current_user] = lambda: "u1"
 
     with TestClient(main.app) as c:
         c.repo = repo
