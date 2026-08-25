@@ -70,6 +70,74 @@ test("keeps only deduplicated originals and thumbnails owned by the signed-in us
 });
 
 
+test("recognizes only canonical original and thumbnail keys for the signed-in user", async () => {
+  const { isOwnedAssetKey } = await loadAssetUrlModule();
+  assert.equal(typeof isOwnedAssetKey, "function");
+
+  assert.equal(isOwnedAssetKey("user-1", "originals/user-1/file-1/wombat.jpg"), true);
+  assert.equal(isOwnedAssetKey("user-1", "thumbnails/user-1/file-1/thumbnail.jpg"), true);
+  assert.equal(isOwnedAssetKey("user-1", "originals/user-2/file-1/wombat.jpg"), false);
+  assert.equal(isOwnedAssetKey("user-1", "originals/user-1/"), false);
+  assert.equal(isOwnedAssetKey("user-1", "originals/user-1/file-1/"), false);
+  assert.equal(isOwnedAssetKey("user-1", "thumbnails/user-1/file-1/not-thumbnail.jpg"), false);
+  assert.equal(isOwnedAssetKey("user-1", "originals/user-1//wombat.jpg"), false);
+  assert.equal(isOwnedAssetKey("user-1", "originals/user-1/../wombat.jpg"), false);
+  assert.equal(isOwnedAssetKey("user-1", "originals/user-1/file-1/nested/wombat.jpg"), false);
+  assert.equal(isOwnedAssetKey("user-1", "originals\\user-1\\file-1\\wombat.jpg"), false);
+  assert.equal(isOwnedAssetKey("user/1", "originals/user/1/file-1/wombat.jpg"), false);
+});
+
+
+test("partitions mutation input without removing foreign global results", async () => {
+  const { partitionOwnedAssetKeys } = await loadAssetUrlModule();
+  assert.equal(typeof partitionOwnedAssetKeys, "function");
+
+  const globalResults = [
+    "originals/user-1/file-1/wombat.jpg",
+    "originals/user-2/file-2/cassowary.jpg",
+    "processing/user-1/file-3/frame.jpg",
+  ];
+  const partitioned = partitionOwnedAssetKeys("user-1", globalResults);
+
+  assert.deepEqual(partitioned, {
+    ownedKeys: ["originals/user-1/file-1/wombat.jpg"],
+    excludedKeys: [
+      "originals/user-2/file-2/cassowary.jpg",
+      "processing/user-1/file-3/frame.jpg",
+    ],
+  });
+  assert.deepEqual(globalResults, [
+    "originals/user-1/file-1/wombat.jpg",
+    "originals/user-2/file-2/cassowary.jpg",
+    "processing/user-1/file-3/frame.jpg",
+  ]);
+});
+
+
+test("selection toggles ignore foreign or malformed keys", async () => {
+  const { toggleOwnedAssetKey } = await loadAssetUrlModule();
+  assert.equal(typeof toggleOwnedAssetKey, "function");
+
+  const selected = ["originals/user-1/file-1/wombat.jpg"];
+  assert.deepEqual(
+    toggleOwnedAssetKey("user-1", selected, "originals/user-2/file-2/private.jpg"),
+    selected
+  );
+  assert.deepEqual(
+    toggleOwnedAssetKey("user-1", selected, "processing/user-1/file-1/frame.jpg"),
+    selected
+  );
+  assert.deepEqual(
+    toggleOwnedAssetKey("user-1", selected, "thumbnails/user-1/file-2/thumbnail.jpg"),
+    [...selected, "thumbnails/user-1/file-2/thumbnail.jpg"]
+  );
+  assert.deepEqual(
+    toggleOwnedAssetKey("user-1", selected, "originals/user-1/file-1/wombat.jpg"),
+    []
+  );
+});
+
+
 test("splits asset keys into API-safe batches without losing order", async () => {
   const { chunkAssetKeys } = await loadAssetUrlModule();
   assert.equal(typeof chunkAssetKeys, "function");

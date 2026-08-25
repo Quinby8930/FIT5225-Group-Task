@@ -2,6 +2,7 @@ import { cognitoConfig } from "./cognitoConfig.js";
 
 const TOKEN_STORAGE_KEY = "pacificBioArchive.tokens";
 const PKCE_STORAGE_KEY = "pacificBioArchive.pkce";
+const callbackExchanges = new Map();
 
 function base64UrlEncode(buffer) {
   const bytes = new Uint8Array(buffer);
@@ -27,7 +28,7 @@ async function sha256(value) {
   return crypto.subtle.digest("SHA-256", encoded);
 }
 
-export async function buildLoginUrl(identityProvider) {
+async function buildAuthorizationUrl(pathname, identityProvider, config) {
   const codeVerifier = randomString(64);
   const codeChallenge = base64UrlEncode(await sha256(codeVerifier));
   const state = randomString(32);
@@ -38,10 +39,10 @@ export async function buildLoginUrl(identityProvider) {
   );
 
   const params = new URLSearchParams({
-    client_id: cognitoConfig.clientId,
+    client_id: config.clientId,
     response_type: "code",
-    scope: cognitoConfig.scopes.join(" "),
-    redirect_uri: cognitoConfig.redirectSignIn,
+    scope: config.scopes.join(" "),
+    redirect_uri: config.redirectSignIn,
     code_challenge: codeChallenge,
     code_challenge_method: "S256",
     state,
@@ -51,16 +52,15 @@ export async function buildLoginUrl(identityProvider) {
     params.set("identity_provider", identityProvider);
   }
 
-  return `${cognitoConfig.domain}/oauth2/authorize?${params.toString()}`;
+  return `${config.domain}${pathname}?${params.toString()}`;
 }
 
-export async function buildSignUpUrl() {
-  const url = new URL(`${cognitoConfig.domain}/signup`);
-  url.searchParams.set("client_id", cognitoConfig.clientId);
-  url.searchParams.set("response_type", "code");
-  url.searchParams.set("scope", cognitoConfig.scopes.join(" "));
-  url.searchParams.set("redirect_uri", cognitoConfig.redirectSignIn);
-  return url.toString();
+export function buildLoginUrl(identityProvider, config = cognitoConfig) {
+  return buildAuthorizationUrl("/oauth2/authorize", identityProvider, config);
+}
+
+export function buildSignUpUrl(config = cognitoConfig) {
+  return buildAuthorizationUrl("/signup", undefined, config);
 }
 
 export async function signIn() {
@@ -94,7 +94,10 @@ export function signOut() {
   window.location.assign(buildLogoutUrl());
 }
 
-export async function handleAuthCallback(callbackUrl = window.location.href) {
+export async function handleAuthCallback(
+  callbackUrl = window.location.href,
+  config = cognitoConfig
+) {
   const url = new URL(callbackUrl);
   const code = url.searchParams.get("code");
   const returnedState = url.searchParams.get("state");
@@ -108,36 +111,52 @@ export async function handleAuthCallback(callbackUrl = window.location.href) {
     throw new Error("Cognito callback did not include an authorization code.");
   }
 
+  const existingExchange = callbackExchanges.get(code);
+  if (existingExchange) {
+    if (existingExchange.state !== returnedState) {
+      throw new Error("Invalid Cognito callback state. Please sign in again.");
+    }
+    return existingExchange.promise;
+  }
+
   const pkce = JSON.parse(sessionStorage.getItem(PKCE_STORAGE_KEY) || "{}");
   if (!pkce.codeVerifier || pkce.state !== returnedState) {
     throw new Error("Invalid Cognito callback state. Please sign in again.");
   }
 
-  const body = new URLSearchParams({
-    grant_type: "authorization_code",
-    client_id: cognitoConfig.clientId,
-    code,
-    redirect_uri: cognitoConfig.redirectSignIn,
-    code_verifier: pkce.codeVerifier,
+  const exchange = Promise.resolve().then(async () => {
+    const body = new URLSearchParams({
+      grant_type: "authorization_code",
+      client_id: config.clientId,
+      code,
+      redirect_uri: config.redirectSignIn,
+      code_verifier: pkce.codeVerifier,
+    });
+
+    const response = await fetch(`${config.domain}/oauth2/token`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/x-www-form-urlencoded",
+      },
+      body,
+    });
+
+    if (!response.ok) {
+      const message = await response.text();
+      throw new Error(`Token exchange failed: ${message}`);
+    }
+
+    const tokens = await response.json();
+    saveTokens(tokens);
+    sessionStorage.removeItem(PKCE_STORAGE_KEY);
+    return tokens;
   });
-
-  const response = await fetch(`${cognitoConfig.domain}/oauth2/token`, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/x-www-form-urlencoded",
-    },
-    body,
+  const retryableExchange = exchange.catch((error) => {
+    callbackExchanges.delete(code);
+    throw error;
   });
-
-  if (!response.ok) {
-    const message = await response.text();
-    throw new Error(`Token exchange failed: ${message}`);
-  }
-
-  const tokens = await response.json();
-  sessionStorage.removeItem(PKCE_STORAGE_KEY);
-  saveTokens(tokens);
-  return tokens;
+  callbackExchanges.set(code, { state: returnedState, promise: retryableExchange });
+  return retryableExchange;
 }
 
 export function saveTokens(tokens) {

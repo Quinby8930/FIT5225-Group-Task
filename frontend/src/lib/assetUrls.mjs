@@ -1,13 +1,57 @@
-export function ownedAssetKeys(userId, keys) {
-  if (typeof userId !== "string" || !userId || userId.includes("/") || !Array.isArray(keys)) {
-    return [];
+function validKeySegment(segment) {
+  return Boolean(segment) && segment !== "." && segment !== "..";
+}
+
+
+export function isOwnedAssetKey(userId, key) {
+  if (
+    typeof userId !== "string"
+    || !userId
+    || userId.includes("/")
+    || userId.includes("\\")
+    || typeof key !== "string"
+    || key.includes("\\")
+  ) {
+    return false;
   }
 
-  const prefixes = [`originals/${userId}/`, `thumbnails/${userId}/`];
-  return [...new Set(keys.filter((key) => (
-    typeof key === "string"
-    && prefixes.some((prefix) => key.startsWith(prefix) && key.length > prefix.length)
-  )))];
+  const parts = key.split("/");
+  if (parts.length !== 4 || parts[1] !== userId || !validKeySegment(parts[2])) {
+    return false;
+  }
+
+  if (parts[0] === "originals") {
+    return validKeySegment(parts[3]);
+  }
+  return parts[0] === "thumbnails" && parts[3] === "thumbnail.jpg";
+}
+
+
+export function partitionOwnedAssetKeys(userId, keys) {
+  if (!Array.isArray(keys)) {
+    return { ownedKeys: [], excludedKeys: [] };
+  }
+
+  const uniqueKeys = [...new Set(keys)];
+  return {
+    ownedKeys: uniqueKeys.filter((key) => isOwnedAssetKey(userId, key)),
+    excludedKeys: uniqueKeys.filter((key) => !isOwnedAssetKey(userId, key)),
+  };
+}
+
+
+export function ownedAssetKeys(userId, keys) {
+  return partitionOwnedAssetKeys(userId, keys).ownedKeys;
+}
+
+
+export function toggleOwnedAssetKey(userId, selectedKeys, key) {
+  if (!Array.isArray(selectedKeys) || !isOwnedAssetKey(userId, key)) {
+    return Array.isArray(selectedKeys) ? selectedKeys : [];
+  }
+  return selectedKeys.includes(key)
+    ? selectedKeys.filter((item) => item !== key)
+    : [...selectedKeys, key];
 }
 
 

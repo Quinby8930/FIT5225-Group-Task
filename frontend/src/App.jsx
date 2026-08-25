@@ -1,5 +1,5 @@
 import React, { useEffect, useMemo, useRef, useState } from "react";
-import { getAuthTest } from "./api/apiClient";
+import { getAuthTest, isDuplicateFileError } from "./api/apiClient";
 import {
   deleteFiles,
   editTags,
@@ -21,10 +21,13 @@ import { parseKeyList, parseSpeciesList, parseTagCounts } from "./lib/forms";
 import {
   assetExpiryDelay,
   indexAssetUrls,
+  isOwnedAssetKey,
   nextAssetRefreshDelay,
   nextAssetRetryDelay,
   ownedAssetKeys,
+  partitionOwnedAssetKeys,
   requestAssetUrlBatches,
+  toggleOwnedAssetKey,
   unexpiredAssetUrls,
 } from "./lib/assetUrls.mjs";
 
@@ -49,7 +52,7 @@ function Field({ label, children }) {
   );
 }
 
-function ResultCard({ resultKey, assetUrl, selected, onToggle, onOpenOriginal }) {
+function ResultCard({ resultKey, assetUrl, selected, canManage, onToggle, onOpenOriginal }) {
   const url = assetUrl;
   const isImage = /\.(jpg|jpeg|png|webp)$/i.test(resultKey);
   const kind = resultKey.includes(".mp4") || resultKey.includes(".mov") ? "video" : "image";
@@ -61,8 +64,13 @@ function ResultCard({ resultKey, assetUrl, selected, onToggle, onOpenOriginal })
       </div>
       <div className="result-body">
         <label className="check-row">
-          <input type="checkbox" checked={selected} onChange={() => onToggle(resultKey)} />
-          <span>Select</span>
+          <input
+            type="checkbox"
+            checked={canManage && selected}
+            disabled={!canManage}
+            onChange={() => onToggle(resultKey)}
+          />
+          <span>{canManage ? "Select" : "Read-only"}</span>
         </label>
         <code title={resultKey}>{resultKey}</code>
         <div className="inline-actions">
@@ -100,7 +108,7 @@ function UploadPanel({ onStatus }) {
     } catch (error) {
       onStatus({
         type: "error",
-        message: error.message.includes("DUPLICATE_FILE")
+        message: isDuplicateFileError(error)
           ? "Duplicate file detected by checksum."
           : error.message,
       });
@@ -399,16 +407,20 @@ function QueryPanel({ userId, results, selectedKeys, setResults, toggleKey, onSt
           <span>{results.length} item(s)</span>
         </div>
         <div className="result-grid">
-          {results.map((key) => (
-            <ResultCard
-              key={key}
-              resultKey={key}
-              assetUrl={assetUrls[key]?.url || ""}
-              selected={selectedKeys.includes(key)}
-              onToggle={toggleKey}
-              onOpenOriginal={openOriginal}
-            />
-          ))}
+          {results.map((key) => {
+            const canManage = isOwnedAssetKey(userId, key);
+            return (
+              <ResultCard
+                key={key}
+                resultKey={key}
+                assetUrl={assetUrls[key]?.url || ""}
+                selected={selectedKeys.includes(key)}
+                canManage={canManage}
+                onToggle={toggleKey}
+                onOpenOriginal={openOriginal}
+              />
+            );
+          })}
           {!results.length && <p className="empty-state">No results loaded.</p>}
         </div>
       </section>
@@ -416,21 +428,44 @@ function QueryPanel({ userId, results, selectedKeys, setResults, toggleKey, onSt
   );
 }
 
-function ManagePanel({ selectedKeys, onStatus }) {
+function ManagePanel({ userId, selectedKeys, onStatus }) {
   const [keysText, setKeysText] = useState("");
   const [tagsText, setTagsText] = useState("wombat");
   const [operation, setOperation] = useState(1);
-  const keys = useMemo(
+  const candidateKeys = useMemo(
     () => [...new Set([...selectedKeys, ...parseKeyList(keysText)])],
     [selectedKeys, keysText]
   );
+  const { ownedKeys: keys, excludedKeys } = useMemo(
+    () => partitionOwnedAssetKeys(userId, candidateKeys),
+    [userId, candidateKeys]
+  );
 
   async function mutate(action, success) {
-    if (!keys.length) return;
-    onStatus({ type: "info", message: "Updating..." });
+    if (!keys.length) {
+      if (excludedKeys.length) {
+        onStatus({
+          type: "info",
+          message: `No changes submitted. ${excludedKeys.length} read-only or malformed key(s) excluded.`,
+        });
+      }
+      return;
+    }
+    onStatus({
+      type: "info",
+      message: excludedKeys.length
+        ? `Updating owned media; ${excludedKeys.length} read-only or malformed key(s) excluded.`
+        : "Updating...",
+    });
     try {
       const data = await action(keys);
-      onStatus({ type: "success", message: `${success}: ${JSON.stringify(data)}` });
+      const exclusionStatus = excludedKeys.length
+        ? ` ${excludedKeys.length} read-only or malformed key(s) excluded.`
+        : "";
+      onStatus({
+        type: "success",
+        message: `${success}: ${JSON.stringify(data)}${exclusionStatus}`,
+      });
     } catch (error) {
       onStatus({ type: "error", message: error.message });
     }
@@ -440,7 +475,7 @@ function ManagePanel({ selectedKeys, onStatus }) {
     <section className="panel narrow-panel">
       <div className="panel-title">
         <h2>Bulk management</h2>
-        <span>{keys.length} selected key(s)</span>
+        <span>{keys.length} manageable key(s), {excludedKeys.length} excluded</span>
       </div>
       <div className="stack">
         <Field label="Additional keys">
@@ -490,7 +525,7 @@ function ManagePanel({ selectedKeys, onStatus }) {
   );
 }
 
-function NotificationPanel({ user, onStatus }) {
+function NotificationPanel({ onStatus }) {
   const [species, setSpecies] = useState("wombat");
   const [subscriptions, setSubscriptions] = useState([]);
   const [notifications, setNotifications] = useState([]);
@@ -498,8 +533,8 @@ function NotificationPanel({ user, onStatus }) {
   async function refresh() {
     try {
       const [subs, notes] = await Promise.all([
-        listSubscriptions(user.sub),
-        listNotifications(user.sub),
+        listSubscriptions(),
+        listNotifications(),
       ]);
       setSubscriptions(subs.species || []);
       setNotifications(notes.notifications || []);
@@ -515,7 +550,7 @@ function NotificationPanel({ user, onStatus }) {
   async function subscribe(event) {
     event.preventDefault();
     try {
-      await subscribeToSpecies(user.sub, species.trim().toLowerCase());
+      await subscribeToSpecies(species.trim().toLowerCase());
       onStatus({ type: "success", message: "Subscription saved." });
       refresh();
     } catch (error) {
@@ -525,7 +560,7 @@ function NotificationPanel({ user, onStatus }) {
 
   async function unsubscribe(item) {
     try {
-      await unsubscribeFromSpecies(user.sub, item);
+      await unsubscribeFromSpecies(item);
       refresh();
     } catch (error) {
       onStatus({ type: "error", message: error.message });
@@ -592,9 +627,14 @@ export default function App() {
   }
 
   function toggleKey(key) {
-    setSelectedKeys((current) =>
-      current.includes(key) ? current.filter((item) => item !== key) : [...current, key]
-    );
+    if (!isOwnedAssetKey(user.sub, key)) {
+      setStatus({
+        type: "info",
+        message: "Read-only archive results cannot be selected for changes.",
+      });
+      return;
+    }
+    setSelectedKeys((current) => toggleOwnedAssetKey(user.sub, current, key));
   }
 
   async function testAuth() {
@@ -661,8 +701,10 @@ export default function App() {
               onStatus={setStatus}
             />
           )}
-          {activeTab === "manage" && <ManagePanel selectedKeys={selectedKeys} onStatus={setStatus} />}
-          {activeTab === "notify" && <NotificationPanel user={user} onStatus={setStatus} />}
+          {activeTab === "manage" && (
+            <ManagePanel userId={user.sub} selectedKeys={selectedKeys} onStatus={setStatus} />
+          )}
+          {activeTab === "notify" && <NotificationPanel onStatus={setStatus} />}
         </>
       )}
     </main>

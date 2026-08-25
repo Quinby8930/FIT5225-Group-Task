@@ -1,16 +1,19 @@
-import React, { useEffect, useState } from "react";
+import React, { useEffect, useRef, useState } from "react";
 import { handleAuthCallback, getCurrentUser } from "./cognitoAuth";
 
 export default function AuthCallback() {
   const [status, setStatus] = useState("Signing you in...");
   const [user, setUser] = useState(null);
+  const initialUrl = useRef(window.location.href);
+  const navigationStarted = useRef(false);
 
   useEffect(() => {
     let active = true;
 
-    handleAuthCallback()
+    handleAuthCallback(initialUrl.current)
       .then(() => {
-        if (!active) return;
+        if (!active || navigationStarted.current) return;
+        navigationStarted.current = true;
         setUser(getCurrentUser());
         setStatus("Signed in successfully.");
         window.history.replaceState({}, document.title, "/");

@@ -97,26 +97,24 @@ export function deleteFiles(keys) {
   });
 }
 
-export function subscribeToSpecies(userId, species) {
+export function subscribeToSpecies(species) {
   return apiRequest("/notifications/subscribe", {
     method: "POST",
-    body: JSON.stringify({ user_id: userId, species }),
+    body: JSON.stringify({ species }),
   });
 }
 
-export function unsubscribeFromSpecies(userId, species) {
-  const params = new URLSearchParams({ user_id: userId, species });
+export function unsubscribeFromSpecies(species) {
+  const params = new URLSearchParams({ species });
   return apiRequest(`/notifications/subscribe?${params.toString()}`, {
     method: "DELETE",
   });
 }
 
-export function listSubscriptions(userId) {
-  const params = new URLSearchParams({ user_id: userId });
-  return apiRequest(`/notifications/subscriptions?${params.toString()}`);
+export function listSubscriptions() {
+  return apiRequest("/notifications/subscriptions");
 }
 
-export function listNotifications(userId) {
-  const params = new URLSearchParams({ user_id: userId });
-  return apiRequest(`/notifications?${params.toString()}`);
+export function listNotifications() {
+  return apiRequest("/notifications");
 }

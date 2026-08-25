@@ -1,6 +1,42 @@
 import { apiConfig } from "../auth/cognitoConfig.js";
 import { clearTokens, getAuthorizationHeader } from "../auth/cognitoAuth.js";
 
+export class ApiError extends Error {
+  constructor(message, { status, code = null, payload = null } = {}) {
+    super(message);
+    this.name = "ApiError";
+    this.status = status;
+    this.code = code;
+    this.payload = payload;
+  }
+}
+
+export function isDuplicateFileError(error) {
+  return error instanceof ApiError && error.code === "DUPLICATE_FILE";
+}
+
+function parseResponsePayload(text) {
+  if (!text) return null;
+  try {
+    return JSON.parse(text);
+  } catch {
+    return text;
+  }
+}
+
+function errorCode(payload) {
+  if (typeof payload?.code === "string") return payload.code;
+  if (typeof payload?.detail?.code === "string") return payload.detail.code;
+  return null;
+}
+
+function errorMessage(payload, status) {
+  if (typeof payload?.message === "string") return payload.message;
+  if (typeof payload?.detail?.message === "string") return payload.detail.message;
+  if (typeof payload?.detail === "string") return payload.detail;
+  return `API request failed: ${status}`;
+}
+
 export async function apiRequest(path, options = {}) {
   const isFormData =
     typeof FormData !== "undefined" && options.body instanceof FormData;
@@ -16,15 +52,17 @@ export async function apiRequest(path, options = {}) {
   });
 
   const text = await response.text();
-  const data = text ? JSON.parse(text) : null;
+  const data = parseResponsePayload(text);
 
   if (!response.ok) {
     if (response.status === 401) {
       clearTokens();
     }
-    throw new Error(
-      data?.message || data?.detail || `API request failed: ${response.status}`
-    );
+    throw new ApiError(errorMessage(data, response.status), {
+      status: response.status,
+      code: errorCode(data),
+      payload: data,
+    });
   }
 
   return data;
