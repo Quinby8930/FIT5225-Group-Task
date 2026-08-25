@@ -30,6 +30,16 @@ class Settings:
     )
     aws_region: str = os.getenv("AWS_REGION", "ap-southeast-2")
 
+    # Cross-module adapters. Cloud deployment sets these explicitly to
+    # "lambda" and "remote"; "stub" is an intentional local/test choice.
+    storage_backend: str = os.getenv("STORAGE_BACKEND", "")
+    storage_delete_function_name: str = os.getenv(
+        "STORAGE_DELETE_FUNCTION_NAME", ""
+    )
+    tag_detector_backend: str = os.getenv("TAG_DETECTOR_BACKEND", "")
+    query_input_bucket: str = os.getenv("QUERY_INPUT_BUCKET", "")
+    inference_api_url: str = os.getenv("INFERENCE_API_URL", "")
+
     # Browser origins allowed to call the query API during local/cloud demos.
     cors_origins: tuple[str, ...] = tuple(
         origin.strip()

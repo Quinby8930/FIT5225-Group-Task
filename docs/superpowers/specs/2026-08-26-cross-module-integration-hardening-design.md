@@ -99,9 +99,13 @@ size, and JSON shape. Member D calls storage before deleting metadata, so a
 storage failure leaves a record that can be retried.
 
 Production query-by-file supports images only. Member D bounds the multipart
-input to 12 MiB, stages it under a request-scoped private S3 prefix, creates a
-short-lived HTTPS GET URL, calls Member C's `/infer` using the shared internal
-key, and deletes the staging object in `finally`. Video query-by-file returns
+input to exactly 4,194,304 bytes, stages it under a request-scoped private S3
+prefix, creates a short-lived HTTPS GET URL, and calls Member C's `/infer` using
+the shared internal key with redirects disabled and a 25-second timeout. The D
+Lambda timeout is 30 seconds. Cleanup is attempted after every put attempt;
+cleanup failures are controlled and never mask an original inference failure.
+The B/C upload and source limits remain 12,582,912 bytes with the separate
+45/60/70 timeout ordering. Video query-by-file returns
 415 because the existing C API expects extracted frames and no non-persisting
 video-frame service exists. Local tests inject fakes; production configuration
 must explicitly select the remote detector so a missing endpoint never returns
@@ -110,7 +114,7 @@ the old fake `dingo` result.
 Member D's SAM template creates the query Lambda, its environment, permissions,
 one API Gateway integration, explicit JWT-protected public routes, unauthenticated
 API Gateway internal routes protected by the application key, and Lambda invoke
-permissions. It accepts the existing HTTP API ID, JWT authorizer ID, Member B
+permissions. It requires the existing HTTP API ID, JWT authorizer ID, Member B
 bucket/delete function, C endpoint, and secret as deployment parameters.
 
 ### Frontend authentication and API use
@@ -141,6 +145,8 @@ security boundary.
   `detail.code=METADATA_CONFLICT`.
 - Oversized B image upload: HTTP 413 with `code=FILE_TOO_LARGE`.
 - Unsupported query-by-file media: HTTP 415.
+- Configured storage adapter failure: HTTP 502 with metadata preserved;
+  unconfigured storage adapter: HTTP 503.
 - C detection overflow: HTTP 422 with `error=detection_limit_exceeded`.
 - Real adapter/configuration failures fail closed; no production route silently
   falls back to a stub.

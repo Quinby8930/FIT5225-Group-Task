@@ -1,8 +1,7 @@
 # Member D 排错说明（Troubleshooting）
 
-按「症状 → 原因 → 解决」排列。先看这条铁律：**本地用 SQLite，云端用
-DynamoDB，切换只靠 `REPO_BACKEND` 环境变量**——绝大多数问题都出在这条切换
-或 schema 没重建上。
+按「症状 → 原因 → 解决」排列。数据库和跨模块 adapter 独立选择：本地 stub 必须
+显式配置；SAM 生产环境固定 DynamoDB/Lambda/remote，缺失配置时 fail closed。
 
 ---
 
@@ -55,15 +54,15 @@ reserve 必须先于 complete 调用（状态机是 `reserve → processing → 
 
 **原因**（按概率）：
 
-1. IAM 角色没挂对 —— 忘了把 `PacificBioArchive-QueryLambdaRole` 挂到查询 Lambda。
+1. 没有通过最新 SAM 模板部署 QueryFunction 或模板生成的执行角色。
 2. 表名/区域不匹配 —— 环境变量 `DYNAMODB_TABLE` / `AWS_REGION` 没设对。
 3. 新表没部署 —— 订阅/通知依赖 `PacificBioArchiveSubscriptions` /
    `PacificBioArchiveNotifications` 两张表，旧模板没有。
 
 **解决**：
 
-1. 用**最新**的 `infrastructure/member-d/dynamodb.yaml` 重新 `aws cloudformation deploy`
-   （会创建 3 张表 + 更新 IAM 角色）。
+1. 用**最新**的 `infrastructure/member-d/dynamodb.yaml` 重新 `sam build` +
+   `sam deploy`（会创建 3 张表、QueryFunction、策略和显式路由）。
 2. Lambda 环境变量补齐：
 
    | 变量 | 值 |
@@ -117,7 +116,8 @@ python -m uvicorn app.main:app --reload --port 8000
 ```
 
 注意 `boto3` 是**可选**依赖（DynamoDB 后端才需要，Lambda 运行时自带），本地
-SQLite 模式不用装。`mangum` 只在打包成 Lambda 时需要。
+SQLite 模式通常不会调用它。`requirements.txt` 仍包含 boto3，因为生产 adapter
+直接使用 DynamoDB、S3 和 Lambda 客户端。
 
 ---
 

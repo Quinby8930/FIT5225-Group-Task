@@ -18,6 +18,7 @@
 - Maximum B image upload and C source image size is exactly 12,582,912 bytes; maximum B video upload remains exactly 262,144,000 bytes.
 - Maximum inference detections is exactly 1,000 at C and at B's response validator.
 - C application timeout is 45 seconds, Alibaba Function Compute timeout remains 60 seconds, and B inference HTTP timeout defaults to 70 seconds.
+- D's synchronous public `/query/by-file` is separately capped at exactly 4,194,304 bytes, calls C with a 25-second timeout, and runs in a 30-second Lambda.
 - Production code never silently falls back to fake deletion or fake `dingo` inference; local tests may inject explicit fakes.
 - Do not commit secrets, live endpoints, model binaries, registry credentials, or AWS credentials.
 - Do not weaken B's owner-prefix asset signer and do not choose a public cross-owner media policy.
@@ -232,7 +233,7 @@ Add `LambdaStorageClient` with `InvocationType="RequestResponse"`, bounded paylo
 
 - [ ] **Step 4: Write failing remote query-by-file tests**
 
-Test an adapter with fake S3 and HTTP boundaries. It must stage one image under `query-inputs/{user_id}/{uuid}/{safe_filename}`, presign HTTPS GET for 120 seconds, call C `/infer` with the shared key, return normalized tags, and delete the staged object in `finally` on success or failure. Endpoint tests reject non-image content with 415 and payloads above 12,582,912 bytes with 413. Missing production configuration returns 503; it never returns the stub `dingo` result.
+Test an adapter with fake S3 and HTTP boundaries. It must stage one image under `query-inputs/{user_id}/{uuid}/{safe_filename}`, presign HTTPS GET for 120 seconds, call C `/infer` with the shared key and a 25-second timeout, return normalized tags, and delete the staged object after every attempted put. Endpoint tests reject non-image content with 415 and payloads above 4,194,304 bytes with 413. Cleanup failures are controlled, never mask an original inference failure, and missing production configuration returns 503 instead of the stub `dingo` result. Redirects and responses without an explicit integer 2xx status are rejected.
 
 - [ ] **Step 5: Run detector tests and verify RED**
 
@@ -240,7 +241,7 @@ Run the new detector and focused query endpoint tests; expected failures show th
 
 - [ ] **Step 6: Implement the S3-staged HTTPS detector**
 
-Extend `TagDetector.detect` to keyword arguments `user_id`, `file_name`, `content_type`, and `content`. Implement `RemoteTagDetector` using injected S3/HTTP operations, validate the C response shape, and always clean up. Build it only when `TAG_DETECTOR_BACKEND=remote` with non-empty bucket, HTTPS inference endpoint, and internal key. Keep explicit `stub` selection for local tests. The public endpoint accepts `image/jpeg`, `image/png`, and `image/webp` only and performs a bounded `read(12_582_913)`.
+Extend `TagDetector.detect` to keyword arguments `user_id`, `file_name`, `content_type`, and `content`. Implement `RemoteTagDetector` using injected S3/HTTP operations, validate the C response shape, reject redirects, and always clean up. Build it only when `TAG_DETECTOR_BACKEND=remote` with non-empty bucket, HTTPS inference endpoint, and internal key. Keep explicit `stub` selection for local tests. The public endpoint accepts `image/jpeg`, `image/png`, and `image/webp` only and performs a bounded `read(4_194_305)`.
 
 - [ ] **Step 7: Write failing Member D template tests**
 
@@ -252,7 +253,7 @@ Run `python -m pytest infrastructure/member-d/test_template.py -q`; expected fai
 
 - [ ] **Step 9: Convert the D template into a deployable SAM stack**
 
-Retain all three existing tables. Add `AWS::Serverless::Function` for `../../backend/lambdas/query/`, `lambda_function.handler`, runtime `python3.12`, timeout 90, memory 1024, environment selecting DynamoDB/Lambda/remote detector, and least-privilege DynamoDB/S3/Lambda invoke policies. Add explicit routes for every documented public/internal method; public routes use `ExistingJwtAuthorizerId`, internal routes use `AuthorizationType: NONE` because application-key auth is mandatory. Do not add a `$default` route.
+Retain all three existing tables. Add `AWS::Serverless::Function` for `../../backend/lambdas/query/`, `lambda_function.handler`, runtime `python3.12`, timeout 30, memory 1024, environment selecting DynamoDB/Lambda/remote detector, and least-privilege DynamoDB/S3/Lambda invoke policies. Require the HTTP API ID at deployment instead of committing a live default. Add explicit routes for every documented public/internal method; public routes use `ExistingJwtAuthorizerId`, internal routes use `AuthorizationType: NONE` because application-key auth is mandatory. Do not add a `$default` route.
 
 - [ ] **Step 10: Run D tests/docs validation and commit**
 

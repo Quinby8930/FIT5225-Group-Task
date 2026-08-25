@@ -1,9 +1,8 @@
 # Member D AWS infrastructure
 
-This directory declares Member D's database resources: a single DynamoDB table
-for file metadata plus the IAM role the query Lambda assumes. It is owned by
-Member D and deployed in `ap-southeast-2` alongside Cognito, S3, and the other
-Lambdas.
+This directory contains the Member D SAM stack: three DynamoDB tables, the
+query Lambda, its least-privilege adapter policies, and explicit routes on the
+existing HTTP API.
 
 The query application code lives in `../../backend/lambdas/query/`; the operator
 setup guide (which single file to read) is in
@@ -17,19 +16,23 @@ setup guide (which single file to read) is in
   + sort key `species` (one subscription per user/species).
 - **`PacificBioArchiveNotifications`** — DynamoDB table, partition key `user_id`
   + sort key `notification_id` (the notification trigger writes here).
-- **`PacificBioArchive-QueryLambdaRole`** — IAM role for the query Lambda,
-  granting `dynamodb:PutItem / GetItem / Scan / Query / UpdateItem / DeleteItem`
-  on those three tables, plus the standard Lambda execution policy.
+- **`QueryFunction`** — Python 3.12/Mangum API with DynamoDB, private
+  `query-inputs/*` staging, and Member B guarded-delete invocation access.
+- **HTTP API routes** — JWT on every public route; `NONE` only on explicit
+  internal and OPTIONS routes. Internal routes remain protected by the shared
+  application key. There is no `$default` route.
 
 ## Deploy
 
 ```bash
-aws cloudformation deploy \
-  --template-file infrastructure/member-d/dynamodb.yaml \
-  --stack-name PacificBioArchive-Database \
-  --region ap-southeast-2 \
-  --capabilities CAPABILITY_NAMED_IAM
+sam build --template-file infrastructure/member-d/dynamodb.yaml
+sam deploy --guided
 ```
+
+The guided deployment requires the existing HTTP API and JWT authorizer IDs,
+Member B private bucket and storage-delete function name, Member C HTTPS base
+URL, and a non-empty shared internal key. Do not save a live key in Git or use a
+fake/default endpoint.
 
 ## Outputs
 
@@ -38,7 +41,7 @@ aws cloudformation deploy \
 | `TableName` | DynamoDB table the query API reads/writes (`PacificBioArchiveFiles`). |
 | `SubscriptionsTableName` | Table holding (user, species) subscriptions. |
 | `NotificationsTableName` | Table holding per-user notifications. |
-| `QueryLambdaRoleArn` | Attach this role to the query Lambda. |
+| `QueryFunctionArn` | Deployed Member D query Lambda. |
 
 No live AWS deployment was performed while preparing these artifacts; account
 validation and deployment remain manual steps for the AWS operator.

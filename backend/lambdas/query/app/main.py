@@ -74,9 +74,23 @@ from app.services.query_service import (
     filter_by_species,
     to_display_keys,
 )
-from app.storage_client import StorageClient, StubStorageClient
+from app.storage_client import (
+    LambdaStorageClient,
+    StorageClient,
+    StorageClientError,
+    StorageClientUnavailable,
+    StubStorageClient,
+    UnavailableStorageClient,
+)
 from app.species import get_mapper
-from app.tag_detector import StubTagDetector, TagDetector
+from app.tag_detector import (
+    RemoteTagDetector,
+    StubTagDetector,
+    TagDetectionError,
+    TagDetectionUnavailable,
+    TagDetector,
+    UnavailableTagDetector,
+)
 from examples.cognito_auth_example import build_get_current_user
 
 app = FastAPI(title="Pacific BioArchive — Database & Query API", version="1.0.0")
@@ -91,6 +105,10 @@ app.add_middleware(
 # Processing lease window matches Member B's media-processing Lambda timeout.
 LEASE_SECONDS = 900
 FAILED_MESSAGE_MAX_CHARS = 240
+MAX_QUERY_IMAGE_BYTES = 4_194_304
+QUERY_IMAGE_CONTENT_TYPES = frozenset(
+    {"image/jpeg", "image/png", "image/webp"}
+)
 FORBIDDEN_OWNER_DETAIL = {
     "code": "FORBIDDEN_OWNER",
     "message": "media is not owned by the authenticated user",
@@ -122,10 +140,49 @@ def _build_notification_repository() -> NotificationRepository:
     return SQLiteNotificationRepository(settings.sqlite_path)
 
 
+def _build_storage(settings_: Settings = settings) -> StorageClient:
+    backend = settings_.storage_backend.strip().lower()
+    if not backend:
+        return UnavailableStorageClient()
+    if backend == "stub":
+        return StubStorageClient()
+    if backend == "lambda":
+        if not settings_.storage_delete_function_name.strip():
+            raise RuntimeError(
+                "STORAGE_DELETE_FUNCTION_NAME function name is required for lambda"
+            )
+        return LambdaStorageClient(settings_.storage_delete_function_name)
+    raise RuntimeError("STORAGE_BACKEND must be either 'stub' or 'lambda'")
+
+
+def _build_detector(settings_: Settings = settings) -> TagDetector:
+    backend = settings_.tag_detector_backend.strip().lower()
+    if backend == "stub":
+        return StubTagDetector()
+    if backend != "remote":
+        return UnavailableTagDetector()
+    if not (
+        settings_.query_input_bucket.strip()
+        and settings_.inference_api_url.strip()
+        and settings_.internal_api_key
+    ):
+        return UnavailableTagDetector()
+    try:
+        return RemoteTagDetector(
+            bucket_name=settings_.query_input_bucket,
+            inference_api_url=settings_.inference_api_url,
+            internal_api_key=settings_.internal_api_key,
+        )
+    except ValueError:
+        return UnavailableTagDetector()
+
+
 repo: FileRepository = _build_repository()
 notif_repo: NotificationRepository = _build_notification_repository()
-detector: TagDetector = StubTagDetector()
-storage: StorageClient = StubStorageClient()
+detector: TagDetector = _build_detector()
+storage: StorageClient = _build_storage()
+
+
 def _build_publisher() -> NotificationPublisher:
     if settings.notification_publisher == "sns":
         return SNSNotificationPublisher(
@@ -283,9 +340,26 @@ async def query_by_file(
     detector_: TagDetector = Depends(get_detector),
     _user: str = Depends(get_current_user),
 ) -> QueryResponse:
-    # Read into memory; the query file is NOT persisted to the repository.
-    content = await file.read()
-    tags = detector_.detect(file.filename or "upload", content)
+    content_type = (file.content_type or "").casefold()
+    if content_type not in QUERY_IMAGE_CONTENT_TYPES:
+        raise HTTPException(status_code=415, detail="unsupported query image type")
+    # The extra byte distinguishes an exact-limit image from an oversized one
+    # without allowing an unbounded in-memory read.
+    content = await file.read(MAX_QUERY_IMAGE_BYTES + 1)
+    if len(content) > MAX_QUERY_IMAGE_BYTES:
+        raise HTTPException(status_code=413, detail="query image exceeds size limit")
+    try:
+        tags = detector_.detect(
+            user_id=_user,
+            file_name=file.filename or "upload",
+            content_type=content_type,
+            content=content,
+        )
+    except TagDetectionUnavailable as exc:
+        raise HTTPException(status_code=503, detail="tag detector unavailable") from exc
+    except TagDetectionError as exc:
+        raise HTTPException(status_code=502, detail="tag detection failed") from exc
+    tags = _normalise_tags(tags)
     records = filter_by_min_counts(repo_.all(), tags)
     keys = to_display_keys(records)
     return QueryResponse(results=keys, count=len(keys))
@@ -336,7 +410,16 @@ def delete_files(
     # Delete storage first so a storage failure cannot leave orphaned objects
     # after their metadata has already disappeared.
     if keys_to_delete:
-        storage_.delete(_user, keys_to_delete)
+        try:
+            storage_.delete(_user, keys_to_delete)
+        except StorageClientUnavailable as exc:
+            raise HTTPException(
+                status_code=503, detail="storage deletion unavailable"
+            ) from exc
+        except StorageClientError as exc:
+            raise HTTPException(
+                status_code=502, detail="storage deletion failed"
+            ) from exc
     removed_db = repo_.delete_by_ids([record.file_id for record in records])
     return {
         "deleted_db_records": removed_db,

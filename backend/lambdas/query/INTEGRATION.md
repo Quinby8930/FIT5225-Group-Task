@@ -105,20 +105,17 @@ mapper.common_name("Canis_familiaris")   # -> "dingo"
 
 ---
 
-## 4. 四个集成插槽（已定义接口，填实现即可）
+## 4. 四个集成接口
 
 ### 4.1 成员 C — `TagDetector`
 
-接口：`app/tag_detector.py`，方法 `detect(file_name, content: bytes) -> dict[str, int]`。
-
-示例适配器：`examples/speciesnet_detector_example.py`（照抄填 TODO）。
-
-对接要点：返回的 key 必须是 §2 的**简化名**。接好后改 `app/main.py` 一行：
-
-```python
-from examples.speciesnet_detector_example import SpeciesNetDetector
-detector: TagDetector = SpeciesNetDetector()
-```
+接口：`app/tag_detector.py`，方法
+`detect(*, user_id, file_name, content_type, content: bytes) -> dict[str, int]`。
+生产环境设置 `TAG_DETECTOR_BACKEND=remote`，`RemoteTagDetector` 会把受限图片临时
+写入私有 S3 `query-inputs/`。此公开入口最大 4,194,304 bytes，以 120 秒 HTTPS
+GET URL 和 25 秒无重定向 HTTP timeout 调用 C 的 `/infer`；D Lambda timeout 为
+30 秒。每次尝试 put 后都会尝试幂等删除，cleanup 错误不会覆盖原始推理错误。返回
+key 必须是 §2 的**简化名**。B/C 普通链路仍使用 12,582,912 bytes 和 45/60/70 秒顺序。
 
 ### 4.2 成员 B — `StorageClient`
 
@@ -128,6 +125,9 @@ detector: TagDetector = SpeciesNetDetector()
 再删 DB 记录（对应成员 B 的 guarded storage-delete Lambda，入参
 `{"user_id": ..., "keys": [...]}`）。公开删除只允许 Cognito `sub` 与记录 owner
 一致；请求中只要有一条外部 owner 记录，整批返回 `403 FORBIDDEN_OWNER` 且不产生副作用。
+生产环境设置 `STORAGE_BACKEND=lambda` 和非空 `STORAGE_DELETE_FUNCTION_NAME`；D
+同步调用 Lambda 并验证外层调用状态、FunctionError、1 MiB 响应边界和内层状态。
+adapter 失败返回稳定的 502 且保留 metadata；未配置返回 503。stub 只可在本地/测试中显式选择。
 
 ### 4.3 成员 A — `get_current_user`
 
@@ -178,8 +178,8 @@ publisher: NotificationPublisher = SNSNotificationPublisher()
 
 ## 5. API 契约（成员 E 前端照此调用）
 
-Base URL：本地 `http://localhost:8000`；云端是 API Gateway HTTP API
-`PacificBioArchive-HTTP-API`（API ID `2dd2aqb32j`，成员 A 提供），所有公开路由都挂
+Base URL：本地 `http://localhost:8000`；云端是成员 A 提供的 API Gateway HTTP API
+（ID 在部署时传入），所有公开路由都挂
 `CognitoJWTAuthorizer`，请求头带 `Authorization: Bearer <id_token>`。
 
 统一错误格式使用 FastAPI `detail`。owner 冲突返回

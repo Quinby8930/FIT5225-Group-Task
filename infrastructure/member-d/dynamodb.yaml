@@ -1,21 +1,44 @@
 AWSTemplateFormatVersion: '2010-09-09'
-Description: >
-  Pacific BioArchive — DynamoDB tables for file metadata, subscriptions and
-  notifications, plus the IAM role the query Lambda assumes. Owned by Member D.
-  Deploy in ap-southeast-2.
+Transform: AWS::Serverless-2016-10-31
+Description: Member D query service, DynamoDB tables, and explicit HTTP API routes.
+
+Parameters:
+  ExistingHttpApiId:
+    Type: String
+  ExistingJwtAuthorizerId:
+    Type: String
+  AllowedOrigin:
+    Type: String
+    Default: http://localhost:3000
+  QueryInputBucketName:
+    Type: String
+    AllowedPattern: '^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$'
+    ConstraintDescription: Must be an S3 bucket name without wildcard characters.
+  StorageDeleteFunctionName:
+    Type: String
+    AllowedPattern: '^[A-Za-z0-9_-]{1,64}$'
+    ConstraintDescription: Must be a Lambda function name without an ARN or wildcard.
+  InferenceApiBaseUrl:
+    Type: String
+    AllowedPattern: '^https://(?:[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.)*[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?(?::(?:[1-9][0-9]{0,3}|[1-5][0-9]{4}|6[0-4][0-9]{3}|65[0-4][0-9]{2}|655[0-2][0-9]|6553[0-5]))?(?:/[A-Za-z0-9._~!$&()*+,;=:@%/-]*)?$'
+    ConstraintDescription: Must be an HTTPS URL with a valid DNS host and optional path.
+  InternalApiKey:
+    Type: String
+    NoEcho: true
+    MinLength: 1
 
 Resources:
   FilesTable:
     Type: AWS::DynamoDB::Table
     Properties:
       TableName: PacificBioArchiveFiles
-      BillingMode: PAY_PER_REQUEST   # on-demand: no capacity planning for this dataset
+      BillingMode: PAY_PER_REQUEST
       AttributeDefinitions:
         - AttributeName: file_id
           AttributeType: S
       KeySchema:
         - AttributeName: file_id
-          KeyType: HASH             # partition key
+          KeyType: HASH
 
   SubscriptionsTable:
     Type: AWS::DynamoDB::Table
@@ -29,9 +52,9 @@ Resources:
           AttributeType: S
       KeySchema:
         - AttributeName: user_id
-          KeyType: HASH             # partition key
+          KeyType: HASH
         - AttributeName: species
-          KeyType: RANGE            # sort key -> unique (user, species) subscription
+          KeyType: RANGE
 
   NotificationsTable:
     Type: AWS::DynamoDB::Table
@@ -45,51 +68,213 @@ Resources:
           AttributeType: S
       KeySchema:
         - AttributeName: user_id
-          KeyType: HASH             # partition key -> list a user's notifications
+          KeyType: HASH
         - AttributeName: notification_id
-          KeyType: RANGE            # sort key -> unique notification
+          KeyType: RANGE
 
-  QueryLambdaRole:
-    Type: AWS::IAM::Role
+  QueryFunction:
+    Type: AWS::Serverless::Function
     Properties:
-      RoleName: PacificBioArchive-QueryLambdaRole
-      AssumeRolePolicyDocument:
-        Version: '2012-10-17'
-        Statement:
-          - Effect: Allow
-            Principal:
-              Service: lambda.amazonaws.com
-            Action: sts:AssumeRole
-      ManagedPolicyArns:
-        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      CodeUri: ../../backend/lambdas/query/
+      Handler: lambda_function.handler
+      Runtime: python3.12
+      Timeout: 30
+      MemorySize: 1024
+      Environment:
+        Variables:
+          REPO_BACKEND: dynamodb
+          DYNAMODB_TABLE: !Ref FilesTable
+          SUBSCRIPTIONS_TABLE: !Ref SubscriptionsTable
+          NOTIFICATIONS_TABLE: !Ref NotificationsTable
+          STORAGE_BACKEND: lambda
+          STORAGE_DELETE_FUNCTION_NAME: !Ref StorageDeleteFunctionName
+          TAG_DETECTOR_BACKEND: remote
+          QUERY_INPUT_BUCKET: !Ref QueryInputBucketName
+          INFERENCE_API_URL: !Ref InferenceApiBaseUrl
+          INTERNAL_API_KEY: !Ref InternalApiKey
+          CORS_ORIGINS: !Ref AllowedOrigin
       Policies:
-        - PolicyName: DynamoDBFilesAccess
-          PolicyDocument:
-            Version: '2012-10-17'
-            Statement:
-              - Effect: Allow
-                Action:
-                  - dynamodb:PutItem
-                  - dynamodb:GetItem
-                  - dynamodb:Scan
-                  - dynamodb:Query
-                  - dynamodb:UpdateItem
-                  - dynamodb:DeleteItem
-                Resource:
-                  - !Sub ${FilesTable.Arn}
-                  - !Sub ${SubscriptionsTable.Arn}
-                  - !Sub ${NotificationsTable.Arn}
+        - AWSLambdaBasicExecutionRole
+        - Statement:
+            - Effect: Allow
+              Action:
+                - dynamodb:PutItem
+                - dynamodb:GetItem
+                - dynamodb:Scan
+                - dynamodb:Query
+                - dynamodb:UpdateItem
+                - dynamodb:DeleteItem
+              Resource:
+                - !GetAtt FilesTable.Arn
+                - !GetAtt SubscriptionsTable.Arn
+                - !GetAtt NotificationsTable.Arn
+            - Effect: Allow
+              Action:
+                - s3:PutObject
+                - s3:GetObject
+                - s3:DeleteObject
+              Resource: !Sub arn:${AWS::Partition}:s3:::${QueryInputBucketName}/query-inputs/*
+            - Effect: Allow
+              Action: lambda:InvokeFunction
+              Resource: !Sub arn:${AWS::Partition}:lambda:${AWS::Region}:${AWS::AccountId}:function:${StorageDeleteFunctionName}
+
+  QueryIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref ExistingHttpApiId
+      IntegrationType: AWS_PROXY
+      IntegrationMethod: POST
+      IntegrationUri: !Sub arn:${AWS::Partition}:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${QueryFunction.Arn}/invocations
+      PayloadFormatVersion: '2.0'
+
+  QueryByTagsRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties: {ApiId: !Ref ExistingHttpApiId, RouteKey: 'POST /query/by-tags', AuthorizationType: JWT, AuthorizerId: !Ref ExistingJwtAuthorizerId, Target: !Sub 'integrations/${QueryIntegration}'}
+  QueryBySpeciesRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties: {ApiId: !Ref ExistingHttpApiId, RouteKey: 'POST /query/by-species', AuthorizationType: JWT, AuthorizerId: !Ref ExistingJwtAuthorizerId, Target: !Sub 'integrations/${QueryIntegration}'}
+  QueryByThumbnailRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties: {ApiId: !Ref ExistingHttpApiId, RouteKey: 'GET /query/by-thumbnail', AuthorizationType: JWT, AuthorizerId: !Ref ExistingJwtAuthorizerId, Target: !Sub 'integrations/${QueryIntegration}'}
+  QueryByFileRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties: {ApiId: !Ref ExistingHttpApiId, RouteKey: 'POST /query/by-file', AuthorizationType: JWT, AuthorizerId: !Ref ExistingJwtAuthorizerId, Target: !Sub 'integrations/${QueryIntegration}'}
+  EditTagsRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties: {ApiId: !Ref ExistingHttpApiId, RouteKey: 'POST /tags/edit', AuthorizationType: JWT, AuthorizerId: !Ref ExistingJwtAuthorizerId, Target: !Sub 'integrations/${QueryIntegration}'}
+  DeleteFilesRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties: {ApiId: !Ref ExistingHttpApiId, RouteKey: 'POST /files/delete', AuthorizationType: JWT, AuthorizerId: !Ref ExistingJwtAuthorizerId, Target: !Sub 'integrations/${QueryIntegration}'}
+  SubscribeRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties: {ApiId: !Ref ExistingHttpApiId, RouteKey: 'POST /notifications/subscribe', AuthorizationType: JWT, AuthorizerId: !Ref ExistingJwtAuthorizerId, Target: !Sub 'integrations/${QueryIntegration}'}
+  UnsubscribeRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties: {ApiId: !Ref ExistingHttpApiId, RouteKey: 'DELETE /notifications/subscribe', AuthorizationType: JWT, AuthorizerId: !Ref ExistingJwtAuthorizerId, Target: !Sub 'integrations/${QueryIntegration}'}
+  SubscriptionsRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties: {ApiId: !Ref ExistingHttpApiId, RouteKey: 'GET /notifications/subscriptions', AuthorizationType: JWT, AuthorizerId: !Ref ExistingJwtAuthorizerId, Target: !Sub 'integrations/${QueryIntegration}'}
+  NotificationsRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties: {ApiId: !Ref ExistingHttpApiId, RouteKey: 'GET /notifications', AuthorizationType: JWT, AuthorizerId: !Ref ExistingJwtAuthorizerId, Target: !Sub 'integrations/${QueryIntegration}'}
+
+  ReserveUploadRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties: {ApiId: !Ref ExistingHttpApiId, RouteKey: 'POST /internal/uploads/reserve', AuthorizationType: NONE, Target: !Sub 'integrations/${QueryIntegration}'}
+  AcquireProcessingRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties: {ApiId: !Ref ExistingHttpApiId, RouteKey: 'POST /internal/files/{file_id}/processing', AuthorizationType: NONE, Target: !Sub 'integrations/${QueryIntegration}'}
+  CompleteFileRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties: {ApiId: !Ref ExistingHttpApiId, RouteKey: 'PUT /internal/files/{file_id}/complete', AuthorizationType: NONE, Target: !Sub 'integrations/${QueryIntegration}'}
+  FailFileRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties: {ApiId: !Ref ExistingHttpApiId, RouteKey: 'PUT /internal/files/{file_id}/failed', AuthorizationType: NONE, Target: !Sub 'integrations/${QueryIntegration}'}
+
+  QueryByTagsOptionsRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties: {ApiId: !Ref ExistingHttpApiId, RouteKey: 'OPTIONS /query/by-tags', AuthorizationType: NONE, Target: !Sub 'integrations/${QueryIntegration}'}
+  QueryBySpeciesOptionsRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties: {ApiId: !Ref ExistingHttpApiId, RouteKey: 'OPTIONS /query/by-species', AuthorizationType: NONE, Target: !Sub 'integrations/${QueryIntegration}'}
+  QueryByThumbnailOptionsRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties: {ApiId: !Ref ExistingHttpApiId, RouteKey: 'OPTIONS /query/by-thumbnail', AuthorizationType: NONE, Target: !Sub 'integrations/${QueryIntegration}'}
+  QueryByFileOptionsRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties: {ApiId: !Ref ExistingHttpApiId, RouteKey: 'OPTIONS /query/by-file', AuthorizationType: NONE, Target: !Sub 'integrations/${QueryIntegration}'}
+  EditTagsOptionsRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties: {ApiId: !Ref ExistingHttpApiId, RouteKey: 'OPTIONS /tags/edit', AuthorizationType: NONE, Target: !Sub 'integrations/${QueryIntegration}'}
+  DeleteFilesOptionsRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties: {ApiId: !Ref ExistingHttpApiId, RouteKey: 'OPTIONS /files/delete', AuthorizationType: NONE, Target: !Sub 'integrations/${QueryIntegration}'}
+  SubscribeOptionsRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties: {ApiId: !Ref ExistingHttpApiId, RouteKey: 'OPTIONS /notifications/subscribe', AuthorizationType: NONE, Target: !Sub 'integrations/${QueryIntegration}'}
+  SubscriptionsOptionsRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties: {ApiId: !Ref ExistingHttpApiId, RouteKey: 'OPTIONS /notifications/subscriptions', AuthorizationType: NONE, Target: !Sub 'integrations/${QueryIntegration}'}
+  NotificationsOptionsRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties: {ApiId: !Ref ExistingHttpApiId, RouteKey: 'OPTIONS /notifications', AuthorizationType: NONE, Target: !Sub 'integrations/${QueryIntegration}'}
+
+  QueryByTagsPermission:
+    Type: AWS::Lambda::Permission
+    Properties: {Action: lambda:InvokeFunction, FunctionName: !Ref QueryFunction, Principal: apigateway.amazonaws.com, SourceArn: !Sub 'arn:${AWS::Partition}:execute-api:${AWS::Region}:${AWS::AccountId}:${ExistingHttpApiId}/*/POST/query/by-tags'}
+  QueryBySpeciesPermission:
+    Type: AWS::Lambda::Permission
+    Properties: {Action: lambda:InvokeFunction, FunctionName: !Ref QueryFunction, Principal: apigateway.amazonaws.com, SourceArn: !Sub 'arn:${AWS::Partition}:execute-api:${AWS::Region}:${AWS::AccountId}:${ExistingHttpApiId}/*/POST/query/by-species'}
+  QueryByThumbnailPermission:
+    Type: AWS::Lambda::Permission
+    Properties: {Action: lambda:InvokeFunction, FunctionName: !Ref QueryFunction, Principal: apigateway.amazonaws.com, SourceArn: !Sub 'arn:${AWS::Partition}:execute-api:${AWS::Region}:${AWS::AccountId}:${ExistingHttpApiId}/*/GET/query/by-thumbnail'}
+  QueryByFilePermission:
+    Type: AWS::Lambda::Permission
+    Properties: {Action: lambda:InvokeFunction, FunctionName: !Ref QueryFunction, Principal: apigateway.amazonaws.com, SourceArn: !Sub 'arn:${AWS::Partition}:execute-api:${AWS::Region}:${AWS::AccountId}:${ExistingHttpApiId}/*/POST/query/by-file'}
+  EditTagsPermission:
+    Type: AWS::Lambda::Permission
+    Properties: {Action: lambda:InvokeFunction, FunctionName: !Ref QueryFunction, Principal: apigateway.amazonaws.com, SourceArn: !Sub 'arn:${AWS::Partition}:execute-api:${AWS::Region}:${AWS::AccountId}:${ExistingHttpApiId}/*/POST/tags/edit'}
+  DeleteFilesPermission:
+    Type: AWS::Lambda::Permission
+    Properties: {Action: lambda:InvokeFunction, FunctionName: !Ref QueryFunction, Principal: apigateway.amazonaws.com, SourceArn: !Sub 'arn:${AWS::Partition}:execute-api:${AWS::Region}:${AWS::AccountId}:${ExistingHttpApiId}/*/POST/files/delete'}
+  SubscribePermission:
+    Type: AWS::Lambda::Permission
+    Properties: {Action: lambda:InvokeFunction, FunctionName: !Ref QueryFunction, Principal: apigateway.amazonaws.com, SourceArn: !Sub 'arn:${AWS::Partition}:execute-api:${AWS::Region}:${AWS::AccountId}:${ExistingHttpApiId}/*/POST/notifications/subscribe'}
+  UnsubscribePermission:
+    Type: AWS::Lambda::Permission
+    Properties: {Action: lambda:InvokeFunction, FunctionName: !Ref QueryFunction, Principal: apigateway.amazonaws.com, SourceArn: !Sub 'arn:${AWS::Partition}:execute-api:${AWS::Region}:${AWS::AccountId}:${ExistingHttpApiId}/*/DELETE/notifications/subscribe'}
+  SubscriptionsPermission:
+    Type: AWS::Lambda::Permission
+    Properties: {Action: lambda:InvokeFunction, FunctionName: !Ref QueryFunction, Principal: apigateway.amazonaws.com, SourceArn: !Sub 'arn:${AWS::Partition}:execute-api:${AWS::Region}:${AWS::AccountId}:${ExistingHttpApiId}/*/GET/notifications/subscriptions'}
+  NotificationsPermission:
+    Type: AWS::Lambda::Permission
+    Properties: {Action: lambda:InvokeFunction, FunctionName: !Ref QueryFunction, Principal: apigateway.amazonaws.com, SourceArn: !Sub 'arn:${AWS::Partition}:execute-api:${AWS::Region}:${AWS::AccountId}:${ExistingHttpApiId}/*/GET/notifications'}
+  ReserveUploadPermission:
+    Type: AWS::Lambda::Permission
+    Properties: {Action: lambda:InvokeFunction, FunctionName: !Ref QueryFunction, Principal: apigateway.amazonaws.com, SourceArn: !Sub 'arn:${AWS::Partition}:execute-api:${AWS::Region}:${AWS::AccountId}:${ExistingHttpApiId}/*/POST/internal/uploads/reserve'}
+  AcquireProcessingPermission:
+    Type: AWS::Lambda::Permission
+    Properties: {Action: lambda:InvokeFunction, FunctionName: !Ref QueryFunction, Principal: apigateway.amazonaws.com, SourceArn: !Sub 'arn:${AWS::Partition}:execute-api:${AWS::Region}:${AWS::AccountId}:${ExistingHttpApiId}/*/POST/internal/files/*/processing'}
+  CompleteFilePermission:
+    Type: AWS::Lambda::Permission
+    Properties: {Action: lambda:InvokeFunction, FunctionName: !Ref QueryFunction, Principal: apigateway.amazonaws.com, SourceArn: !Sub 'arn:${AWS::Partition}:execute-api:${AWS::Region}:${AWS::AccountId}:${ExistingHttpApiId}/*/PUT/internal/files/*/complete'}
+  FailFilePermission:
+    Type: AWS::Lambda::Permission
+    Properties: {Action: lambda:InvokeFunction, FunctionName: !Ref QueryFunction, Principal: apigateway.amazonaws.com, SourceArn: !Sub 'arn:${AWS::Partition}:execute-api:${AWS::Region}:${AWS::AccountId}:${ExistingHttpApiId}/*/PUT/internal/files/*/failed'}
+  QueryByTagsOptionsPermission:
+    Type: AWS::Lambda::Permission
+    Properties: {Action: lambda:InvokeFunction, FunctionName: !Ref QueryFunction, Principal: apigateway.amazonaws.com, SourceArn: !Sub 'arn:${AWS::Partition}:execute-api:${AWS::Region}:${AWS::AccountId}:${ExistingHttpApiId}/*/OPTIONS/query/by-tags'}
+  QueryBySpeciesOptionsPermission:
+    Type: AWS::Lambda::Permission
+    Properties: {Action: lambda:InvokeFunction, FunctionName: !Ref QueryFunction, Principal: apigateway.amazonaws.com, SourceArn: !Sub 'arn:${AWS::Partition}:execute-api:${AWS::Region}:${AWS::AccountId}:${ExistingHttpApiId}/*/OPTIONS/query/by-species'}
+  QueryByThumbnailOptionsPermission:
+    Type: AWS::Lambda::Permission
+    Properties: {Action: lambda:InvokeFunction, FunctionName: !Ref QueryFunction, Principal: apigateway.amazonaws.com, SourceArn: !Sub 'arn:${AWS::Partition}:execute-api:${AWS::Region}:${AWS::AccountId}:${ExistingHttpApiId}/*/OPTIONS/query/by-thumbnail'}
+  QueryByFileOptionsPermission:
+    Type: AWS::Lambda::Permission
+    Properties: {Action: lambda:InvokeFunction, FunctionName: !Ref QueryFunction, Principal: apigateway.amazonaws.com, SourceArn: !Sub 'arn:${AWS::Partition}:execute-api:${AWS::Region}:${AWS::AccountId}:${ExistingHttpApiId}/*/OPTIONS/query/by-file'}
+  EditTagsOptionsPermission:
+    Type: AWS::Lambda::Permission
+    Properties: {Action: lambda:InvokeFunction, FunctionName: !Ref QueryFunction, Principal: apigateway.amazonaws.com, SourceArn: !Sub 'arn:${AWS::Partition}:execute-api:${AWS::Region}:${AWS::AccountId}:${ExistingHttpApiId}/*/OPTIONS/tags/edit'}
+  DeleteFilesOptionsPermission:
+    Type: AWS::Lambda::Permission
+    Properties: {Action: lambda:InvokeFunction, FunctionName: !Ref QueryFunction, Principal: apigateway.amazonaws.com, SourceArn: !Sub 'arn:${AWS::Partition}:execute-api:${AWS::Region}:${AWS::AccountId}:${ExistingHttpApiId}/*/OPTIONS/files/delete'}
+  SubscribeOptionsPermission:
+    Type: AWS::Lambda::Permission
+    Properties: {Action: lambda:InvokeFunction, FunctionName: !Ref QueryFunction, Principal: apigateway.amazonaws.com, SourceArn: !Sub 'arn:${AWS::Partition}:execute-api:${AWS::Region}:${AWS::AccountId}:${ExistingHttpApiId}/*/OPTIONS/notifications/subscribe'}
+  SubscriptionsOptionsPermission:
+    Type: AWS::Lambda::Permission
+    Properties: {Action: lambda:InvokeFunction, FunctionName: !Ref QueryFunction, Principal: apigateway.amazonaws.com, SourceArn: !Sub 'arn:${AWS::Partition}:execute-api:${AWS::Region}:${AWS::AccountId}:${ExistingHttpApiId}/*/OPTIONS/notifications/subscriptions'}
+  NotificationsOptionsPermission:
+    Type: AWS::Lambda::Permission
+    Properties: {Action: lambda:InvokeFunction, FunctionName: !Ref QueryFunction, Principal: apigateway.amazonaws.com, SourceArn: !Sub 'arn:${AWS::Partition}:execute-api:${AWS::Region}:${AWS::AccountId}:${ExistingHttpApiId}/*/OPTIONS/notifications'}
 
 Outputs:
   TableName:
     Value: !Ref FilesTable
-    Description: DynamoDB table the query API reads/writes.
   SubscriptionsTableName:
     Value: !Ref SubscriptionsTable
-    Description: DynamoDB table holding (user, species) subscriptions.
   NotificationsTableName:
     Value: !Ref NotificationsTable
-    Description: DynamoDB table holding per-user notifications.
-  QueryLambdaRoleArn:
-    Value: !GetAtt QueryLambdaRole.Arn
-    Description: Attach this role to the query Lambda.
+  QueryFunctionArn:
+    Value: !GetAtt QueryFunction.Arn

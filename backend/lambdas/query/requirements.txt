@@ -6,6 +6,5 @@ pytest>=8.0
 httpx>=0.27
 # Cloud deploy: Lambda entry point (lambda_function.py).
 mangum>=0.17
-# Cloud DB backend (DynamoDB). Lambda runtime bundles boto3 already; install
-# locally only if you want to test the DynamoDB or SNS path outside Lambda.
-# boto3>=1.34
+# DynamoDB, S3 staging, guarded-delete Lambda invocation, and SNS adapters.
+boto3>=1.34

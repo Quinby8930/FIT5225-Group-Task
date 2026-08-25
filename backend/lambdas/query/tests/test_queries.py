@@ -6,6 +6,7 @@ real FastAPI app against a fresh SQLite database via dependency overrides.
 
 from __future__ import annotations
 
+import json
 from types import SimpleNamespace
 
 import pytest
@@ -20,8 +21,13 @@ from app.services.query_service import (
     filter_by_species,
     to_display_keys,
 )
-from app.storage_client import StorageClient
-from app.tag_detector import TagDetector
+from app.storage_client import (
+    LambdaStorageClient,
+    StorageClient,
+    StubStorageClient,
+    UnavailableStorageClient,
+)
+from app.tag_detector import StubTagDetector, TagDetector
 
 
 INTERNAL_API_KEY = "test-internal-api-key"
@@ -98,7 +104,11 @@ def client(tmp_path):
     )
 
     class _Detector(TagDetector):
-        def detect(self, file_name, content):
+        def __init__(self):
+            self.calls = []
+
+        def detect(self, **kwargs):
+            self.calls.append(kwargs)
             return {"wombat": 1}
 
     class _Storage(StorageClient):
@@ -118,10 +128,11 @@ def client(tmp_path):
             self.published.append(notification)
 
     storage = _Storage()
+    detector = _Detector()
     publisher = _Publisher()
     main.app.dependency_overrides[main.get_repo] = lambda: repo
     main.app.dependency_overrides[main.get_notification_repo] = lambda: notif_repo
-    main.app.dependency_overrides[main.get_detector] = lambda: _Detector()
+    main.app.dependency_overrides[main.get_detector] = lambda: detector
     main.app.dependency_overrides[main.get_storage] = lambda: storage
     main.app.dependency_overrides[main.get_publisher] = lambda: publisher
     main.app.dependency_overrides[main.get_current_user] = lambda: "u1"
@@ -132,6 +143,7 @@ def client(tmp_path):
         c.repo = repo
         c.notif_repo = notif_repo
         c.storage = storage
+        c.detector = detector
         c.publisher = publisher
         yield c
 
@@ -179,6 +191,144 @@ class TestEndpoints:
         )
         assert r.status_code == 200
         assert len(client.repo.all()) == before  # query file NOT stored
+        assert client.detector.calls == [
+            {
+                "user_id": "u1",
+                "file_name": "query.jpg",
+                "content_type": "image/jpeg",
+                "content": b"fake-image-bytes",
+            }
+        ]
+
+    @pytest.mark.parametrize(
+        "content_type", ["image/jpeg", "image/png", "image/webp"]
+    )
+    def test_by_file_accepts_supported_image_types(self, client, content_type):
+        response = client.post(
+            "/query/by-file",
+            files={"file": ("query", b"image", content_type)},
+        )
+
+        assert response.status_code == 200
+
+    def test_by_file_rejects_non_image_before_detection(self, client):
+        response = client.post(
+            "/query/by-file",
+            files={"file": ("query.txt", b"not-an-image", "text/plain")},
+        )
+
+        assert response.status_code == 415
+        assert client.detector.calls == []
+
+    def test_by_file_rejects_image_over_front_door_limit_before_detection(self, client):
+        response = client.post(
+            "/query/by-file",
+            files={"file": ("query.jpg", b"x" * 4_194_305, "image/jpeg")},
+        )
+
+        assert response.status_code == 413
+        assert client.detector.calls == []
+
+    def test_by_file_accepts_image_at_exact_front_door_limit(self, client):
+        response = client.post(
+            "/query/by-file",
+            files={"file": ("query.jpg", b"x" * 4_194_304, "image/jpeg")},
+        )
+
+        assert response.status_code == 200
+        assert len(client.detector.calls) == 1
+        assert len(client.detector.calls[0]["content"]) == 4_194_304
+
+    def test_by_file_returns_503_when_remote_detector_config_is_missing(self, client):
+        missing_remote = main._build_detector(
+            SimpleNamespace(
+                tag_detector_backend="remote",
+                query_input_bucket="",
+                inference_api_url="",
+                internal_api_key="",
+            )
+        )
+        main.app.dependency_overrides[main.get_detector] = lambda: missing_remote
+
+        response = client.post(
+            "/query/by-file",
+            files={"file": ("query.jpg", b"image", "image/jpeg")},
+        )
+
+        assert response.status_code == 503
+
+    def test_adapter_builders_require_explicit_backends_and_production_config(
+        self, monkeypatch
+    ):
+        assert isinstance(
+            main._build_storage(
+                SimpleNamespace(
+                    storage_backend="stub", storage_delete_function_name=""
+                )
+            ),
+            StubStorageClient,
+        )
+        assert isinstance(
+            main._build_storage(
+                SimpleNamespace(storage_backend="", storage_delete_function_name="")
+            ),
+            UnavailableStorageClient,
+        )
+        assert isinstance(
+            main._build_detector(
+                SimpleNamespace(
+                    tag_detector_backend="stub",
+                    query_input_bucket="",
+                    inference_api_url="",
+                    internal_api_key="",
+                )
+            ),
+            StubTagDetector,
+        )
+
+        sentinel_storage = object()
+        monkeypatch.setattr(
+            main,
+            "LambdaStorageClient",
+            lambda function_name: sentinel_storage
+            if function_name == "storage-delete"
+            else None,
+        )
+        assert (
+            main._build_storage(
+                SimpleNamespace(
+                    storage_backend="lambda",
+                    storage_delete_function_name="storage-delete",
+                )
+            )
+            is sentinel_storage
+        )
+        with pytest.raises(RuntimeError, match="function name"):
+            main._build_storage(
+                SimpleNamespace(
+                    storage_backend="lambda", storage_delete_function_name=""
+                )
+            )
+        with pytest.raises(RuntimeError, match="STORAGE_BACKEND"):
+            main._build_storage(
+                SimpleNamespace(
+                    storage_backend="unexpected", storage_delete_function_name=""
+                )
+            )
+
+        sentinel_detector = object()
+        monkeypatch.setattr(main, "RemoteTagDetector", lambda **kwargs: sentinel_detector)
+        assert (
+            main._build_detector(
+                SimpleNamespace(
+                    tag_detector_backend="remote",
+                    query_input_bucket="private-media",
+                    inference_api_url="https://inference.example",
+                    internal_api_key="internal-key",
+                )
+            )
+            is sentinel_detector
+        )
 
     def test_tag_add(self, client):
         client.post("/tags/edit", json={"keys": ["originals/f1"], "tags": ["koala"], "operation": 1})
@@ -253,6 +403,45 @@ class TestEndpoints:
         with pytest.raises(RuntimeError, match="storage unavailable"):
             client.post("/files/delete", json={"keys": ["originals/f1"]})
 
+        assert client.repo.get("f1") is not None
+
+    def test_delete_returns_503_and_keeps_metadata_when_storage_config_is_missing(
+        self, client
+    ):
+        unavailable = main._build_storage(
+            SimpleNamespace(storage_backend="", storage_delete_function_name="")
+        )
+        main.app.dependency_overrides[main.get_storage] = lambda: unavailable
+
+        response = client.post("/files/delete", json={"keys": ["originals/f1"]})
+
+        assert response.status_code == 503
+        assert client.repo.get("f1") is not None
+
+    def test_delete_keeps_metadata_when_lambda_adapter_rejects_nested_failure(
+        self, client
+    ):
+        class _Payload:
+            def read(self, limit=-1):
+                return json.dumps(
+                    {
+                        "statusCode": 500,
+                        "body": json.dumps({"code": "INTERNAL_ERROR"}),
+                    }
+                ).encode()[:limit]
+
+        class _Lambda:
+            def invoke(self, **_kwargs):
+                return {"StatusCode": 200, "Payload": _Payload()}
+
+        main.app.dependency_overrides[main.get_storage] = lambda: LambdaStorageClient(
+            "storage-delete", lambda_client=_Lambda()
+        )
+
+        response = client.post("/files/delete", json={"keys": ["originals/f1"]})
+
+        assert response.status_code == 502
+        assert response.json() == {"detail": "storage deletion failed"}
         assert client.repo.get("f1") is not None
 
     @pytest.mark.parametrize(

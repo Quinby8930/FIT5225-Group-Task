@@ -28,7 +28,11 @@ Both backends sit behind the same `FileRepository` interface
 # 1. Seed the local SQLite database (7 demo records)
 python seed.py
 
-# 2. Start the API (auto docs at http://localhost:8000/docs)
+# 2. Explicitly select local-only adapters. Omitting these values fails closed.
+export STORAGE_BACKEND=stub
+export TAG_DETECTOR_BACKEND=stub
+
+# 3. Start the API (auto docs at http://localhost:8000/docs)
 python -m uvicorn app.main:app --reload --port 8000
 ```
 
@@ -75,25 +79,26 @@ the JSON fixtures in `events/` with `curl` (see `events/README.md`).
 python -m pytest tests/ -v
 ```
 
-## Switching to DynamoDB (cloud)
+## Production adapter contract
 
-```bash
-pip install boto3
-export REPO_BACKEND=dynamodb
-export DYNAMODB_TABLE=PacificBioArchiveFiles
-export AWS_REGION=ap-southeast-2
-```
+The SAM template sets `REPO_BACKEND=dynamodb`, `STORAGE_BACKEND=lambda`, and
+`TAG_DETECTOR_BACKEND=remote`. Storage deletion synchronously invokes Member B's
+guarded-delete Lambda before metadata is removed. File queries accept only
+JPEG/PNG/WebP up to 4,194,304 bytes, stage the image privately under
+`query-inputs/`, give Member C a 120-second HTTPS GET URL, and call C with a
+25-second no-redirect HTTP timeout inside a 30-second Lambda. Cleanup is
+attempted after every S3 put attempt. Missing production configuration returns
+503; it never falls back to a fake deletion or fake `dingo` result.
 
 The query API code is unchanged — only the repository backend swaps
 (`app/config.py` -> `_build_repository()` in `app/main.py`).
 
 ## Wiring to other members
 
-- **Member C (ML):** replace `StubTagDetector` with an adapter around the
-  MegaDetector + SpeciesNet pipeline (`app/tag_detector.py`). Output tags must
-  use the team short species name (`app/species.py`).
-- **Member B (storage):** replace `StubStorageClient` with the guarded
-  storage-delete Lambda invocation (`app/storage_client.py`, takes S3 **keys**).
+- **Member C (ML):** `RemoteTagDetector` calls `/infer` using the private staged
+  image contract. Output tags use the team short species name.
+- **Member B (storage):** `LambdaStorageClient` invokes the guarded
+  storage-delete Lambda with the owning user and S3 **keys**.
   Member B also writes metadata through the internal endpoints above, not by
   importing this repo directly.
 - **Member A (auth):** replace the body of `get_current_user` in `app/main.py`
