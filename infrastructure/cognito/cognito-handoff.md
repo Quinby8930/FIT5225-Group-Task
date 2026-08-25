@@ -9,7 +9,7 @@ Member A owns authentication and authorization.
 ```text
 AWS Region: ap-southeast-2
 User Pool ID: ap-southeast-2_1hGEJyYO7
-Cognito Domain: https://ap-southeast-21hgejyy07.auth.ap-southeast-2.amazoncognito.com
+Cognito Domain: https://ap-southeast-21hgejyyo7.auth.ap-southeast-2.amazoncognito.com
 SPA App Client Name: PacificBioArchive-SPA
 SPA App Client ID: 65dgspco2djehpbpunc13t2oml
 Callback URL: http://localhost:3000/callback

@@ -9,7 +9,7 @@ or screenshots that expose private credentials.
 User pool: ap-southeast-2_1hGEJyYO7
 App client: PacificBioArchive-SPA
 App client ID: 65dgspco2djehpbpunc13t2oml
-Cognito domain: https://ap-southeast-21hgejyy07.auth.ap-southeast-2.amazoncognito.com
+Cognito domain: https://ap-southeast-21hgejyyo7.auth.ap-southeast-2.amazoncognito.com
 App callback URL: http://localhost:3000/callback
 App sign-out URL: http://localhost:3000/logout
 ```
@@ -19,7 +19,7 @@ App sign-out URL: http://localhost:3000/logout
 Create a Google OAuth web client and use this Authorized redirect URI:
 
 ```text
-https://ap-southeast-21hgejyy07.auth.ap-southeast-2.amazoncognito.com/oauth2/idpresponse
+https://ap-southeast-21hgejyyo7.auth.ap-southeast-2.amazoncognito.com/oauth2/idpresponse
 ```
 
 Keep the Google client ID and client secret outside the repository.
