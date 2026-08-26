@@ -50,6 +50,18 @@ npm run dev
 - Screenshot of subscription and notification inbox.
 - Output of `npm test`.
 - Output of `npm run build`.
+- Demo walkthrough: `docs/member-e/demo-script.md`.
+
+## Final Cloud Address
+
+Member E only needs the final API base URL from Member A:
+
+```text
+VITE_API_BASE_URL=https://<api-id>.execute-api.ap-southeast-2.amazonaws.com
+```
+
+Do not set `VITE_ASSET_BASE_URL`. Query result previews and full-image/video
+links use `POST /asset-urls` on the same API Gateway base URL.
 
 ## SNS Notification Delivery
 

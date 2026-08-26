@@ -159,6 +159,7 @@ Handoff references:
 - [Frontend setup](frontend/README.md)
 - [Member E user guide](docs/member-e/user-guide.md)
 - [Member E architecture notes](docs/member-e/architecture.md)
+- [Member E demo script](docs/member-e/demo-script.md)
 
 ## Local frontend start
 
