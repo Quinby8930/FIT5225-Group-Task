@@ -19,8 +19,10 @@ from mangum import Mangum
 
 from app.main import app
 
+adapter = Mangum(app, api_gateway_base_path="/dev")
+
 
 def handler(event, context):
     # Let get_current_user read the API Gateway authorizer claims.
     app.state.lambda_event = event
-    return Mangum(app)(event, context)
+    return adapter(event, context)
