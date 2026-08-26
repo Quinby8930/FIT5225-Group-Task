@@ -153,6 +153,14 @@ get_current_user = build_get_current_user()
 
 
 # ---------------------------------------------------------------------------
+# Authentication smoke test
+# ---------------------------------------------------------------------------
+@app.get("/auth-test")
+def auth_test(user_id: str = Depends(get_current_user)) -> dict:
+    return {"authenticated": True, "user_id": user_id}
+
+
+# ---------------------------------------------------------------------------
 # Queries
 # ---------------------------------------------------------------------------
 @app.post("/query/by-tags", response_model=QueryResponse)
