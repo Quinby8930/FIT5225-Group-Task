@@ -14,6 +14,10 @@ RUN apt-get update \
 
 COPY requirements.txt .
 COPY requirements-model-runtime.txt .
+RUN pip install --no-cache-dir --prefer-binary \
+    torch==2.13.0 \
+    torchvision==0.28.0 \
+    --index-url https://download.pytorch.org/whl/cpu
 RUN pip install --no-cache-dir --prefer-binary -r requirements.txt
 RUN pip install --no-cache-dir --prefer-binary -r requirements-model-runtime.txt
 
