@@ -41,7 +41,10 @@ Conditions:
 Resources:
   MediaBucket:
     Type: AWS::S3::Bucket
+    DependsOn:
+      - MediaProcessingInvokePermission
     Properties:
+      BucketName: !Sub pacificbioarchive-media-${AWS::AccountId}-${AWS::Region}
       PublicAccessBlockConfiguration:
         BlockPublicAcls: true
         BlockPublicPolicy: true
@@ -75,6 +78,15 @@ Resources:
             Prefix: processing/
             Status: Enabled
             ExpirationInDays: 1
+      NotificationConfiguration:
+        LambdaConfigurations:
+          - Event: s3:ObjectCreated:*
+            Function: !GetAtt MediaProcessingFunction.Arn
+            Filter:
+              S3Key:
+                Rules:
+                  - Name: prefix
+                    Value: originals/
 
   UploadFunction:
     Type: AWS::Serverless::Function
@@ -86,7 +98,7 @@ Resources:
       MemorySize: 256
       Environment:
         Variables:
-          UPLOAD_BUCKET: !Ref MediaBucket
+          UPLOAD_BUCKET: !Sub pacificbioarchive-media-${AWS::AccountId}-${AWS::Region}
           METADATA_API_BASE_URL: !Ref MetadataApiBaseUrl
           INTERNAL_API_KEY: !Ref InternalApiKey
           MAX_UPLOAD_BYTES: !Ref MaxUploadBytes
@@ -97,7 +109,7 @@ Resources:
         - Statement:
             - Effect: Allow
               Action: s3:PutObject
-              Resource: !Sub ${MediaBucket.Arn}/originals/*
+              Resource: !Sub arn:${AWS::Partition}:s3:::pacificbioarchive-media-${AWS::AccountId}-${AWS::Region}/originals/*
 
   MediaProcessingFunction:
     Type: AWS::Serverless::Function
@@ -106,14 +118,14 @@ Resources:
       Handler: handler.handler
       Runtime: python3.12
       Timeout: 900
-      MemorySize: 4096
+      MemorySize: 3008
       EphemeralStorage:
         Size: 4096
       Layers:
         - !If [HasFfmpegLayer, !Ref FfmpegLayerArn, !Ref AWS::NoValue]
       Environment:
         Variables:
-          MEDIA_BUCKET_NAME: !Ref MediaBucket
+          MEDIA_BUCKET_NAME: !Sub pacificbioarchive-media-${AWS::AccountId}-${AWS::Region}
           METADATA_API_BASE_URL: !Ref MetadataApiBaseUrl
           INFERENCE_API_URL: !Ref InferenceApiUrl
           INTERNAL_API_KEY: !Ref InternalApiKey
@@ -125,27 +137,25 @@ Resources:
             - Effect: Allow
               Action: s3:GetObject
               Resource:
-                - !Sub ${MediaBucket.Arn}/originals/*
-                - !Sub ${MediaBucket.Arn}/processing/*
+                - !Sub arn:${AWS::Partition}:s3:::pacificbioarchive-media-${AWS::AccountId}-${AWS::Region}/originals/*
+                - !Sub arn:${AWS::Partition}:s3:::pacificbioarchive-media-${AWS::AccountId}-${AWS::Region}/processing/*
             - Effect: Allow
               Action: s3:PutObject
               Resource:
-                - !Sub ${MediaBucket.Arn}/thumbnails/*
-                - !Sub ${MediaBucket.Arn}/processing/*
+                - !Sub arn:${AWS::Partition}:s3:::pacificbioarchive-media-${AWS::AccountId}-${AWS::Region}/thumbnails/*
+                - !Sub arn:${AWS::Partition}:s3:::pacificbioarchive-media-${AWS::AccountId}-${AWS::Region}/processing/*
             - Effect: Allow
               Action: s3:DeleteObject
-              Resource: !Sub ${MediaBucket.Arn}/processing/*
-      Events:
-        OriginalUpload:
-          Type: S3
-          Properties:
-            Bucket: !Ref MediaBucket
-            Events: s3:ObjectCreated:*
-            Filter:
-              S3Key:
-                Rules:
-                  - Name: prefix
-                    Value: originals/
+              Resource: !Sub arn:${AWS::Partition}:s3:::pacificbioarchive-media-${AWS::AccountId}-${AWS::Region}/processing/*
+
+  MediaProcessingInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref MediaProcessingFunction
+      Principal: s3.amazonaws.com
+      SourceAccount: !Ref AWS::AccountId
+      SourceArn: !Sub arn:${AWS::Partition}:s3:::pacificbioarchive-media-${AWS::AccountId}-${AWS::Region}
 
   StorageDeleteFunction:
     Type: AWS::Serverless::Function
@@ -157,16 +167,16 @@ Resources:
       MemorySize: 256
       Environment:
         Variables:
-          MEDIA_BUCKET_NAME: !Ref MediaBucket
+          MEDIA_BUCKET_NAME: !Sub pacificbioarchive-media-${AWS::AccountId}-${AWS::Region}
       Policies:
         - AWSLambdaBasicExecutionRole
         - Statement:
             - Effect: Allow
               Action: s3:DeleteObject
               Resource:
-                - !Sub ${MediaBucket.Arn}/originals/*
-                - !Sub ${MediaBucket.Arn}/thumbnails/*
-                - !Sub ${MediaBucket.Arn}/processing/*
+                - !Sub arn:${AWS::Partition}:s3:::pacificbioarchive-media-${AWS::AccountId}-${AWS::Region}/originals/*
+                - !Sub arn:${AWS::Partition}:s3:::pacificbioarchive-media-${AWS::AccountId}-${AWS::Region}/thumbnails/*
+                - !Sub arn:${AWS::Partition}:s3:::pacificbioarchive-media-${AWS::AccountId}-${AWS::Region}/processing/*
 
   AssetUrlsFunction:
     Type: AWS::Serverless::Function
@@ -178,7 +188,7 @@ Resources:
       MemorySize: 256
       Environment:
         Variables:
-          MEDIA_BUCKET_NAME: !Ref MediaBucket
+          MEDIA_BUCKET_NAME: !Sub pacificbioarchive-media-${AWS::AccountId}-${AWS::Region}
           ALLOWED_ORIGIN: !Ref AllowedOrigin
       Policies:
         - AWSLambdaBasicExecutionRole
@@ -186,8 +196,8 @@ Resources:
             - Effect: Allow
               Action: s3:GetObject
               Resource:
-                - !Sub ${MediaBucket.Arn}/originals/*
-                - !Sub ${MediaBucket.Arn}/thumbnails/*
+                - !Sub arn:${AWS::Partition}:s3:::pacificbioarchive-media-${AWS::AccountId}-${AWS::Region}/originals/*
+                - !Sub arn:${AWS::Partition}:s3:::pacificbioarchive-media-${AWS::AccountId}-${AWS::Region}/thumbnails/*
 
   UploadIntegration:
     Type: AWS::ApiGatewayV2::Integration
@@ -275,7 +285,7 @@ Resources:
 
 Outputs:
   MediaBucketName:
-    Value: !Ref MediaBucket
+    Value: !Sub pacificbioarchive-media-${AWS::AccountId}-${AWS::Region}
   UploadFunctionArn:
     Value: !GetAtt UploadFunction.Arn
   MediaProcessingFunctionArn:
