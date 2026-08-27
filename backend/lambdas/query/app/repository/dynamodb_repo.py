@@ -185,7 +185,8 @@ class DynamoDBRepository(FileRepository):
     def update_tags(self, file_id: str, tags: dict[str, int]) -> None:
         self._table.update_item(
             Key={"file_id": file_id},
-            UpdateExpression="SET tags = :t",
+            UpdateExpression="SET #tags = :t",
+            ExpressionAttributeNames={"#tags": "tags"},
             ExpressionAttributeValues={":t": _float_to_decimal(tags)},
         )
 
@@ -225,7 +226,7 @@ class DynamoDBRepository(FileRepository):
             ":m": model_version,
         }
         set_expr = (
-            "SET #s = :s, object_key = :o, file_type = :ft, tags = :t, "
+            "SET #s = :s, object_key = :o, file_type = :ft, #tags = :t, "
             "detections = :d, model_version = :m "
         )
         if thumbnail_key is not None:
@@ -237,7 +238,7 @@ class DynamoDBRepository(FileRepository):
                 set_expr
                 + "REMOVE processing_sequencer, lease_expires_at, error_code, message"
             ),
-            ExpressionAttributeNames={"#s": "status"},
+            ExpressionAttributeNames={"#s": "status", "#tags": "tags"},
             ExpressionAttributeValues=values,
         )
 
