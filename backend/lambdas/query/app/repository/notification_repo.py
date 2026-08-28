@@ -47,8 +47,12 @@ class NotificationRepository(ABC):
         """Return every user_id subscribed to `species` (for the trigger)."""
 
     @abstractmethod
-    def add_notification(self, notification: Notification) -> None:
-        """Store one notification."""
+    def add_notification(self, notification: Notification) -> bool:
+        """Store one notification and report whether this call created it."""
+
+    @abstractmethod
+    def delete_notification(self, notification: Notification) -> None:
+        """Delete a notification created during a failed inbox write."""
 
     @abstractmethod
     def pending_for_file(self, file_id: str) -> list[Notification]:
@@ -137,8 +141,8 @@ class SQLiteNotificationRepository(NotificationRepository):
         ).fetchall()
         return [r["user_id"] for r in rows]
 
-    def add_notification(self, notification: Notification) -> None:
-        self._conn.execute(
+    def add_notification(self, notification: Notification) -> bool:
+        cursor = self._conn.execute(
             "INSERT OR IGNORE INTO notifications "
             "(notification_id, user_id, file_id, species, object_key, created_at, "
             "delivery_status) VALUES (?,?,?,?,?,?,'pending')",
@@ -150,6 +154,14 @@ class SQLiteNotificationRepository(NotificationRepository):
                 notification.object_key,
                 notification.created_at.isoformat(),
             ),
+        )
+        self._conn.commit()
+        return cursor.rowcount == 1
+
+    def delete_notification(self, notification: Notification) -> None:
+        self._conn.execute(
+            "DELETE FROM notifications WHERE notification_id=?",
+            (notification.notification_id,),
         )
         self._conn.commit()
 
@@ -231,7 +243,7 @@ class DynamoDBNotificationRepository(NotificationRepository):
         )
         return sorted(item["user_id"] for item in items)
 
-    def add_notification(self, notification: Notification) -> None:
+    def add_notification(self, notification: Notification) -> bool:
         import botocore.exceptions
 
         try:
@@ -247,10 +259,19 @@ class DynamoDBNotificationRepository(NotificationRepository):
                 },
                 ConditionExpression="attribute_not_exists(notification_id)",
             )
+            return True
         except botocore.exceptions.ClientError as exc:
             if exc.response.get("Error", {}).get("Code") == "ConditionalCheckFailedException":
-                return
+                return False
             raise
+
+    def delete_notification(self, notification: Notification) -> None:
+        self._notifications.delete_item(
+            Key={
+                "user_id": notification.user_id,
+                "notification_id": notification.notification_id,
+            }
+        )
 
     @staticmethod
     def _notification_from_item(item: dict) -> Notification:

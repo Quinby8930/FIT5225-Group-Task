@@ -76,6 +76,10 @@ Resources:
             Prefix: processing/
             Status: Enabled
             ExpirationInDays: 1
+          - Id: ExpireAbandonedQueryInputs
+            Prefix: query-inputs/
+            Status: Enabled
+            ExpirationInDays: 1
       NotificationConfiguration:
         LambdaConfigurations:
           - Event: s3:ObjectCreated:*

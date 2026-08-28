@@ -60,12 +60,17 @@ Member D has added the database and query API:
 - Query endpoints for tag AND queries with minimum counts, species lookup,
   thumbnail-to-original mapping, file-based querying (without persisting the
   query file), bulk tag add/remove, and bulk delete across database and storage.
+  Query inputs are actively deleted after each attempt, with an S3 lifecycle
+  rule as a cleanup backstop rather than a precise expiry guarantee.
 - An internal metadata state machine (`reserve` / `processing` lease /
   `complete` / `failed`) that Member B's upload and processing Lambdas call.
 - A subscription & notification model (subscribe/unsubscribe/list endpoints plus
   a trigger that notifies subscribers when a completed file matches their
   subscribed species), behind a `NotificationPublisher` integration slot for
-  Member E's delivery.
+  Member E's delivery. A manual tag edit notifies current subscribers only for
+  their deterministic first notification per file/user/species when it activates
+  a normalized species on a completed file (missing or non-positive count to
+  positive); repeat adds and removals do not notify existing recipients.
 - A CloudFormation template declaring three DynamoDB tables (file metadata,
   subscriptions, notifications) and the query Lambda's IAM role.
 

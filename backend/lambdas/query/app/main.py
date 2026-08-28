@@ -54,6 +54,7 @@ from app.schemas import (
     DeleteRequest,
     FailedRequest,
     FileRecord,
+    Notification,
     NotificationListResponse,
     ProcessingRequest,
     QueryResponse,
@@ -340,12 +341,12 @@ def _require_matching_metadata(
         raise HTTPException(status_code=409, detail=METADATA_CONFLICT_DETAIL)
 
 
-def _publish_pending_notifications(
-    file_id: str,
+def _publish_notifications(
+    notifications: list[Notification],
     notif_repo_: NotificationRepository,
     publisher_: NotificationPublisher,
 ) -> None:
-    for notification in notif_repo_.pending_for_file(file_id):
+    for notification in notifications:
         try:
             publisher_.publish(notification)
         except Exception:
@@ -369,17 +370,44 @@ def _publish_pending_notifications(
             )
 
 
+def _publish_pending_notifications(
+    file_id: str,
+    notif_repo_: NotificationRepository,
+    publisher_: NotificationPublisher,
+) -> None:
+    _publish_notifications(
+        notif_repo_.pending_for_file(file_id), notif_repo_, publisher_
+    )
+
+
 def _ensure_notification_inbox(
     file_id: str,
     object_key: str,
     tags: dict[str, int],
     notif_repo_: NotificationRepository,
-) -> None:
-    notifications = build_notifications(
-        file_id, object_key, tags, notif_repo_.subscribers_for_species
-    )
-    for notification in notifications:
-        notif_repo_.add_notification(notification)
+) -> list[Notification]:
+    created_notifications: list[Notification] = []
+    try:
+        notifications = build_notifications(
+            file_id, object_key, tags, notif_repo_.subscribers_for_species
+        )
+        for notification in notifications:
+            if notif_repo_.add_notification(notification):
+                created_notifications.append(notification)
+    except Exception:
+        for notification in reversed(created_notifications):
+            try:
+                notif_repo_.delete_notification(notification)
+            except Exception:
+                logger.exception(
+                    "notification inbox compensation delete failed",
+                    extra={
+                        "notification_id": notification.notification_id,
+                        "file_id": notification.file_id,
+                    },
+                )
+        raise
+    return created_notifications
 
 
 # ---------------------------------------------------------------------------
@@ -473,6 +501,8 @@ async def query_by_file(
 def edit_tags(
     body: TagEditRequest,
     repo_: FileRepository = Depends(get_repo),
+    notif_repo_: NotificationRepository = Depends(get_notification_repo),
+    publisher_: NotificationPublisher = Depends(get_publisher),
     _user: str = Depends(get_current_user),
     settings_: Settings = Depends(get_settings),
 ) -> dict:
@@ -481,16 +511,36 @@ def edit_tags(
     )
     if any(record.user_id != _user for record in records):
         raise HTTPException(status_code=403, detail=FORBIDDEN_OWNER_DETAIL)
-    normalised_tags = [_normalise_species(tag) for tag in body.tags]
+    normalised_tags = list(dict.fromkeys(_normalise_species(tag) for tag in body.tags))
     updated = 0
     for record in records:
+        old_tags = dict(record.tags)
         tags = dict(record.tags)
+        activated_tags: dict[str, int] = {}
         for tag in normalised_tags:
             if body.operation == 1:  # add
-                tags[tag] = tags.get(tag, 0) + 1
+                previous_count = tags.get(tag, 0)
+                tags[tag] = previous_count + 1
+                if previous_count <= 0 and tags[tag] > 0:
+                    activated_tags[tag] = tags[tag]
             else:  # remove — ignore tags that aren't present (spec requirement)
                 tags.pop(tag, None)
         repo_.update_tags(record.file_id, tags)
+        if record.status == "completed" and activated_tags:
+            try:
+                created_notifications = _ensure_notification_inbox(
+                    record.file_id, record.object_key, activated_tags, notif_repo_
+                )
+            except Exception:
+                try:
+                    repo_.update_tags(record.file_id, old_tags)
+                except Exception:
+                    logger.exception(
+                        "tag rollback failed after notification inbox persistence error",
+                        extra={"file_id": record.file_id},
+                    )
+                raise
+            _publish_notifications(created_notifications, notif_repo_, publisher_)
         updated += 1
     return {"updated": updated, "matched_keys": [r.object_key for r in records]}
 

@@ -138,6 +138,12 @@ def test_media_bucket_is_private_encrypted_and_recoverable(template):
         and rule["ExpirationInDays"] == 1
         for rule in lifecycle
     )
+    assert {
+        "Id": "ExpireAbandonedQueryInputs",
+        "Prefix": "query-inputs/",
+        "Status": "Enabled",
+        "ExpirationInDays": 1,
+    } in lifecycle
 
 
 def test_s3_event_is_filtered_to_originals(template):

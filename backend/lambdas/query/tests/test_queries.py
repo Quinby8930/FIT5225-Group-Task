@@ -85,6 +85,35 @@ class TestPureLogic:
 
         assert first[0].notification_id == replay[0].notification_id
 
+    def test_sqlite_notification_add_reports_only_the_atomic_create(self, tmp_path):
+        notification_repo = SQLiteNotificationRepository(str(tmp_path / "notifications.db"))
+        notification = Notification(
+            notification_id="stable",
+            user_id="u2",
+            file_id="f1",
+            species="wombat",
+            object_key="originals/f1",
+        )
+
+        assert notification_repo.add_notification(notification) is True
+        assert notification_repo.add_notification(notification) is False
+
+    def test_sqlite_notification_delete_removes_the_created_notification(self, tmp_path):
+        notification_repo = SQLiteNotificationRepository(str(tmp_path / "notifications.db"))
+        notification = Notification(
+            notification_id="compensated",
+            user_id="u2",
+            file_id="f1",
+            species="wombat",
+            object_key="originals/f1",
+        )
+        assert notification_repo.add_notification(notification) is True
+
+        notification_repo.delete_notification(notification)
+
+        assert notification_repo.notifications("u2") == []
+        assert notification_repo.add_notification(notification) is True
+
 
 class TestInternalAssetAuthorization:
     def test_completed_keys_are_authorized_with_mixed_denials_and_deduplication(self, client):
@@ -519,6 +548,306 @@ class TestEndpoints:
         record = client.repo.get("f1")
         assert record.tags["wombat"] == 2
         assert "Vombatus_ursinus" not in record.tags
+
+    def test_manual_completed_activation_creates_and_publishes_notification(self, client):
+        client.notif_repo.subscribe("u2", "koala")
+
+        response = client.post(
+            "/tags/edit",
+            json={"keys": ["originals/f1"], "tags": ["koala"], "operation": 1},
+        )
+
+        assert response.status_code == 200
+        notifications = client.notif_repo.notifications("u2")
+        assert [(item.file_id, item.species) for item in notifications] == [
+            ("f1", "koala")
+        ]
+        assert [(item.file_id, item.species) for item in client.publisher.published] == [
+            ("f1", "koala")
+        ]
+
+    def test_manual_add_to_positive_tag_increases_count_without_notification(self, client):
+        client.notif_repo.subscribe("u2", "wombat")
+
+        response = client.post(
+            "/tags/edit",
+            json={"keys": ["originals/f1"], "tags": ["wombat"], "operation": 1},
+        )
+
+        assert response.status_code == 200
+        assert client.repo.get("f1").tags["wombat"] == 2
+        assert client.notif_repo.notifications("u2") == []
+        assert client.publisher.published == []
+
+    def test_manual_repeat_add_does_not_duplicate_or_republish_notification(self, client):
+        client.notif_repo.subscribe("u2", "koala")
+        payload = {"keys": ["originals/f1"], "tags": ["koala"], "operation": 1}
+
+        assert client.post("/tags/edit", json=payload).status_code == 200
+        assert client.post("/tags/edit", json=payload).status_code == 200
+
+        assert client.repo.get("f1").tags["koala"] == 2
+        assert len(client.notif_repo.notifications("u2")) == 1
+        assert len(client.publisher.published) == 1
+
+    def test_manual_remove_does_not_create_or_publish_notification(self, client):
+        client.notif_repo.subscribe("u2", "wombat")
+
+        response = client.post(
+            "/tags/edit",
+            json={"keys": ["originals/f1"], "tags": ["wombat"], "operation": 0},
+        )
+
+        assert response.status_code == 200
+        assert "wombat" not in client.repo.get("f1").tags
+        assert client.notif_repo.notifications("u2") == []
+        assert client.publisher.published == []
+
+    def test_manual_add_from_zero_count_activates_notification(self, client):
+        client.repo.update_tags("f1", {"wombat": 0})
+        client.notif_repo.subscribe("u2", "wombat")
+
+        response = client.post(
+            "/tags/edit",
+            json={"keys": ["originals/f1"], "tags": ["wombat"], "operation": 1},
+        )
+
+        assert response.status_code == 200
+        assert client.repo.get("f1").tags == {"wombat": 1}
+        assert [(item.file_id, item.species) for item in client.notif_repo.notifications("u2")] == [
+            ("f1", "wombat")
+        ]
+        assert len(client.publisher.published) == 1
+
+    def test_manual_add_still_non_positive_does_not_activate_notification(self, client):
+        client.repo.update_tags("f1", {"wombat": -1})
+        client.notif_repo.subscribe("u2", "wombat")
+
+        response = client.post(
+            "/tags/edit",
+            json={"keys": ["originals/f1"], "tags": ["wombat"], "operation": 1},
+        )
+
+        assert response.status_code == 200
+        assert client.repo.get("f1").tags == {"wombat": 0}
+        assert client.notif_repo.notifications("u2") == []
+        assert client.publisher.published == []
+
+    def test_manual_alias_and_duplicate_tags_activate_once(self, client):
+        client.repo.update_tags("f1", {"wombat": 0})
+        client.notif_repo.subscribe("u2", "wombat")
+
+        response = client.post(
+            "/tags/edit",
+            json={
+                "keys": ["originals/f1"],
+                "tags": ["Vombatus_ursinus", "wombat", "wombat"],
+                "operation": 1,
+            },
+        )
+
+        assert response.status_code == 200
+        assert client.repo.get("f1").tags == {"wombat": 1}
+        assert len(client.notif_repo.notifications("u2")) == 1
+        assert len(client.publisher.published) == 1
+
+    def test_manual_notification_publish_failure_keeps_pending_and_tag_update(self, client):
+        client.notif_repo.subscribe("u2", "koala")
+
+        def fail_publish(_notification):
+            raise RuntimeError("temporary SNS outage")
+
+        client.publisher.publish = fail_publish
+        response = client.post(
+            "/tags/edit",
+            json={"keys": ["originals/f1"], "tags": ["koala"], "operation": 1},
+        )
+
+        assert response.status_code == 200
+        assert client.repo.get("f1").tags["koala"] == 1
+        assert len(client.notif_repo.notifications("u2")) == 1
+        assert len(client.notif_repo.pending_for_file("f1")) == 1
+
+    def test_manual_repeat_add_does_not_replay_existing_pending_notification(self, client):
+        client.notif_repo.subscribe("u2", "koala")
+        attempts = []
+
+        def fail_publish(notification):
+            attempts.append(notification.notification_id)
+            raise RuntimeError("temporary SNS outage")
+
+        client.publisher.publish = fail_publish
+        payload = {"keys": ["originals/f1"], "tags": ["koala"], "operation": 1}
+        assert client.post("/tags/edit", json=payload).status_code == 200
+
+        client.publisher.publish = lambda notification: attempts.append(
+            notification.notification_id
+        )
+        assert client.post("/tags/edit", json=payload).status_code == 200
+
+        assert len(attempts) == 1
+        assert len(client.notif_repo.pending_for_file("f1")) == 1
+
+    @pytest.mark.parametrize("delivery_pending", [False, True], ids=["delivered", "pending"])
+    def test_manual_remove_then_readd_never_republishes_existing_notification(
+        self, client, delivery_pending
+    ):
+        client.notif_repo.subscribe("u2", "koala")
+        attempts = []
+        if delivery_pending:
+            def fail_publish(notification):
+                attempts.append(notification.notification_id)
+                raise RuntimeError("temporary SNS outage")
+
+            client.publisher.publish = fail_publish
+
+        payload = {"keys": ["originals/f1"], "tags": ["koala"], "operation": 1}
+        assert client.post("/tags/edit", json=payload).status_code == 200
+        assert client.post(
+            "/tags/edit",
+            json={"keys": ["originals/f1"], "tags": ["koala"], "operation": 0},
+        ).status_code == 200
+        if delivery_pending:
+            client.publisher.publish = lambda notification: attempts.append(
+                notification.notification_id
+            )
+        assert client.post("/tags/edit", json=payload).status_code == 200
+
+        assert len(client.notif_repo.notifications("u2")) == 1
+        assert len(attempts) == (1 if delivery_pending else 0)
+        assert len(client.publisher.published) == (0 if delivery_pending else 1)
+
+    def test_manual_readd_notifies_late_subscriber_without_replaying_old_pending(self, client):
+        client.notif_repo.subscribe("u2", "koala")
+        attempts = []
+
+        def fail_publish(notification):
+            attempts.append(notification.user_id)
+            raise RuntimeError("temporary SNS outage")
+
+        client.publisher.publish = fail_publish
+        payload = {"keys": ["originals/f1"], "tags": ["koala"], "operation": 1}
+        assert client.post("/tags/edit", json=payload).status_code == 200
+        assert client.post(
+            "/tags/edit",
+            json={"keys": ["originals/f1"], "tags": ["koala"], "operation": 0},
+        ).status_code == 200
+        client.notif_repo.subscribe("u3", "koala")
+        client.publisher.publish = lambda notification: attempts.append(notification.user_id)
+
+        assert client.post("/tags/edit", json=payload).status_code == 200
+
+        assert attempts == ["u2", "u3"]
+        assert len(client.notif_repo.notifications("u2")) == 1
+        assert len(client.notif_repo.notifications("u3")) == 1
+
+    def test_manual_activation_publishes_only_its_new_species_not_old_pending(self, client):
+        client.repo.update_tags("f1", {"wombat": 0})
+        client.notif_repo.subscribe("u2", "wombat")
+        attempts = []
+
+        def fail_publish(notification):
+            attempts.append(notification.species)
+            raise RuntimeError("temporary SNS outage")
+
+        client.publisher.publish = fail_publish
+        assert client.post(
+            "/tags/edit",
+            json={"keys": ["originals/f1"], "tags": ["wombat"], "operation": 1},
+        ).status_code == 200
+        client.notif_repo.subscribe("u3", "koala")
+        client.publisher.publish = lambda notification: attempts.append(notification.species)
+
+        assert client.post(
+            "/tags/edit",
+            json={"keys": ["originals/f1"], "tags": ["koala"], "operation": 1},
+        ).status_code == 200
+
+        assert attempts == ["wombat", "koala"]
+        assert len(client.notif_repo.pending_for_file("f1")) == 1
+
+    def test_manual_inbox_failure_restores_tags_and_fails_request(self, client):
+        client.notif_repo.subscribe("u2", "koala")
+        original_tags = dict(client.repo.get("f1").tags)
+
+        def fail_add_notification(_notification):
+            raise RuntimeError("notification database unavailable")
+
+        client.notif_repo.add_notification = fail_add_notification
+
+        with pytest.raises(RuntimeError, match="notification database unavailable"):
+            client.post(
+                "/tags/edit",
+                json={"keys": ["originals/f1"], "tags": ["koala"], "operation": 1},
+            )
+
+        assert client.repo.get("f1").tags == original_tags
+        assert client.publisher.published == []
+
+    def test_manual_partial_inbox_failure_compensates_created_notifications_and_retries(
+        self, client
+    ):
+        client.notif_repo.subscribe("u2", "koala")
+        client.notif_repo.subscribe("u3", "koala")
+        original_tags = dict(client.repo.get("f1").tags)
+        original_add_notification = client.notif_repo.add_notification
+        add_attempts = 0
+
+        def fail_second_notification(notification):
+            nonlocal add_attempts
+            add_attempts += 1
+            if add_attempts == 2:
+                raise RuntimeError("second notification write failed")
+            return original_add_notification(notification)
+
+        client.notif_repo.add_notification = fail_second_notification
+        payload = {"keys": ["originals/f1"], "tags": ["koala"], "operation": 1}
+
+        with pytest.raises(RuntimeError, match="second notification write failed"):
+            client.post("/tags/edit", json=payload)
+
+        assert client.repo.get("f1").tags == original_tags
+        assert client.notif_repo.notifications("u2") == []
+        assert client.notif_repo.notifications("u3") == []
+        assert client.publisher.published == []
+
+        client.notif_repo.add_notification = original_add_notification
+        response = client.post("/tags/edit", json=payload)
+
+        assert response.status_code == 200
+        assert [notification.user_id for notification in client.publisher.published] == [
+            "u2",
+            "u3",
+        ]
+        assert len(client.notif_repo.notifications("u2")) == 1
+        assert len(client.notif_repo.notifications("u3")) == 1
+
+    def test_manual_add_on_non_completed_record_does_not_notify(self, client):
+        client.repo.add(
+            FileRecord(
+                file_id="manual-processing",
+                user_id="u1",
+                file_type="image",
+                object_key="originals/manual-processing",
+                checksum="sha256:manual-processing",
+                status="processing",
+            )
+        )
+        client.notif_repo.subscribe("u2", "koala")
+
+        response = client.post(
+            "/tags/edit",
+            json={
+                "keys": ["originals/manual-processing"],
+                "tags": ["koala"],
+                "operation": 1,
+            },
+        )
+
+        assert response.status_code == 200
+        assert client.repo.get("manual-processing").tags == {"koala": 1}
+        assert client.notif_repo.notifications("u2") == []
+        assert client.publisher.published == []
 
     def test_tag_remove_ignores_missing(self, client):
         # Removing a tag that isn't present must not error and must not mutate.
