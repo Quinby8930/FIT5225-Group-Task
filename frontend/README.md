@@ -40,6 +40,32 @@ npm run dev
 The Cognito app client must allow `http://localhost:3000/callback` as a callback
 URL and `http://localhost:3000/logout` as a sign-out URL.
 
+## Deploy to GitHub Pages
+
+The frontend is deployed from `main` by the GitHub Actions workflow in
+`.github/workflows/deploy-frontend.yml`. The public site is:
+
+```text
+https://quinby8930.github.io/FIT5225-Group-Task/
+```
+
+GitHub Pages must use **GitHub Actions** as its source in the repository
+settings. The production build uses the repository subpath:
+
+```powershell
+npm run build -- --base=/FIT5225-Group-Task/
+```
+
+The Cognito app client must also allow these GitHub Pages URLs:
+
+```text
+Callback URL: https://quinby8930.github.io/FIT5225-Group-Task/callback
+Sign-out URL: https://quinby8930.github.io/FIT5225-Group-Task/logout
+```
+
+Keep the localhost callback and sign-out URLs as well so local testing still
+works.
+
 Both login and sign-up use Cognito's authorization-code flow with PKCE S256.
 The callback shares one token exchange for repeated handling of the same code
 (including React StrictMode effect replay). A failed exchange keeps the PKCE

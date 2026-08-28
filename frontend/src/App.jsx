@@ -16,6 +16,7 @@ import {
 } from "./api/mediaApi";
 import AuthCallback from "./auth/AuthCallback";
 import AuthControls from "./auth/AuthControls";
+import { appConfig } from "./auth/cognitoConfig";
 import { getCurrentUser, signIn } from "./auth/cognitoAuth";
 import { parseKeyList, parseSpeciesList, parseTagCounts } from "./lib/forms";
 import {
@@ -50,6 +51,11 @@ function Field({ label, children }) {
       {children}
     </label>
   );
+}
+
+function normalizePath(path) {
+  const normalized = path.replace(/\/+$/, "");
+  return normalized || "/";
 }
 
 function ResultCard({ resultKey, assetUrl, selected, canManage, onToggle, onOpenOriginal }) {
@@ -617,13 +623,14 @@ export default function App() {
   const [results, setResults] = useState([]);
   const [selectedKeys, setSelectedKeys] = useState([]);
   const user = getCurrentUser();
+  const currentPath = normalizePath(window.location.pathname);
 
-  if (window.location.pathname === "/callback") {
+  if (currentPath === normalizePath(appConfig.callbackPath)) {
     return <AuthCallback />;
   }
 
-  if (window.location.pathname === "/logout") {
-    window.history.replaceState({}, document.title, "/");
+  if (currentPath === normalizePath(appConfig.logoutPath)) {
+    window.history.replaceState({}, document.title, appConfig.homePath);
   }
 
   function toggleKey(key) {
