@@ -61,6 +61,7 @@ INTERNAL_ROUTES = {
     "POST /internal/files/{file_id}/processing",
     "PUT /internal/files/{file_id}/complete",
     "PUT /internal/files/{file_id}/failed",
+    "POST /internal/assets/authorize",
 }
 OPTIONS_ROUTES = {
     "OPTIONS /query/by-tags",

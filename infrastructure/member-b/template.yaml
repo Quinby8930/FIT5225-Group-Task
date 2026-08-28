@@ -187,6 +187,8 @@ Resources:
       Environment:
         Variables:
           MEDIA_BUCKET_NAME: !Sub pacificbioarchive-media-${AWS::AccountId}-${AWS::Region}
+          METADATA_API_BASE_URL: !Ref MetadataApiBaseUrl
+          INTERNAL_API_KEY: !Ref InternalApiKey
           ALLOWED_ORIGIN: !Ref AllowedOrigin
       Policies:
         - AWSLambdaBasicExecutionRole

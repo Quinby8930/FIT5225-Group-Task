@@ -39,6 +39,7 @@ test('returns signed assets for the authenticated Cognito subject', async () => 
             url: 'https://signed.example/thumbnail.jpg',
             expires_in: 900,
           }],
+          errors: [],
         };
       },
     },
@@ -52,6 +53,7 @@ test('returns signed assets for the authenticated Cognito subject', async () => 
   assert.equal(response.headers['Cache-Control'], 'no-store');
   assert.deepEqual(parseBody(response), {
     assets: [{ key, url: 'https://signed.example/thumbnail.jpg', expires_in: 900 }],
+    errors: [],
   });
   assert.deepEqual(calls, [{ userId: 'user-1', keys: [key] }]);
 });
@@ -102,12 +104,12 @@ test('handles unauthenticated preflight without invoking the service', async () 
 });
 
 
-test('maps forbidden and unexpected failures without exposing private details', async () => {
+test('maps authorization and unexpected failures without exposing private details', async () => {
   const { createHandler } = await loadHandlerModule();
   assert.equal(typeof createHandler, 'function');
 
   for (const [errorCode, expectedStatus, expectedCode] of [
-    ['FORBIDDEN_KEY', 403, 'FORBIDDEN_KEY'],
+    ['AUTHORIZATION_UNAVAILABLE', 503, 'AUTHORIZATION_UNAVAILABLE'],
     [undefined, 500, 'INTERNAL_ERROR'],
   ]) {
     const invoke = createHandler({
@@ -158,4 +160,20 @@ test('S3 adapter signs a private GetObject request for 900 seconds', async () =>
     Key: 'originals/user-1/file-1/wombat.jpg',
   });
   assert.deepEqual(signingOptions, { expiresIn: 900 });
+});
+
+test('production bootstrap returns the standard 503 response for missing metadata configuration', async () => {
+  const { createProductionHandler } = await loadHandlerModule();
+  assert.equal(typeof createProductionHandler, 'function');
+  for (const environment of [
+    { INTERNAL_API_KEY: 'secret', ALLOWED_ORIGIN: 'https://app.example' },
+    { METADATA_API_BASE_URL: 'https://metadata.example', ALLOWED_ORIGIN: 'https://app.example' },
+  ]) {
+    const invoke = await createProductionHandler({ environment });
+    const result = await invoke(event({ body: { keys: ['originals/u/file.jpg'] } }));
+    assert.equal(result.statusCode, 503);
+    assert.deepEqual(parseBody(result), { code: 'AUTHORIZATION_UNAVAILABLE' });
+    assert.equal(result.headers['Access-Control-Allow-Origin'], 'https://app.example');
+    assert.equal(result.body.includes('secret'), false);
+  }
 });

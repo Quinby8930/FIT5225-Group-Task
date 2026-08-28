@@ -86,6 +86,29 @@ class TestPureLogic:
         assert first[0].notification_id == replay[0].notification_id
 
 
+class TestInternalAssetAuthorization:
+    def test_completed_keys_are_authorized_with_mixed_denials_and_deduplication(self, client):
+        completed = FileRecord(file_id='asset-completed', user_id='u1', file_type='image', object_key='originals/u1/file.jpg', thumbnail_key='thumbnails/u1/file.jpg', checksum='asset-completed', status='completed')
+        pending = FileRecord(file_id='asset-pending', user_id='u1', file_type='image', object_key='originals/u1/pending.jpg', thumbnail_key=None, checksum='asset-pending', status='processing')
+        client.repo.add(completed)
+        client.repo.add(pending)
+        keys = ['originals/u1/file.jpg', 'thumbnails/u1/file.jpg', 'originals/u1/pending.jpg', 'processing/u1/file.jpg', 'originals/u1/file.jpg', 'originals/u1/missing.jpg']
+        response = client.post('/internal/assets/authorize', headers={'X-Internal-Api-Key': INTERNAL_API_KEY}, json={'keys': keys})
+        assert response.status_code == 200
+        assert response.json() == {'decisions': [
+            {'key': 'originals/u1/file.jpg', 'allowed': True},
+            {'key': 'thumbnails/u1/file.jpg', 'allowed': True},
+            {'key': 'originals/u1/pending.jpg', 'allowed': False, 'code': 'NOT_COMPLETED'},
+            {'key': 'processing/u1/file.jpg', 'allowed': False, 'code': 'FORBIDDEN_KEY'},
+            {'key': 'originals/u1/missing.jpg', 'allowed': False, 'code': 'NOT_FOUND'},
+        ]}
+
+    def test_authorize_requires_internal_key_and_rejects_malformed_batch(self, client):
+        assert client.post('/internal/assets/authorize', json={'keys': ['originals/u1/file.jpg']}).status_code == 401
+        assert client.post('/internal/assets/authorize', headers={'X-Internal-Api-Key': INTERNAL_API_KEY}, json={'keys': []}).status_code == 422
+        assert client.post('/internal/assets/authorize', headers={'X-Internal-Api-Key': INTERNAL_API_KEY}, json={'keys': [f'originals/u1/{"海" * 400}.jpg']}).status_code == 422
+
+
 # ---------------------------------------------------------------------------
 # Endpoint tests (fresh SQLite per test)
 # ---------------------------------------------------------------------------

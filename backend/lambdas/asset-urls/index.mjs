@@ -1,4 +1,5 @@
 import { createAssetUrlService } from './service.mjs';
+import { createMetadataAuthorizationClient } from './metadata-client.mjs';
 
 
 const DEFAULT_EXPIRES_IN_SECONDS = 900;
@@ -23,8 +24,8 @@ function errorResponse(error, allowedOrigin) {
   if (error?.code === 'INVALID_REQUEST') {
     return response(400, { code: 'INVALID_REQUEST' }, allowedOrigin);
   }
-  if (error?.code === 'FORBIDDEN_KEY') {
-    return response(403, { code: 'FORBIDDEN_KEY' }, allowedOrigin);
+  if (error?.code === 'AUTHORIZATION_UNAVAILABLE') {
+    return response(503, { code: 'AUTHORIZATION_UNAVAILABLE' }, allowedOrigin);
   }
   return response(500, { code: 'INTERNAL_ERROR' }, allowedOrigin);
 }
@@ -79,28 +80,61 @@ export function createS3Presigner({
 }
 
 
-async function createProductionHandler() {
+function unavailableService() {
+  return {
+    async createUrlsForUser() {
+      const error = new Error('AUTHORIZATION_UNAVAILABLE');
+      error.code = 'AUTHORIZATION_UNAVAILABLE';
+      throw error;
+    },
+  };
+}
+
+async function loadS3Dependencies() {
   const [{ GetObjectCommand, S3Client }, { getSignedUrl }] = await Promise.all([
     import('@aws-sdk/client-s3'),
     import('@aws-sdk/s3-request-presigner'),
   ]);
+  return { GetObjectCommand, S3Client, getSignedUrl };
+}
+
+export async function createProductionHandler({
+  environment = process.env,
+  loadS3 = loadS3Dependencies,
+} = {}) {
+  const allowedOrigin = environment.ALLOWED_ORIGIN || 'http://localhost:3000';
+  let metadataClient;
+  try {
+    metadataClient = createMetadataAuthorizationClient({
+      baseUrl: environment.METADATA_API_BASE_URL,
+      internalApiKey: environment.INTERNAL_API_KEY,
+    });
+  } catch {
+    return createHandler({ allowedOrigin, service: unavailableService() });
+  }
+  const { GetObjectCommand, S3Client, getSignedUrl } = await loadS3();
   const presignGet = createS3Presigner({
     client: new S3Client({}),
-    bucket: process.env.MEDIA_BUCKET_NAME,
+    bucket: environment.MEDIA_BUCKET_NAME,
     GetObjectCommand,
     getSignedUrl,
   });
   return createHandler({
-    allowedOrigin: process.env.ALLOWED_ORIGIN || 'http://localhost:3000',
-    service: createAssetUrlService({ presignGet }),
+    allowedOrigin,
+    service: createAssetUrlService({ presignGet, authorize: metadataClient.authorize }),
   });
 }
 
 
-let productionHandler;
+let productionHandlerPromise;
 
 
 export async function handler(event) {
-  productionHandler ??= createProductionHandler();
-  return (await productionHandler)(event);
+  productionHandlerPromise ??= createProductionHandler();
+  try {
+    return await (await productionHandlerPromise)(event);
+  } catch (error) {
+    productionHandlerPromise = undefined;
+    return errorResponse(error, process.env.ALLOWED_ORIGIN || 'http://localhost:3000');
+  }
 }

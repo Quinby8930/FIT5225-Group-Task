@@ -11,7 +11,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from typing import Literal, Optional
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, StrictStr, field_validator
 
 
 def utcnow() -> datetime:
@@ -154,6 +154,19 @@ class NotificationListResponse(BaseModel):
 # ---------------------------------------------------------------------------
 # Internal metadata requests (Member B -> Member D, see api-contracts.md)
 # ---------------------------------------------------------------------------
+class AssetAuthorizationRequest(BaseModel):
+    """Batch authorization request for canonical completed archive keys."""
+
+    model_config = {"extra": "forbid"}
+    keys: list[StrictStr] = Field(min_length=1, max_length=100)
+
+    @field_validator("keys")
+    @classmethod
+    def keys_fit_s3_byte_limit(cls, keys: list[str]) -> list[str]:
+        if any(len(key.encode("utf-8")) > 1024 for key in keys):
+            raise ValueError("each key must be at most 1024 UTF-8 bytes")
+        return keys
+
 class ReserveRequest(BaseModel):
     """Reserve a unique (user_id, checksum) upload before S3 pre-signing."""
 

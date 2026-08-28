@@ -200,7 +200,7 @@ def test_function_environment_names_match_production_handlers(template):
             "FFMPEG_PATH",
         },
         "StorageDeleteFunction": {"MEDIA_BUCKET_NAME"},
-        "AssetUrlsFunction": {"MEDIA_BUCKET_NAME", "ALLOWED_ORIGIN"},
+        "AssetUrlsFunction": {"MEDIA_BUCKET_NAME", "METADATA_API_BASE_URL", "INTERNAL_API_KEY", "ALLOWED_ORIGIN"},
     }
     for function, names in expected.items():
         variables = _properties(template, function)["Environment"]["Variables"]
@@ -212,6 +212,9 @@ def test_function_environment_names_match_production_handlers(template):
     assert processing_variables["INFERENCE_HTTP_TIMEOUT_SECONDS"] == {
         "Ref": "InferenceHttpTimeoutSeconds"
     }
+    asset_variables = _properties(template, "AssetUrlsFunction")["Environment"]["Variables"]
+    assert asset_variables["METADATA_API_BASE_URL"] == {"Ref": "MetadataApiBaseUrl"}
+    assert asset_variables["INTERNAL_API_KEY"] == {"Ref": "InternalApiKey"}
 
 
 def test_upload_post_route_uses_existing_jwt_authorizer(template):

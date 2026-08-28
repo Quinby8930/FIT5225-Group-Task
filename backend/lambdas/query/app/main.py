@@ -49,6 +49,7 @@ from app.repository import (
 )
 from app.repository.base import DuplicateError, FileRepository
 from app.schemas import (
+    AssetAuthorizationRequest,
     CompleteRequest,
     DeleteRequest,
     FailedRequest,
@@ -579,6 +580,42 @@ def list_notifications(
 # ---------------------------------------------------------------------------
 # Internal metadata state machine (Member B -> Member D)
 # ---------------------------------------------------------------------------
+def _is_canonical_archive_key(key: str) -> bool:
+    parts = key.split("/")
+    return (
+        len(parts) >= 3
+        and parts[0] in {"originals", "thumbnails"}
+        and all(part and part not in {".", ".."} and "\\" not in part for part in parts)
+    )
+
+
+@app.post("/internal/assets/authorize")
+def authorize_assets(
+    body: AssetAuthorizationRequest,
+    repo_: FileRepository = Depends(get_repo),
+    _internal_auth: None = Depends(require_internal_api_key),
+) -> dict:
+    keys = list(dict.fromkeys(body.keys))
+    valid_keys = [key for key in keys if len(key.encode("utf-8")) <= 1024 and _is_canonical_archive_key(key)]
+    records_by_key: dict[str, list[FileRecord]] = {key: [] for key in valid_keys}
+    for record in repo_.by_keys(valid_keys):
+        if record.object_key in records_by_key:
+            records_by_key[record.object_key].append(record)
+        if record.thumbnail_key in records_by_key:
+            records_by_key[record.thumbnail_key].append(record)
+    decisions = []
+    for key in keys:
+        if len(key.encode("utf-8")) > 1024 or not _is_canonical_archive_key(key):
+            decisions.append({"key": key, "allowed": False, "code": "FORBIDDEN_KEY"})
+        elif not records_by_key[key]:
+            decisions.append({"key": key, "allowed": False, "code": "NOT_FOUND"})
+        elif any(record.status == "completed" for record in records_by_key[key]):
+            decisions.append({"key": key, "allowed": True})
+        else:
+            decisions.append({"key": key, "allowed": False, "code": "NOT_COMPLETED"})
+    return {"decisions": decisions}
+
+
 @app.post("/internal/uploads/reserve", status_code=201)
 def reserve_upload(
     body: ReserveRequest,
