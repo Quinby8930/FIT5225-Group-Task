@@ -41,10 +41,17 @@ export async function putUpload(uploadUrl, file, requiredHeaders = {}) {
   }
 }
 
-export async function uploadMedia(file) {
+export async function uploadMedia(file, { onStage } = {}) {
+  const reportStage = (stage) => {
+    if (typeof onStage === "function") onStage(stage);
+  };
+  reportStage("hashing");
   const checksum = await computeSha256Base64(file);
+  reportStage("requesting");
   const reservation = await requestUploadUrl(file, checksum);
+  reportStage("uploading");
   await putUpload(reservation.upload_url, file, reservation.required_headers);
+  reportStage("queued");
   return { ...reservation, checksum };
 }
 

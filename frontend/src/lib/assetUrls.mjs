@@ -116,6 +116,68 @@ export function indexAssetUrls(response, nowMs = Date.now()) {
   return indexed;
 }
 
+export function assetErrorStatus(code) {
+  const states = {
+    SIGNING_FAILED: "signing_failed",
+    FORBIDDEN_KEY: "forbidden",
+    NOT_FOUND: "not_found",
+    NOT_COMPLETED: "not_completed",
+  };
+  return states[code] || "unavailable";
+}
+
+export function markAssetKeysLoading(keys, current = {}) {
+  const next = { ...(current || {}) };
+  for (const key of Array.isArray(keys) ? keys : []) {
+    if (typeof key === "string" && key) next[key] = { status: "loading" };
+  }
+  return next;
+}
+
+export function mergeAssetUrlStates(current, response, nowMs = Date.now()) {
+  const next = { ...(current || {}) };
+  const successful = indexAssetUrls(response, nowMs);
+  for (const [key, asset] of Object.entries(successful)) {
+    next[key] = { status: "ready", ...asset };
+  }
+  for (const error of Array.isArray(response?.errors) ? response.errors : []) {
+    if (
+      typeof error?.key === "string"
+      && error.key
+      && !Object.hasOwn(successful, error.key)
+    ) {
+      next[error.key] = { status: assetErrorStatus(error.code) };
+    }
+  }
+  return next;
+}
+
+export function retryableAssetKeys(assetStates) {
+  return Object.entries(assetStates || {})
+    .filter(([, state]) => state?.status === "signing_failed")
+    .map(([key]) => key);
+}
+
+export function pruneAssetUrlStates(assetStates, nowMs = Date.now()) {
+  return Object.fromEntries(Object.entries(assetStates || {}).map(([key, state]) => {
+    if (state?.status === "ready" && Number.isFinite(state.expiresAt) && state.expiresAt <= nowMs) {
+      return [key, { status: "expired" }];
+    }
+    return [key, state];
+  }));
+}
+
+export function isCurrentAssetRequest(currentVersion, responseVersion) {
+  return Number.isInteger(currentVersion)
+    && Number.isInteger(responseVersion)
+    && currentVersion === responseVersion;
+}
+
+export function nextSigningRetryDelay(attempt, maxAttempts = 4) {
+  if (!Number.isInteger(attempt) || attempt < 0 || attempt >= maxAttempts) return null;
+  return Math.min(1_000 * (2 ** attempt), 15_000);
+}
+
 
 export function nextAssetRefreshDelay(assetUrls, nowMs = Date.now(), leadMs = 30_000) {
   const expirations = Object.values(assetUrls || {})
