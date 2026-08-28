@@ -1,7 +1,7 @@
-# Member E Frontend
+# Pacific BioArchive Frontend
 
-This React/Vite app is the Member E deliverable for the Pacific BioArchive UI
-and integration workflow.
+This React/Vite app provides the Pacific BioArchive public landing page and
+authenticated archive workspace.
 
 ## Configuration
 
@@ -38,8 +38,22 @@ npm install
 npm run dev
 ```
 
+The dev server binds port 3000 with `--strictPort`: if the port is occupied it
+fails loudly instead of silently moving to another port. Cognito only accepts
+the registered exact callback URL, so a silently drifted port would break
+login with a hosted-UI error. Free port 3000 first (close any stale Vite
+process); if the port is genuinely unavailable, register the new port's exact
+callback and sign-out URLs in the Cognito app client instead of improvising.
+
 The Cognito app client must allow `http://localhost:3000/callback` as a callback
 URL and `http://localhost:3000/logout` as a sign-out URL.
+
+## Demo diagnostics
+
+The signed-in shell hides demo diagnostics (session `sub`, **Check auth**) by
+default. They appear automatically in `npm run dev`, and on any build by
+appending `?demo=1` to the URL, for example
+`https://quinby8930.github.io/FIT5225-Group-Task/?demo=1`.
 
 ## Deploy to GitHub Pages
 
@@ -66,6 +80,16 @@ Sign-out URL: https://quinby8930.github.io/FIT5225-Group-Task/logout
 
 Keep the localhost callback and sign-out URLs as well so local testing still
 works.
+
+## Visual assets and regional context
+
+The public landing page and signed-in Home view use locally served habitat
+photographs so the interface does not depend on third-party image hosts. The
+Pacific Coast map is an illustrative summary of the assignment scenario, not
+live archive coverage or a species-range claim. Explore's suggested species
+cards are explicitly described as inference-label examples rather than usage
+or popularity data. Source links and licences are recorded in
+[`IMAGE_CREDITS.md`](./IMAGE_CREDITS.md).
 
 Every push to `main` runs the frontend tests, builds with the repository base
 path, and publishes the resulting static site automatically. AWS services are

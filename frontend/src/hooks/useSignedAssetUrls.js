@@ -1,15 +1,15 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { requestAssetUrls } from "../api/mediaApi";
 import {
-  assetExpiryDelay, markAssetKeysLoading, mergeAssetUrlStates, nextAssetRefreshDelay,
-  pruneAssetUrlStates, requestAssetUrlBatches, retryableAssetKeys,
+  assetExpiryDelay, expiredAssetKeys, markAssetKeysLoading, mergeAssetUrlStates, nextAssetRefreshDelay,
+  nextAssetRetryDelay, pruneAssetUrlStates, requestAssetUrlBatches, retryableAssetKeys,
 } from "../lib/assetUrls.mjs";
-import { beginAssetDataset, beginAssetRequest, filterLatestAssetResponse } from "../lib/assetRequestCoordinator.mjs";
-import { canOpenFullImage, withDetachedWindow } from "../lib/mediaActions.mjs";
+import { assetDatasetIdentity, beginAssetDataset, beginAssetRequest, filterLatestAssetResponse } from "../lib/assetRequestCoordinator.mjs";
+import { canOpenFullImage, canRenderInlinePreview, withDetachedWindow } from "../lib/mediaActions.mjs";
 import { clearRetryEpisodes, recordRetryDispatch, retryDelayForKey } from "../lib/retryEpisodes.mjs";
 
 function previewKey(item) {
-  if (!item || item.legacy || item.can_preview !== true) return null;
+  if (!canRenderInlinePreview(item)) return null;
   return item.file_type === "image" ? item.display_key : (item.file_type === "video" ? item.original_key : null);
 }
 
@@ -49,7 +49,9 @@ export default function useSignedAssetUrls(items, sessionKey, onStatus) {
       const response = filterLatestAssetResponse(coordinator.current, started.request, rawResponse);
       const clearedKeys = [
         ...response.assets.map((asset) => asset.key),
-        ...response.errors.filter((error) => error.code !== "SIGNING_FAILED").map((error) => error.key),
+        ...response.errors
+          .filter((error) => error.code !== "SIGNING_FAILED" && error.code !== "UNAVAILABLE")
+          .map((error) => error.key),
       ];
       if (clearedKeys.length) retryEpisodes.current = clearRetryEpisodes(retryEpisodes.current, clearedKeys);
       return mergeAssetUrlStates(next, response, outcome.signedAt);
@@ -57,9 +59,9 @@ export default function useSignedAssetUrls(items, sessionKey, onStatus) {
   }, []);
 
   const keys = uniquePreviewKeys(items);
-  const itemIdentity = (Array.isArray(items) ? items : []).map((item) => item.identity).join("|");
+  const itemIdentity = assetDatasetIdentity(items);
   const keyIdentity = keys.join("|");
-  const stateIdentity = Object.entries(assetStates).map(([key, state]) => `${key}:${state?.status}:${state?.expiresAt || ""}`).sort().join("|");
+  const stateIdentity = Object.entries(assetStates).map(([key, state]) => `${key}:${state?.status}:${state?.expiresAt || ""}:${state?.retryable === true}`).sort().join("|");
 
   useEffect(() => {
     coordinator.current = beginAssetDataset(coordinator.current);
@@ -87,7 +89,10 @@ export default function useSignedAssetUrls(items, sessionKey, onStatus) {
     const refreshDelay = nextAssetRefreshDelay(assetStates);
     if (refreshDelay !== null) schedule(() => loadKeys(keys, datasetEpoch).catch(() => {}), refreshDelay);
     for (const key of retryableAssetKeys(assetStates)) {
-      const delay = retryDelayForKey(retryEpisodes.current, key);
+      const state = assetStates[key];
+      const delay = state?.status === "ready"
+        ? nextAssetRetryDelay({ [key]: state }, retryEpisodes.current[key] || 0)
+        : retryDelayForKey(retryEpisodes.current, key);
       if (delay !== null) schedule(() => {
         retryEpisodes.current = recordRetryDispatch(retryEpisodes.current, key);
         loadKeys([key], datasetEpoch).catch(() => {});
@@ -97,6 +102,22 @@ export default function useSignedAssetUrls(items, sessionKey, onStatus) {
   }, [clearTimers, keyIdentity, loadKeys, schedule, stateIdentity]);
 
   useEffect(() => () => { coordinator.current = beginAssetDataset(coordinator.current); clearTimers(); }, [clearTimers]);
+
+  useEffect(() => {
+    const pruneExpired = () => {
+      if (document.visibilityState === "hidden") return;
+      const datasetEpoch = coordinator.current.datasetEpoch;
+      const expiredKeys = expiredAssetKeys(assetStates, keys);
+      setAssetStates((current) => pruneAssetUrlStates(current));
+      if (expiredKeys.length) loadKeys(expiredKeys, datasetEpoch).catch(() => {});
+    };
+    window.addEventListener("focus", pruneExpired);
+    document.addEventListener("visibilitychange", pruneExpired);
+    return () => {
+      window.removeEventListener("focus", pruneExpired);
+      document.removeEventListener("visibilitychange", pruneExpired);
+    };
+  }, [keyIdentity, loadKeys, stateIdentity]);
 
   const refresh = useCallback(() => {
     const datasetEpoch = coordinator.current.datasetEpoch;

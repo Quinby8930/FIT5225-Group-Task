@@ -4,6 +4,10 @@ export function canOpenPreview(item) {
     && (item.file_type === "image" || item.file_type === "video");
 }
 
+export function canRenderInlinePreview(item) {
+  return canOpenPreview(item);
+}
+
 export function canOpenFullImage(item) {
   return canOpenPreview(item)
     && item.file_type === "image"

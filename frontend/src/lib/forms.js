@@ -14,6 +14,20 @@ export function parseTagCounts(value) {
     }, {});
 }
 
+export function hasTagCounts(tagMap) {
+  return Boolean(
+    tagMap
+    && typeof tagMap === "object"
+    && !Array.isArray(tagMap)
+    && Object.entries(tagMap).some(([name, count]) => (
+      typeof name === "string"
+      && name.trim().length > 0
+      && Number.isInteger(count)
+      && count > 0
+    ))
+  );
+}
+
 export function parseSpeciesList(value) {
   return value
     .split(/[\n,]+/)

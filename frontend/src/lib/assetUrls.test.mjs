@@ -242,6 +242,104 @@ test("merges same-batch signed assets and per-key errors without losing successf
   });
 });
 
+test("keeps an unexpired ready URL visible while its replacement request is loading", async () => {
+  const { markAssetKeysLoading } = await loadAssetUrlModule();
+  assert.equal(typeof markAssetKeysLoading, "function");
+
+  assert.deepEqual(markAssetKeysLoading(["current", "expired"], {
+    current: { status: "ready", url: "https://signed.example/current", expiresAt: 2_000 },
+    expired: { status: "ready", url: "https://signed.example/expired", expiresAt: 1_000 },
+  }, 1_000), {
+    current: { status: "ready", url: "https://signed.example/current", expiresAt: 2_000 },
+    expired: { status: "loading" },
+  });
+});
+
+test("clears the retry marker while retrying with an unexpired ready URL", async () => {
+  const { markAssetKeysLoading } = await loadAssetUrlModule();
+  assert.equal(typeof markAssetKeysLoading, "function");
+
+  assert.deepEqual(markAssetKeysLoading(["preview"], {
+    preview: {
+      status: "ready",
+      url: "https://signed.example/current",
+      expiresAt: 2_000,
+      retryable: true,
+    },
+  }, 1_000), {
+    preview: {
+      status: "ready",
+      url: "https://signed.example/current",
+      expiresAt: 2_000,
+    },
+  });
+});
+
+test("keeps an unexpired ready URL and marks it for retry after an unavailable refresh", async () => {
+  const { mergeAssetUrlStates, retryableAssetKeys } = await loadAssetUrlModule();
+  assert.equal(typeof mergeAssetUrlStates, "function");
+  assert.equal(typeof retryableAssetKeys, "function");
+
+  const states = mergeAssetUrlStates({
+    preview: { status: "ready", url: "https://signed.example/current", expiresAt: 2_000 },
+  }, {
+    assets: [],
+    errors: [{ key: "preview", code: "UNAVAILABLE" }],
+  }, 500, 1_000);
+
+  assert.deepEqual(states, {
+    preview: {
+      status: "ready",
+      url: "https://signed.example/current",
+      expiresAt: 2_000,
+      retryable: true,
+    },
+  });
+  assert.deepEqual(retryableAssetKeys(states), ["preview"]);
+});
+
+test("does not retain a signed URL after it has expired", async () => {
+  const { mergeAssetUrlStates } = await loadAssetUrlModule();
+  assert.equal(typeof mergeAssetUrlStates, "function");
+
+  assert.deepEqual(mergeAssetUrlStates({
+    preview: { status: "ready", url: "https://signed.example/expired", expiresAt: 1_000 },
+  }, {
+    assets: [],
+    errors: [{ key: "preview", code: "UNAVAILABLE" }],
+  }, 500, 1_000), {
+    preview: { status: "unavailable", retryable: true },
+  });
+});
+
+test("never exposes a ready URL at or after its expiry", async () => {
+  const { usableAssetUrl } = await loadAssetUrlModule();
+  assert.equal(typeof usableAssetUrl, "function");
+
+  const state = {
+    status: "ready",
+    url: "https://signed.example/current",
+    expiresAt: 2_000,
+  };
+  assert.equal(usableAssetUrl(state, 1_999), state.url);
+  assert.equal(usableAssetUrl(state, 2_000), null);
+  assert.equal(usableAssetUrl({ ...state, status: "loading" }, 1_000), null);
+});
+
+test("replaces a retained URL when the response gives an authoritative asset result", async () => {
+  const { mergeAssetUrlStates } = await loadAssetUrlModule();
+  assert.equal(typeof mergeAssetUrlStates, "function");
+
+  assert.deepEqual(mergeAssetUrlStates({
+    preview: { status: "ready", url: "https://signed.example/current", expiresAt: 2_000 },
+  }, {
+    assets: [],
+    errors: [{ key: "preview", code: "NOT_FOUND" }],
+  }, 500, 1_000), {
+    preview: { status: "not_found" },
+  });
+});
+
 test("retries only explicit signing failures and marks expired ready states", async () => {
   const { retryableAssetKeys, pruneAssetUrlStates } = await loadAssetUrlModule();
   assert.equal(typeof retryableAssetKeys, "function");
@@ -264,6 +362,21 @@ test("retries only explicit signing failures and marks expired ready states", as
     expired: { status: "expired" },
     ready: { status: "ready", url: "https://signed.example/ready", expiresAt: 2_000 },
   });
+});
+
+test("finds expired preview keys that need a fresh signature after tab resume", async () => {
+  const { expiredAssetKeys } = await loadAssetUrlModule();
+  assert.equal(typeof expiredAssetKeys, "function");
+
+  assert.deepEqual(expiredAssetKeys({
+    expiredReady: { status: "ready", expiresAt: 1_000 },
+    alreadyExpired: { status: "expired" },
+    stillReady: { status: "ready", expiresAt: 2_000 },
+    failed: { status: "signing_failed" },
+  }, ["expiredReady", "alreadyExpired", "stillReady", "notRequested"], 1_000), [
+    "expiredReady",
+    "alreadyExpired",
+  ]);
 });
 
 test("accepts only the latest asset request version for state writes", async () => {

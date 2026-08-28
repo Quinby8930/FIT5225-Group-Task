@@ -3,6 +3,9 @@ import { parseSpeciesList } from "./forms.js";
 export function canSubmitTags(text) { return parseSpeciesList(text).length > 0; }
 export function beginDeleteConfirmation(state = {}) { return { ...state, open: true, pending: false }; }
 export function confirmDeleteOnce(state = {}) { return state.pending ? state : { ...state, pending: true }; }
+export function beginMutation(state = {}) { return state.pending ? state : { ...state, pending: true }; }
+export function finishMutation(state = {}) { return { ...state, pending: false }; }
+export function canStartMutation(state = {}) { return !state.pending; }
 export function mutationCount(response, selectedCount, field) {
   return Number.isInteger(response?.[field]) && response[field] >= 0 ? response[field] : selectedCount;
 }

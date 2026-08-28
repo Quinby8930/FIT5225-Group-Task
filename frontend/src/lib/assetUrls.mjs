@@ -126,17 +126,39 @@ export function assetErrorStatus(code) {
   return states[code] || "unavailable";
 }
 
-export function markAssetKeysLoading(keys, current = {}) {
+export function usableAssetUrl(state, nowMs = Date.now()) {
+  return state?.status === "ready"
+    && typeof state.url === "string"
+    && /^https:\/\//i.test(state.url)
+    && Number.isFinite(state.expiresAt)
+    && state.expiresAt > nowMs
+    ? state.url
+    : null;
+}
+
+export function markAssetKeysLoading(keys, current = {}, nowMs = Date.now()) {
   const next = { ...(current || {}) };
   for (const key of Array.isArray(keys) ? keys : []) {
-    if (typeof key === "string" && key) next[key] = { status: "loading" };
+    if (typeof key !== "string" || !key) continue;
+    const previous = next[key];
+    if (
+      previous?.status === "ready"
+      && typeof previous.url === "string"
+      && Number.isFinite(previous.expiresAt)
+      && previous.expiresAt > nowMs
+    ) {
+      const { retryable, ...ready } = previous;
+      next[key] = ready;
+      continue;
+    }
+    next[key] = { status: "loading" };
   }
   return next;
 }
 
-export function mergeAssetUrlStates(current, response, nowMs = Date.now()) {
+export function mergeAssetUrlStates(current, response, signedAt = Date.now(), nowMs = Date.now()) {
   const next = { ...(current || {}) };
-  const successful = indexAssetUrls(response, nowMs);
+  const successful = indexAssetUrls(response, signedAt);
   for (const [key, asset] of Object.entries(successful)) {
     next[key] = { status: "ready", ...asset };
   }
@@ -146,7 +168,20 @@ export function mergeAssetUrlStates(current, response, nowMs = Date.now()) {
       && error.key
       && !Object.hasOwn(successful, error.key)
     ) {
-      next[error.key] = { status: assetErrorStatus(error.code) };
+      const previous = next[error.key];
+      if (
+        error.code === "UNAVAILABLE"
+        && previous?.status === "ready"
+        && typeof previous.url === "string"
+        && Number.isFinite(previous.expiresAt)
+        && previous.expiresAt > nowMs
+      ) {
+        next[error.key] = { ...previous, retryable: true };
+      } else {
+        const state = { status: assetErrorStatus(error.code) };
+        if (error.code === "UNAVAILABLE") state.retryable = true;
+        next[error.key] = state;
+      }
     }
   }
   return next;
@@ -154,7 +189,7 @@ export function mergeAssetUrlStates(current, response, nowMs = Date.now()) {
 
 export function retryableAssetKeys(assetStates) {
   return Object.entries(assetStates || {})
-    .filter(([, state]) => state?.status === "signing_failed")
+    .filter(([, state]) => state?.status === "signing_failed" || state?.retryable === true)
     .map(([key]) => key);
 }
 
@@ -165,6 +200,17 @@ export function pruneAssetUrlStates(assetStates, nowMs = Date.now()) {
     }
     return [key, state];
   }));
+}
+
+export function expiredAssetKeys(assetStates, requestedKeys, nowMs = Date.now()) {
+  const states = assetStates && typeof assetStates === "object" ? assetStates : {};
+  return [...new Set(Array.isArray(requestedKeys) ? requestedKeys : [])].filter((key) => {
+    const state = states[key];
+    if (state?.status === "expired") return true;
+    return state?.status === "ready"
+      && Number.isFinite(state.expiresAt)
+      && state.expiresAt <= nowMs;
+  });
 }
 
 export function isCurrentAssetRequest(currentVersion, responseVersion) {

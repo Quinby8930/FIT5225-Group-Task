@@ -19,3 +19,12 @@ test("accepts only the latest query generation when responses resolve out of ord
   assert.deepEqual(stale, second);
   assert.deepEqual(latest, { generation: 2, phase: "ready", result: { file_id: "B" } });
 });
+
+test("hides the result controls only before the first Explore query", async () => {
+  const { shouldShowResultsHeader } = await loadQueryLifecycle();
+
+  assert.equal(shouldShowResultsHeader("idle"), false);
+  for (const phase of ["loading", "ready", "empty", "error"]) {
+    assert.equal(shouldShowResultsHeader(phase), true, phase);
+  }
+});

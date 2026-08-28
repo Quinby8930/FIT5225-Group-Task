@@ -15,6 +15,14 @@ test("allows preview actions only for trusted previewable structured media", asy
   assert.equal(canOpenFullImage({ legacy: true, can_preview: true, file_type: "image", original_key: "originals/u/f/a.jpg" }), false);
 });
 
+test("allows inline media rendering only when preview permission is granted", async () => {
+  const { canRenderInlinePreview } = await loadMediaActions();
+  assert.equal(typeof canRenderInlinePreview, "function");
+
+  assert.equal(canRenderInlinePreview({ legacy: false, can_preview: true, file_type: "image" }), true);
+  assert.equal(canRenderInlinePreview({ legacy: false, can_preview: false, file_type: "video" }), false);
+});
+
 test("opens and detaches a navigable blank window without noopener feature flags", async () => {
   const { openDetachedWindow } = await loadMediaActions();
   assert.equal(typeof openDetachedWindow, "function");

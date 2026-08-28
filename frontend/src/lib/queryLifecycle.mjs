@@ -10,3 +10,7 @@ export function settleQuery(current, generation, result, phase) {
   if (!current || current.generation !== generation) return current;
   return { generation, phase, result };
 }
+
+export function shouldShowResultsHeader(phase) {
+  return phase !== "idle";
+}

@@ -1,75 +1,222 @@
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { getAuthTest } from "./api/apiClient";
 import AuthCallback from "./auth/AuthCallback";
-import AuthControls from "./auth/AuthControls";
 import { appConfig } from "./auth/cognitoConfig";
-import { signIn } from "./auth/cognitoAuth";
+import AppHeader from "./components/AppHeader";
+import AppNav from "./components/AppNav";
 import StatusBanner from "./components/StatusBanner";
+import LandingPage from "./features/landing/LandingPage";
 import ExplorePanel from "./features/explore/ExplorePanel";
+import HomePanel from "./features/home/HomePanel";
 import ManagePanel from "./features/manage/ManagePanel";
 import NotificationsPanel from "./features/notifications/NotificationsPanel";
 import UploadPanel from "./features/upload/UploadPanel";
-import { beginQuerySelection, toggleFileSelection } from "./lib/manageSelection.mjs";
+import { beginQuerySelection, selectedMutationKeys, toggleFileSelection } from "./lib/manageSelection.mjs";
 import { removeManagedItems } from "./lib/manageWorkflow.mjs";
+import { beginQuery } from "./lib/queryLifecycle.mjs";
+import {
+  beginPendingQuery,
+  clearQueryDescriptors,
+  settleQueryFailure,
+  settleQuerySuccess,
+} from "./lib/queryDescriptor.mjs";
 import { authRouteForPath } from "./lib/appRoutes.mjs";
+import { navigateToView, queryStatusAfterDeletion, resetSessionViewState, setStatusForView, statusForView } from "./lib/viewState.mjs";
 import useAuthSession from "./hooks/useAuthSession";
 
-const views = [["explore", "Explore"], ["upload", "Upload"], ["manage", "Manage"], ["notifications", "Notifications"]];
+const EMPTY_QUERY = { items: [], structuredItems: [], legacyItems: [], count: 0 };
+const VIEW_TITLES = {
+  home: "Pacific BioArchive",
+  explore: "Explore | Pacific BioArchive",
+  upload: "Upload | Pacific BioArchive",
+  manage: "Manage | Pacific BioArchive",
+  notifications: "Notifications | Pacific BioArchive",
+};
 
 export default function App() {
-  const [activeView, setActiveView] = useState("explore");
-  const [status, setStatus] = useState(null);
-  const [query, setQuery] = useState({ items: [], structuredItems: [], legacyItems: [], count: 0 });
+  const [activeView, setActiveView] = useState("home");
+  const [statuses, setStatuses] = useState({});
+  const [query, setQuery] = useState(EMPTY_QUERY);
   const [queryState, setQueryState] = useState("idle");
+  const [descriptors, setDescriptors] = useState(clearQueryDescriptors);
   const [selectedFileIds, setSelectedFileIds] = useState([]);
   const { user, reason: sessionReason } = useAuthSession();
   const previousUser = useRef(user?.sub || null);
+  const activeSession = useRef(user?.sub || null);
+  activeSession.current = user?.sub || null;
+  const mainRef = useRef(null);
+  const queryLifecycle = useRef({ generation: 0, phase: "idle", result: null });
   const authRoute = authRouteForPath(window.location.pathname, appConfig);
+  const demoMode = useMemo(
+    () => Boolean(import.meta.env.DEV) || new URLSearchParams(window.location.search).has("demo"),
+    []
+  );
+
+  const setViewStatus = useCallback((view, status) => {
+    setStatuses((current) => setStatusForView(current, view, status));
+  }, []);
+  const setExploreStatus = useCallback((status) => setViewStatus("explore", status), [setViewStatus]);
+  const setUploadStatus = useCallback((sourceSession, status) => {
+    if (sourceSession !== activeSession.current) return;
+    setViewStatus("upload", status);
+  }, [setViewStatus]);
+  const setManageStatus = useCallback((status) => setViewStatus("manage", status), [setViewStatus]);
+  const setNotificationsStatus = useCallback((status) => setViewStatus("notifications", status), [setViewStatus]);
+  const navigate = useCallback((view) => {
+    navigateToView(view, {
+      setActiveView,
+      scrollTo: window.scrollTo.bind(window),
+    });
+    window.requestAnimationFrame(() => mainRef.current?.focus({ preventScroll: true }));
+  }, []);
+
+  useEffect(() => {
+    document.title = VIEW_TITLES[activeView] || "Pacific BioArchive";
+  }, [activeView]);
 
   useEffect(() => {
     if (authRoute === "logout") {
       window.history.replaceState({}, document.title, appConfig.homePath);
     }
   }, [authRoute]);
+
   useEffect(() => {
     if (previousUser.current !== (user?.sub || null)) {
       previousUser.current = user?.sub || null;
-      setQuery({ items: [], structuredItems: [], legacyItems: [], count: 0 });
+      const sessionView = resetSessionViewState();
+      queryLifecycle.current = beginQuery(queryLifecycle.current);
+      setActiveView(sessionView.activeView);
+      setStatuses(sessionView.statuses);
+      setQuery(EMPTY_QUERY);
       setSelectedFileIds([]);
       setQueryState("idle");
+      setDescriptors(clearQueryDescriptors());
     }
   }, [user?.sub]);
 
-  if (authRoute === "callback") return <AuthCallback />;
-
-  function startQuery() {
-    setSelectedFileIds(beginQuerySelection());
-    setQuery({ items: [], structuredItems: [], legacyItems: [], count: 0 });
-    setQueryState("loading");
-    setStatus({ type: "info", message: "Searching the archive…" });
+  // The Cognito callback route must win over every other view, including the
+  // public landing page, or the hosted-UI redirect would be swallowed.
+  if (authRoute === "callback") {
+    return <div className="auth-callback-shell"><AuthCallback /></div>;
   }
 
-  function completeQuery(nextQuery, nextStatus) {
+  if (!user) {
+    return <LandingPage sessionReason={sessionReason} />;
+  }
+
+  function startQuery(descriptor) {
+    setSelectedFileIds(beginQuerySelection());
+    setDescriptors((current) => beginPendingQuery(current, descriptor));
+    setQueryState("loading");
+    setViewStatus("explore", { type: "info", message: "Searching the archive…" });
+  }
+
+  function completeQuery(nextQuery, nextStatus, descriptor) {
     setQuery(nextQuery);
-    setQueryState(nextStatus.type === "error" ? "error" : (nextQuery.count ? "ready" : "empty"));
-    setStatus(nextStatus);
+    setDescriptors((current) => settleQuerySuccess(current, descriptor));
+    setQueryState(nextQuery.count ? "ready" : "empty");
+    setViewStatus("explore", nextStatus);
+  }
+
+  function failQuery(nextStatus) {
+    setDescriptors((current) => settleQueryFailure(current));
+    // Keep the previous successful results visible with their own descriptor.
+    setQueryState(query.items.length ? "ready" : "error");
+    setViewStatus("explore", nextStatus);
+  }
+
+  function clearQuery() {
+    queryLifecycle.current = beginQuery(queryLifecycle.current);
+    setQuery(EMPTY_QUERY);
+    setQueryState("idle");
+    setSelectedFileIds([]);
+    setDescriptors(clearQueryDescriptors());
+    setViewStatus("explore", null);
   }
 
   async function testAuth() {
-    try { await getAuthTest(); setStatus({ type: "success", message: "Protected API is available." }); }
-    catch (error) { setStatus({ type: "error", message: error.message }); }
+    const sourceView = activeView;
+    try {
+      await getAuthTest();
+      setViewStatus(sourceView, { type: "success", message: "Protected API is available." });
+    } catch (error) {
+      setViewStatus(sourceView, { type: "error", message: error.message });
+    }
   }
 
-  return <main className="app-shell">
-    <header className="app-header"><div><p className="eyebrow">Pacific BioArchive</p><h1>Wildlife media archive</h1></div>{user && <AuthControls user={user} />}</header>
-    {!user ? <section className="auth-gate"><p className="eyebrow">Private collection</p><h2>Sign in to explore the archive.</h2>{sessionReason === "expired" && <p role="alert">Your session has expired. Please sign in again.</p>}<AuthControls user={null} /></section> : <>
-      <details className="session-bar"><summary>Demo diagnostics</summary><div><span>{user.email || user["cognito:username"] || "Signed in"}</span><code>Session {user.sub}</code><button type="button" className="secondary-button" onClick={testAuth}>Check auth</button></div></details>
-      <nav className="tabs" aria-label="Primary navigation">{views.map(([id, label]) => <button key={id} type="button" className={activeView === id ? "active" : ""} aria-current={activeView === id ? "page" : undefined} onClick={() => setActiveView(id)}>{label}</button>)}</nav>
-      <StatusBanner status={status} />
-      {activeView === "explore" && <ExplorePanel items={query.items} queryState={queryState} selectedFileIds={selectedFileIds} onQueryStart={startQuery} onQueryResult={completeQuery} onToggle={(fileId) => setSelectedFileIds((current) => toggleFileSelection(current, fileId))} onStatus={setStatus} sessionKey={user.sub} />}
-      {activeView === "upload" && <UploadPanel onStatus={setStatus} />}
-      {activeView === "manage" && <ManagePanel selectedFileIds={selectedFileIds} currentItems={query.structuredItems} onStatus={setStatus} onDeleted={(fileIds) => { const items = removeManagedItems(query.items, fileIds); const structuredItems = items.filter((item) => !item.legacy); const legacyItems = items.filter((item) => item.legacy); setQuery({ items, structuredItems, legacyItems, count: items.length }); setSelectedFileIds((current) => current.filter((id) => !fileIds.includes(id))); setQueryState(items.length ? "ready" : "empty"); }} />}
-      {activeView === "notifications" && <NotificationsPanel onStatus={setStatus} />}
-    </>}
-  </main>;
+  const manageCount = selectedMutationKeys(selectedFileIds, query.structuredItems).length;
+
+  const diagnostics = demoMode ? (
+    <details className="demo-diagnostics">
+      <summary>Demo diagnostics</summary>
+      <div>
+        <span>{user.email || user["cognito:username"] || "Signed in"}</span>
+        <code>Session {user.sub}</code>
+        <button type="button" className="btn btn-secondary" onClick={testAuth}>Check auth</button>
+      </div>
+    </details>
+  ) : null;
+
+  return (
+    <div className="app-shell">
+      <AppHeader user={user} activeView={activeView} onNavigate={navigate} />
+      <div className="app-body">
+        <AppNav
+          activeView={activeView}
+          manageCount={manageCount}
+          onNavigate={navigate}
+          diagnostics={diagnostics}
+        />
+        <main ref={mainRef} className="app-main" tabIndex="-1">
+          <StatusBanner status={statusForView(statuses, activeView)} />
+          {activeView === "home" && <HomePanel onNavigate={navigate} />}
+          {activeView === "explore" && (
+            <ExplorePanel
+              items={query.items}
+              queryState={queryState}
+              lastDescriptor={descriptors.lastSuccessfulDescriptor}
+              pendingDescriptor={descriptors.pendingDescriptor}
+              selectedFileIds={selectedFileIds}
+              queryLifecycle={queryLifecycle}
+              onQueryStart={startQuery}
+              onQueryResult={completeQuery}
+              onQueryError={failQuery}
+              onClearQuery={clearQuery}
+              onToggle={(fileId) => setSelectedFileIds((current) => toggleFileSelection(current, fileId))}
+              onStatus={setExploreStatus}
+              sessionKey={user.sub}
+            />
+          )}
+          <div hidden={activeView !== "upload"}>
+            <UploadPanel
+              key={user.sub}
+              active={activeView === "upload"}
+              sessionKey={user.sub}
+              getActiveSession={() => activeSession.current}
+              onStatus={(status) => setUploadStatus(user.sub, status)}
+              onNavigate={navigate}
+            />
+          </div>
+          {activeView === "manage" && (
+            <ManagePanel
+              selectedFileIds={selectedFileIds}
+              currentItems={query.structuredItems}
+              onStatus={setManageStatus}
+              onNavigate={navigate}
+              onDeleted={(fileIds) => {
+                const items = removeManagedItems(query.items, fileIds);
+                const structuredItems = items.filter((item) => !item.legacy);
+                const legacyItems = items.filter((item) => item.legacy);
+                setQuery({ items, structuredItems, legacyItems, count: items.length });
+                setSelectedFileIds((current) => current.filter((id) => !fileIds.includes(id)));
+                setQueryState(items.length ? "ready" : "empty");
+                setExploreStatus(queryStatusAfterDeletion(items.length));
+              }}
+            />
+          )}
+          {activeView === "notifications" && <NotificationsPanel onStatus={setNotificationsStatus} />}
+        </main>
+      </div>
+    </div>
+  );
 }
