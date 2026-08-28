@@ -100,7 +100,7 @@ from app.tag_detector import (
     TagDetector,
     UnavailableTagDetector,
 )
-from examples.cognito_auth_example import build_get_current_user
+from app.auth import build_get_current_user
 
 app = FastAPI(title="Pacific BioArchive — Database & Query API", version="1.0.0")
 app.add_middleware(

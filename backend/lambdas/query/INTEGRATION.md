@@ -143,7 +143,7 @@ adapter 失败返回稳定的 502 且保留 metadata；未配置返回 503。stu
 由成员 A 操作；共享 secret 仅由 A 与负责阿里云部署的 C 通过安全渠道配置，B/D 不自行
 配置。secret 不得提交 Git、写入文档或发送到群聊。
 
-真实 Cognito 配置（成员 A 提供，已写进 `examples/cognito_auth_example.py`）：
+真实 Cognito 配置（成员 A 提供，已写进 `app/auth.py`）：
 
 | 参数 | 值 |
 |------|-----|
@@ -153,7 +153,7 @@ adapter 失败返回稳定的 502 且保留 metadata；未配置返回 503。stu
 | Issuer | `https://cognito-idp.ap-southeast-2.amazonaws.com/ap-southeast-2_1hGEJyYO7` |
 | JWKS | `https://cognito-idp.ap-southeast-2.amazonaws.com/ap-southeast-2_1hGEJyYO7/.well-known/jwks.json` |
 
-示例实现支持两种部署模式：
+认证实现支持两种部署模式：
 
 1. **Lambda 模式**：API Gateway 的 `CognitoJWTAuthorizer` 已验过 token，直接读
    `event["requestContext"]["authorizer"]["jwt"]["claims"]["sub"]`。

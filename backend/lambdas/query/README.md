@@ -113,9 +113,9 @@ The query API code is unchanged — only the repository backend swaps
   storage-delete Lambda with the owning user and S3 **keys**.
   Member B also writes metadata through the internal endpoints above, not by
   importing this repo directly.
-- **Member A (auth):** replace the body of `get_current_user` in `app/main.py`
-  with `build_get_current_user()` from `examples/cognito_auth_example.py`
-  (real Cognito params already filled in) — every public route already depends on it.
+- **Member A (auth):** `app/auth.py` resolves the verified API Gateway JWT
+  `sub` in Lambda and verifies Cognito bearer tokens during local development;
+  every public route already depends on it.
 - **Member D (notifications):** the module already includes the DynamoDB inbox,
   trigger, SNS publisher, and subscription/notification endpoints. Member A's
   SAM deployment enables it with `NOTIFICATION_PUBLISHER=sns` and the exact
