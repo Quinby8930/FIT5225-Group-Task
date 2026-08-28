@@ -70,7 +70,8 @@ class SpeciesQueryRequest(BaseModel):
 class TagEditRequest(BaseModel):
     """Bulk add/remove tags on a list of files (matched by object key)."""
 
-    keys: list[str]
+    keys: list[str] = Field(default_factory=list)
+    urls: list[str] = Field(default_factory=list)
     tags: list[str]
     operation: Literal[0, 1]  # 1 = add, 0 = remove
 
@@ -78,7 +79,20 @@ class TagEditRequest(BaseModel):
 class DeleteRequest(BaseModel):
     """Bulk delete files (matched by object key)."""
 
-    keys: list[str]
+    keys: list[str] = Field(default_factory=list)
+    urls: list[str] = Field(default_factory=list)
+
+
+class QueryResultItem(BaseModel):
+    """Safe archive metadata used by the authenticated query client."""
+
+    file_id: str
+    file_type: Literal["image", "video"]
+    display_key: str
+    original_key: str
+    thumbnail_key: Optional[str]
+    can_preview: bool
+    can_manage: bool
 
 
 class QueryResponse(BaseModel):
@@ -90,6 +104,7 @@ class QueryResponse(BaseModel):
 
     results: list[str]
     count: int
+    items: list[QueryResultItem] = Field(default_factory=list)
 
 
 # ---------------------------------------------------------------------------

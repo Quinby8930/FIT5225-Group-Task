@@ -54,7 +54,7 @@
         "url": { "raw": "{{baseUrl}}/tags/edit", "host": ["{{baseUrl}}"], "path": ["tags", "edit"] },
         "body": {
           "mode": "raw",
-          "raw": "{\"keys\": [\"originals/u1/a1.jpg\"], \"tags\": [\"echidna\"], \"operation\": 1}"
+          "raw": "{\"keys\": [\"originals/u1/a1.jpg\"], \"urls\": [], \"tags\": [\"echidna\"], \"operation\": 1}"
         }
       }
     },
@@ -76,7 +76,7 @@
         "method": "POST",
         "header": [{ "key": "Content-Type", "value": "application/json" }],
         "url": { "raw": "{{baseUrl}}/files/delete", "host": ["{{baseUrl}}"], "path": ["files", "delete"] },
-        "body": { "mode": "raw", "raw": "{\"keys\": [\"originals/u1/a5.jpg\"]}" }
+        "body": { "mode": "raw", "raw": "{\"keys\": [\"originals/u1/a5.jpg\"], \"urls\": []}" }
       }
     },
     {

@@ -143,7 +143,10 @@ def client(tmp_path):
     main.app.dependency_overrides[main.get_storage] = lambda: storage
     main.app.dependency_overrides[main.get_publisher] = lambda: publisher
     main.app.dependency_overrides[main.get_current_user] = lambda: "u1"
-    test_settings = SimpleNamespace(internal_api_key=INTERNAL_API_KEY)
+    test_settings = SimpleNamespace(
+        internal_api_key=INTERNAL_API_KEY,
+        query_input_bucket="private-media",
+    )
     main.app.dependency_overrides[main.get_settings] = lambda: test_settings
 
     with TestClient(main.app) as c:
@@ -168,6 +171,61 @@ class TestEndpoints:
             "thumbnails/u2/f4.jpg",
         }
 
+    def test_query_results_add_safe_archive_items_and_exclude_incomplete_records(
+        self, client
+    ):
+        client.repo.add(
+            FileRecord(
+                file_id="processing",
+                user_id="u1",
+                file_type="image",
+                object_key="originals/processing.jpg",
+                checksum="sha256:processing",
+                tags={"dingo": 1},
+                status="processing",
+            )
+        )
+
+        response = client.post("/query/by-tags", json={"tags": {"dingo": 1}})
+
+        assert response.status_code == 200
+        payload = response.json()
+        assert payload["results"] == [
+            "thumbnails/f1.jpg",
+            "originals/v1.mp4",
+            "thumbnails/u2/f4.jpg",
+        ]
+        assert payload["count"] == 3
+        assert payload["items"] == [
+            {
+                "file_id": "f1",
+                "file_type": "image",
+                "display_key": "thumbnails/f1.jpg",
+                "original_key": "originals/f1",
+                "thumbnail_key": "thumbnails/f1.jpg",
+                "can_preview": True,
+                "can_manage": True,
+            },
+            {
+                "file_id": "f3",
+                "file_type": "video",
+                "display_key": "originals/v1.mp4",
+                "original_key": "originals/v1.mp4",
+                "thumbnail_key": None,
+                "can_preview": True,
+                "can_manage": True,
+            },
+            {
+                "file_id": "f4",
+                "file_type": "image",
+                "display_key": "thumbnails/u2/f4.jpg",
+                "original_key": "originals/u2/f4.jpg",
+                "thumbnail_key": "thumbnails/u2/f4.jpg",
+                "can_preview": True,
+                "can_manage": False,
+            },
+        ]
+
     def test_by_tags_and(self, client):
         r = client.post("/query/by-tags", json={"tags": {"dingo": 1, "wombat": 1}})
         assert r.status_code == 200
@@ -186,9 +244,33 @@ class TestEndpoints:
         assert r.status_code == 200
         assert r.json()["original_key"] == "originals/f1"
 
+    def test_by_thumbnail_url_normalizes_to_key(self, client):
+        response = client.get(
+            "/query/by-thumbnail",
+            params={
+                "key": (
+                    "https://private-media.s3.ap-southeast-2.amazonaws.com/"
+                    "thumbnails/f1.jpg?X-Amz-Signature=redacted"
+                )
+            },
+        )
+
+        assert response.status_code == 200
+        assert response.json() == {"original_key": "originals/f1", "file_id": "f1"}
+
     def test_by_thumbnail_missing_404(self, client):
         r = client.get("/query/by-thumbnail", params={"key": "thumbnails/nope.jpg"})
         assert r.status_code == 404
+        assert r.json()["detail"]["code"] == "THUMBNAIL_NOT_FOUND"
+
+    def test_by_thumbnail_rejects_untrusted_media_url(self, client):
+        response = client.get(
+            "/query/by-thumbnail",
+            params={"key": "https://wrong-bucket.s3.amazonaws.com/thumbnails/f1.jpg"},
+        )
+
+        assert response.status_code == 422
+        assert response.json()["detail"]["code"] == "INVALID_MEDIA_REFERENCE"
 
     def test_by_file_does_not_persist(self, client):
         before = len(client.repo.all())
@@ -220,7 +302,7 @@ class TestEndpoints:
         )
 
         assert response.status_code == 200
-        assert response.json() == {"results": [], "count": 0}
+        assert response.json() == {"results": [], "count": 0, "items": []}
 
     @pytest.mark.parametrize(
         "content_type", ["image/jpeg", "image/png", "image/webp"]
@@ -357,6 +439,49 @@ class TestEndpoints:
         rec = next(x for x in client.repo.all() if x.file_id == "f1")
         assert rec.tags["koala"] == 1
 
+    def test_tag_edit_deduplicates_the_same_legacy_key_and_url(self, client):
+        original_by_keys = client.repo.by_keys
+        lookup_keys = []
+
+        def observe_by_keys(keys):
+            lookup_keys.append(keys)
+            return original_by_keys(keys)
+
+        client.repo.by_keys = observe_by_keys
+        response = client.post(
+            "/tags/edit",
+            json={
+                "keys": ["originals/f1"],
+                "urls": [
+                    "https://private-media.s3.ap-southeast-2.amazonaws.com/"
+                    "originals/f1?X-Amz-Signature=redacted",
+                ],
+                "tags": ["koala"],
+                "operation": 1,
+            },
+        )
+
+        assert response.status_code == 200
+        assert response.json() == {"updated": 1, "matched_keys": ["originals/f1"]}
+        assert lookup_keys == [["originals/f1"]]
+        assert client.repo.get("f1").tags["koala"] == 1
+
+    def test_tag_edit_accepts_url_only_references(self, client):
+        response = client.post(
+            "/tags/edit",
+            json={
+                "urls": [
+                    "https://private-media.s3.ap-southeast-2.amazonaws.com/"
+                    "originals/f1?X-Amz-Signature=redacted"
+                ],
+                "tags": ["koala"],
+                "operation": 1,
+            },
+        )
+
+        assert response.status_code == 200
+        assert response.json() == {"updated": 1, "matched_keys": ["originals/f1"]}
+
     def test_tag_edit_normalizes_scientific_names_before_persistence(self, client):
         response = client.post(
             "/tags/edit",
@@ -415,6 +540,48 @@ class TestEndpoints:
         assert client.storage.deleted_by_owner == {
             "u1": ["originals/f1", "thumbnails/f1.jpg"]
         }
+
+    def test_delete_accepts_thumbnail_url_and_preserves_unknown_reference_noop(self, client):
+        response = client.post(
+            "/files/delete",
+            json={
+                "keys": ["originals/unknown"],
+                "urls": [
+                    "https://private-media.s3.ap-southeast-2.amazonaws.com/"
+                    "thumbnails/f1.jpg?X-Amz-Signature=redacted"
+                ],
+            },
+        )
+
+        assert response.status_code == 200
+        assert response.json()["deleted_db_records"] == 1
+        assert client.repo.get("f1") is None
+
+    def test_delete_accepts_url_only_references(self, client):
+        response = client.post(
+            "/files/delete",
+            json={
+                "urls": [
+                    "https://private-media.s3.ap-southeast-2.amazonaws.com/"
+                    "thumbnails/f1.jpg?X-Amz-Signature=redacted"
+                ],
+            },
+        )
+
+        assert response.status_code == 200
+        assert response.json()["deleted_db_records"] == 1
+        assert client.repo.get("f1") is None
+
+    @pytest.mark.parametrize("route", ["/tags/edit", "/files/delete"])
+    def test_management_routes_reject_empty_media_references(self, client, route):
+        payload = {"keys": [], "urls": []}
+        if route == "/tags/edit":
+            payload.update({"tags": ["koala"], "operation": 1})
+
+        response = client.post(route, json=payload)
+
+        assert response.status_code == 422
+        assert response.json()["detail"]["code"] == "INVALID_MEDIA_REFERENCE"
 
     def test_delete_keeps_metadata_when_storage_deletion_fails(self, client):
         def fail_delete(_user_id, _keys):
