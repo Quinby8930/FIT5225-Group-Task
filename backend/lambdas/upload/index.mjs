@@ -7,14 +7,32 @@ import { createUploadService } from './service.mjs';
 const DEFAULT_MAX_UPLOAD_BYTES = 262_144_000;
 const DEFAULT_MAX_IMAGE_UPLOAD_BYTES = 12_582_912;
 
+function configuredAllowedOrigins(allowedOrigin, allowedOrigins) {
+  return [...new Set([allowedOrigin, allowedOrigins]
+    .flatMap((origins) => Array.isArray(origins) ? origins : String(origins || '').split(','))
+    .map((origin) => origin.trim())
+    .filter(Boolean))];
+}
+
+function requestOrigin(event) {
+  const headers = event?.headers || {};
+  const match = Object.entries(headers).find(([name]) => name.toLowerCase() === 'origin');
+  return typeof match?.[1] === 'string' ? match[1] : undefined;
+}
+
+function allowedRequestOrigin(event, allowedOrigins) {
+  const origin = requestOrigin(event);
+  return origin && allowedOrigins.includes(origin) ? origin : undefined;
+}
+
 function response(statusCode, payload, allowedOrigin) {
   return {
     statusCode,
     headers: {
       'Content-Type': 'application/json',
-      'Access-Control-Allow-Origin': allowedOrigin,
       'Access-Control-Allow-Headers': 'Authorization,Content-Type',
       'Access-Control-Allow-Methods': 'POST,OPTIONS',
+      ...(allowedOrigin ? { 'Access-Control-Allow-Origin': allowedOrigin } : {}),
     },
     body: payload === undefined ? '' : JSON.stringify(payload),
   };
@@ -30,23 +48,25 @@ function errorResponse(error, allowedOrigin) {
   return response(500, { code: 'INTERNAL_ERROR' }, allowedOrigin);
 }
 
-export function createHandler({ createService, maxUploadBytes = DEFAULT_MAX_UPLOAD_BYTES, maxImageUploadBytes = DEFAULT_MAX_IMAGE_UPLOAD_BYTES, allowedOrigin = 'http://localhost:3000' }) {
+export function createHandler({ createService, maxUploadBytes = DEFAULT_MAX_UPLOAD_BYTES, maxImageUploadBytes = DEFAULT_MAX_IMAGE_UPLOAD_BYTES, allowedOrigin = 'http://localhost:3000', allowedOrigins }) {
+  const originAllowlist = configuredAllowedOrigins(allowedOrigin, allowedOrigins);
   let service;
   return async function uploadHandler(event = {}) {
-    if (event.requestContext?.http?.method === 'OPTIONS' || event.httpMethod === 'OPTIONS') return response(204, undefined, allowedOrigin);
+    const responseOrigin = allowedRequestOrigin(event, originAllowlist);
+    if (event.requestContext?.http?.method === 'OPTIONS' || event.httpMethod === 'OPTIONS') return response(204, undefined, responseOrigin);
     const userId = event.requestContext?.authorizer?.jwt?.claims?.sub;
-    if (!userId) return response(401, { code: 'UNAUTHENTICATED' }, allowedOrigin);
+    if (!userId) return response(401, { code: 'UNAUTHENTICATED' }, responseOrigin);
     let request;
     try {
       request = JSON.parse(event.body);
     } catch {
-      return response(400, { code: 'INVALID_REQUEST' }, allowedOrigin);
+      return response(400, { code: 'INVALID_REQUEST' }, responseOrigin);
     }
     try {
       service ??= createService({ maxBytes: maxUploadBytes, maxImageBytes: maxImageUploadBytes });
-      return response(200, await service.createUpload({ userId, request }), allowedOrigin);
+      return response(200, await service.createUpload({ userId, request }), responseOrigin);
     } catch (error) {
-      return errorResponse(error, allowedOrigin);
+      return errorResponse(error, responseOrigin);
     }
   };
 }
@@ -80,6 +100,7 @@ async function createProductionHandler() {
     maxUploadBytes: configuredMaxBytes(),
     maxImageUploadBytes: configuredMaxImageBytes(),
     allowedOrigin: process.env.ALLOWED_ORIGIN || 'http://localhost:3000',
+    allowedOrigins: process.env.ALLOWED_ORIGINS,
     createService: ({ maxBytes, maxImageBytes }) => createUploadService({
       createFileId: randomUUID,
       reserveUpload: metadataClient.reserveUpload,

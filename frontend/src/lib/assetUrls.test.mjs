@@ -221,3 +221,62 @@ test("prunes only expired URL records and leaves later batches available", async
     current: { url: "https://signed.example/current", expiresAt: 2_000 },
   });
 });
+
+test("merges same-batch signed assets and per-key errors without losing successful URLs", async () => {
+  const { mergeAssetUrlStates } = await loadAssetUrlModule();
+  assert.equal(typeof mergeAssetUrlStates, "function");
+
+  assert.deepEqual(mergeAssetUrlStates({
+    previous: { status: "ready", url: "https://signed.example/previous", expiresAt: 9_000 },
+  }, {
+    assets: [{ key: "current", url: "https://signed.example/current", expires_in: 900 }],
+    errors: [
+      { key: "forbidden", code: "FORBIDDEN_KEY" },
+      { key: "retry", code: "SIGNING_FAILED" },
+    ],
+  }, 1_000), {
+    previous: { status: "ready", url: "https://signed.example/previous", expiresAt: 9_000 },
+    current: { status: "ready", url: "https://signed.example/current", expiresAt: 901_000 },
+    forbidden: { status: "forbidden" },
+    retry: { status: "signing_failed" },
+  });
+});
+
+test("retries only explicit signing failures and marks expired ready states", async () => {
+  const { retryableAssetKeys, pruneAssetUrlStates } = await loadAssetUrlModule();
+  assert.equal(typeof retryableAssetKeys, "function");
+  assert.equal(typeof pruneAssetUrlStates, "function");
+  const states = {
+    retry: { status: "signing_failed" },
+    forbidden: { status: "forbidden" },
+    missing: { status: "not_found" },
+    queued: { status: "not_completed" },
+    expired: { status: "ready", url: "https://signed.example/expired", expiresAt: 1_000 },
+    ready: { status: "ready", url: "https://signed.example/ready", expiresAt: 2_000 },
+  };
+
+  assert.deepEqual(retryableAssetKeys(states), ["retry"]);
+  assert.deepEqual(pruneAssetUrlStates(states, 1_000), {
+    retry: { status: "signing_failed" },
+    forbidden: { status: "forbidden" },
+    missing: { status: "not_found" },
+    queued: { status: "not_completed" },
+    expired: { status: "expired" },
+    ready: { status: "ready", url: "https://signed.example/ready", expiresAt: 2_000 },
+  });
+});
+
+test("accepts only the latest asset request version for state writes", async () => {
+  const { isCurrentAssetRequest } = await loadAssetUrlModule();
+  assert.equal(typeof isCurrentAssetRequest, "function");
+  assert.equal(isCurrentAssetRequest(4, 4), true);
+  assert.equal(isCurrentAssetRequest(4, 3), false);
+});
+
+test("backs off only bounded automatic signing retries", async () => {
+  const { nextSigningRetryDelay } = await loadAssetUrlModule();
+  assert.equal(typeof nextSigningRetryDelay, "function");
+  assert.equal(nextSigningRetryDelay(0), 1_000);
+  assert.equal(nextSigningRetryDelay(3), 8_000);
+  assert.equal(nextSigningRetryDelay(4), null);
+});

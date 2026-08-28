@@ -21,7 +21,7 @@ function makeToken(payload) {
   return `${encode({ alg: "none" })}.${encode(payload)}.`;
 }
 
-test("member E browser flow calls the agreed upload, query, edit, delete and notification APIs", async () => {
+test("member E contract flow calls the agreed upload, query, edit, delete and notification APIs", async () => {
   globalThis.localStorage = storage();
   globalThis.sessionStorage = storage();
   globalThis.btoa = (value) => Buffer.from(value, "binary").toString("base64");
@@ -147,8 +147,10 @@ test("member E browser flow calls the agreed upload, query, edit, delete and not
     type: "image/jpeg",
   });
 
-  const uploaded = await mediaApi.uploadMedia(file);
+  const uploadStages = [];
+  const uploaded = await mediaApi.uploadMedia(file, { onStage: (stage) => uploadStages.push(stage) });
   assert.equal(uploaded.file_id, "file-1");
+  assert.deepEqual(uploadStages, ["hashing", "requesting", "uploading", "queued"]);
   assert.deepEqual(await mediaApi.queryByTags({ wombat: 1 }), {
     results: ["thumbnails/user-123/file-1/thumbnail.jpg"],
     count: 1,

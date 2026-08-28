@@ -16,6 +16,7 @@ INTRINSIC_NAMES = {
     "Equals": "Fn::Equals",
     "GetAtt": "Fn::GetAtt",
     "If": "Fn::If",
+    "Join": "Fn::Join",
     "Not": "Fn::Not",
     "Sub": "Fn::Sub",
 }
@@ -65,6 +66,7 @@ def test_template_declares_required_parameters(template):
     assert "Default" not in parameters["ExistingHttpApiId"]
     assert "Default" not in parameters["ExistingJwtAuthorizerId"]
     assert parameters["AllowedOrigin"]["Default"] == "http://localhost:3000"
+    assert parameters["PublicAllowedOrigin"]["Default"] == "https://quinby8930.github.io"
     assert "Default" not in parameters["MetadataApiBaseUrl"]
     assert "Default" not in parameters["InferenceApiUrl"]
     for name in ("MetadataApiBaseUrl", "InferenceApiUrl"):
@@ -129,7 +131,10 @@ def test_media_bucket_is_private_encrypted_and_recoverable(template):
     ]
     cors = bucket["CorsConfiguration"]["CorsRules"]
     assert len(cors) == 1
-    assert cors[0]["AllowedOrigins"] == [{"Ref": "AllowedOrigin"}]
+    assert cors[0]["AllowedOrigins"] == [
+        {"Ref": "AllowedOrigin"},
+        {"Ref": "PublicAllowedOrigin"},
+    ]
     assert set(cors[0]["AllowedMethods"]) == {"PUT", "GET", "HEAD"}
     lifecycle = bucket["LifecycleConfiguration"]["Rules"]
     assert any(
@@ -138,6 +143,12 @@ def test_media_bucket_is_private_encrypted_and_recoverable(template):
         and rule["ExpirationInDays"] == 1
         for rule in lifecycle
     )
+    assert {
+        "Id": "ExpireAbandonedQueryInputs",
+        "Prefix": "query-inputs/",
+        "Status": "Enabled",
+        "ExpirationInDays": 1,
+    } in lifecycle
 
 
 def test_s3_event_is_filtered_to_originals(template):
@@ -190,6 +201,7 @@ def test_function_environment_names_match_production_handlers(template):
             "MAX_UPLOAD_BYTES",
             "MAX_IMAGE_UPLOAD_BYTES",
             "ALLOWED_ORIGIN",
+            "ALLOWED_ORIGINS",
         },
         "MediaProcessingFunction": {
             "MEDIA_BUCKET_NAME",
@@ -200,7 +212,7 @@ def test_function_environment_names_match_production_handlers(template):
             "FFMPEG_PATH",
         },
         "StorageDeleteFunction": {"MEDIA_BUCKET_NAME"},
-        "AssetUrlsFunction": {"MEDIA_BUCKET_NAME", "ALLOWED_ORIGIN"},
+        "AssetUrlsFunction": {"MEDIA_BUCKET_NAME", "METADATA_API_BASE_URL", "INTERNAL_API_KEY", "ALLOWED_ORIGIN", "ALLOWED_ORIGINS"},
     }
     for function, names in expected.items():
         variables = _properties(template, function)["Environment"]["Variables"]
@@ -212,6 +224,17 @@ def test_function_environment_names_match_production_handlers(template):
     assert processing_variables["INFERENCE_HTTP_TIMEOUT_SECONDS"] == {
         "Ref": "InferenceHttpTimeoutSeconds"
     }
+    asset_variables = _properties(template, "AssetUrlsFunction")["Environment"]["Variables"]
+    assert asset_variables["METADATA_API_BASE_URL"] == {"Ref": "MetadataApiBaseUrl"}
+    assert asset_variables["INTERNAL_API_KEY"] == {"Ref": "InternalApiKey"}
+    expected_allowlist = {
+        "Fn::Join": [
+            ",",
+            [{"Ref": "AllowedOrigin"}, {"Ref": "PublicAllowedOrigin"}],
+        ]
+    }
+    assert upload_variables["ALLOWED_ORIGINS"] == expected_allowlist
+    assert asset_variables["ALLOWED_ORIGINS"] == expected_allowlist
 
 
 def test_upload_post_route_uses_existing_jwt_authorizer(template):

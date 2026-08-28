@@ -98,13 +98,14 @@ Content-Type: application/json
 }
 ```
 
-The verified Cognito `sub` is the only user identifier used for authorization.
-The endpoint accepts at most 100 keys, removes duplicates while preserving
-first-seen order, and signs only non-empty objects below
-`originals/{sub}/` or `thumbnails/{sub}/`. Cross-user keys, incomplete
-prefixes, and internal `processing/` frames are rejected before any URL is
-created. Each key is also limited to the S3 maximum of 1,024 UTF-8 bytes. The
-S3 bucket remains private.
+The verified Cognito `sub` is required to call the endpoint. The endpoint accepts
+1--100 keys, removes duplicates while preserving first-seen order, and asks
+Member D to authorize each canonical archive key against completed metadata.
+Any signed-in user may preview a completed original or thumbnail; no owner-prefix
+authorization is performed by this endpoint. Invalid prefixes and archive keys
+that are missing or not completed are reported per key, while an unavailable or
+malformed authorization response fails the entire request closed. Each key is
+limited to the S3 maximum of 1,024 UTF-8 bytes. The S3 bucket remains private.
 
 Success (`200`):
 
@@ -116,6 +117,9 @@ Success (`200`):
       "url": "https://temporary-presigned-get-url",
       "expires_in": 900
     }
+  ],
+  "errors": [
+    {"key": "processing/cognito-sub/frame.jpg", "code": "FORBIDDEN_KEY"}
   ]
 }
 ```
@@ -130,10 +134,29 @@ for the configured browser origin.
 | --- | --- | --- |
 | `400` | `INVALID_REQUEST` | JSON, key types, 1,024-byte key size, or the 100-key limit is invalid. |
 | `401` | `UNAUTHENTICATED` | The verified JWT `sub` claim is absent. |
-| `403` | `FORBIDDEN_KEY` | At least one key is outside the authenticated user's readable prefixes. |
+| `503` | `AUTHORIZATION_UNAVAILABLE` | Member D authorization could not be safely verified; no key is signed. |
 | `500` | `INTERNAL_ERROR` | S3 signing or another unexpected operation failed. |
 
 ## Member D metadata contracts
+
+### Authorize completed archive assets
+
+```http
+POST {METADATA_API_BASE_URL}/internal/assets/authorize
+```
+
+```json
+{"keys":["originals/cognito-sub/file.jpg","thumbnails/cognito-sub/file.jpg"]}
+```
+
+This internal endpoint accepts only 1--100 unique canonical `originals/` or
+`thumbnails/` S3 keys (duplicates are collapsed in first-seen order), with a
+non-empty owner and file path and no empty, `.`, `..`, or backslash segments.
+It is protected by `X-Internal-Api-Key`. It returns one decision per key:
+`{"key":"...","allowed":true}` only when the key is recorded by a
+`completed` media record, or `{"key":"...","allowed":false,"code":"FORBIDDEN_KEY|NOT_FOUND|NOT_COMPLETED"}`.
+Member B treats any unavailable, non-2xx, oversized, redirected, or malformed
+response as `AUTHORIZATION_UNAVAILABLE` and signs no URLs.
 
 ### Reserve an upload
 

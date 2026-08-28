@@ -49,10 +49,12 @@ from app.repository import (
 )
 from app.repository.base import DuplicateError, FileRepository
 from app.schemas import (
+    AssetAuthorizationRequest,
     CompleteRequest,
     DeleteRequest,
     FailedRequest,
     FileRecord,
+    Notification,
     NotificationListResponse,
     ProcessingRequest,
     QueryResponse,
@@ -71,9 +73,15 @@ from app.notification_client import (
 )
 from app.services.notification_service import build_notifications
 from app.services.query_service import (
+    completed_records,
     filter_by_min_counts,
     filter_by_species,
     to_display_keys,
+    to_query_items,
+)
+from app.services.media_reference_service import (
+    MediaReferenceError,
+    normalize_media_reference,
 )
 from app.storage_client import (
     LambdaStorageClient,
@@ -279,6 +287,45 @@ def _normalise_detections(detections: list[dict]) -> list[dict]:
     ]
 
 
+def _normalise_media_references(
+    keys: list[str], urls: list[str], settings_: Settings
+) -> list[str]:
+    """Normalize and de-duplicate client supplied archive references."""
+    references = [*keys, *urls]
+    if not references:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "code": "INVALID_MEDIA_REFERENCE",
+                "message": "at least one media reference is required",
+            },
+        )
+    try:
+        return list(
+            dict.fromkeys(
+                normalize_media_reference(reference, settings_.query_input_bucket)
+                for reference in references
+            )
+        )
+    except MediaReferenceError as exc:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "code": "INVALID_MEDIA_REFERENCE",
+                "message": "media reference must be an archive key or trusted HTTPS URL",
+            },
+        ) from exc
+
+
+def _query_response(records: list[FileRecord], user_id: str) -> QueryResponse:
+    display_keys = to_display_keys(records)
+    return QueryResponse(
+        results=display_keys,
+        count=len(display_keys),
+        items=to_query_items(records, user_id),
+    )
+
+
 def _require_matching_metadata(
     record: FileRecord,
     *,
@@ -294,12 +341,12 @@ def _require_matching_metadata(
         raise HTTPException(status_code=409, detail=METADATA_CONFLICT_DETAIL)
 
 
-def _publish_pending_notifications(
-    file_id: str,
+def _publish_notifications(
+    notifications: list[Notification],
     notif_repo_: NotificationRepository,
     publisher_: NotificationPublisher,
 ) -> None:
-    for notification in notif_repo_.pending_for_file(file_id):
+    for notification in notifications:
         try:
             publisher_.publish(notification)
         except Exception:
@@ -323,17 +370,44 @@ def _publish_pending_notifications(
             )
 
 
+def _publish_pending_notifications(
+    file_id: str,
+    notif_repo_: NotificationRepository,
+    publisher_: NotificationPublisher,
+) -> None:
+    _publish_notifications(
+        notif_repo_.pending_for_file(file_id), notif_repo_, publisher_
+    )
+
+
 def _ensure_notification_inbox(
     file_id: str,
     object_key: str,
     tags: dict[str, int],
     notif_repo_: NotificationRepository,
-) -> None:
-    notifications = build_notifications(
-        file_id, object_key, tags, notif_repo_.subscribers_for_species
-    )
-    for notification in notifications:
-        notif_repo_.add_notification(notification)
+) -> list[Notification]:
+    created_notifications: list[Notification] = []
+    try:
+        notifications = build_notifications(
+            file_id, object_key, tags, notif_repo_.subscribers_for_species
+        )
+        for notification in notifications:
+            if notif_repo_.add_notification(notification):
+                created_notifications.append(notification)
+    except Exception:
+        for notification in reversed(created_notifications):
+            try:
+                notif_repo_.delete_notification(notification)
+            except Exception:
+                logger.exception(
+                    "notification inbox compensation delete failed",
+                    extra={
+                        "notification_id": notification.notification_id,
+                        "file_id": notification.file_id,
+                    },
+                )
+        raise
+    return created_notifications
 
 
 # ---------------------------------------------------------------------------
@@ -353,9 +427,8 @@ def query_by_tags(
     repo_: FileRepository = Depends(get_repo),
     _user: str = Depends(get_current_user),
 ) -> QueryResponse:
-    records = filter_by_min_counts(repo_.all(), body.tags)
-    keys = to_display_keys(records)
-    return QueryResponse(results=keys, count=len(keys))
+    records = filter_by_min_counts(completed_records(repo_.all()), body.tags)
+    return _query_response(records, _user)
 
 
 @app.post("/query/by-species", response_model=QueryResponse)
@@ -364,9 +437,8 @@ def query_by_species(
     repo_: FileRepository = Depends(get_repo),
     _user: str = Depends(get_current_user),
 ) -> QueryResponse:
-    records = filter_by_species(repo_.all(), body.species)
-    keys = to_display_keys(records)
-    return QueryResponse(results=keys, count=len(keys))
+    records = filter_by_species(completed_records(repo_.all()), body.species)
+    return _query_response(records, _user)
 
 
 @app.get("/query/by-thumbnail")
@@ -374,11 +446,23 @@ def query_by_thumbnail(
     key: str,
     repo_: FileRepository = Depends(get_repo),
     _user: str = Depends(get_current_user),
+    settings_: Settings = Depends(get_settings),
 ) -> dict:
-    record = repo_.by_thumbnail_key(key)
-    if record is None:
-        raise HTTPException(status_code=404, detail="thumbnail key not found")
-    return {"original_key": record.object_key, "file_id": record.file_id}
+    normalised_key = _normalise_media_references([key], [], settings_)[0]
+    record = repo_.by_thumbnail_key(normalised_key)
+    if record is None or record.status != "completed":
+        raise HTTPException(
+            status_code=404,
+            detail={
+                "code": "THUMBNAIL_NOT_FOUND",
+                "message": "thumbnail key not found",
+            },
+        )
+    return {
+        "original_key": record.object_key,
+        "file_id": record.file_id,
+        "item": to_query_items([record], _user)[0].model_dump(),
+    }
 
 
 @app.post("/query/by-file", response_model=QueryResponse)
@@ -409,10 +493,9 @@ async def query_by_file(
         raise HTTPException(status_code=502, detail="tag detection failed") from exc
     tags = _normalise_tags(tags)
     if not tags:
-        return QueryResponse(results=[], count=0)
-    records = filter_by_min_counts(repo_.all(), tags)
-    keys = to_display_keys(records)
-    return QueryResponse(results=keys, count=len(keys))
+        return QueryResponse(results=[], count=0, items=[])
+    records = filter_by_min_counts(completed_records(repo_.all()), tags)
+    return _query_response(records, _user)
 
 
 # ---------------------------------------------------------------------------
@@ -422,21 +505,46 @@ async def query_by_file(
 def edit_tags(
     body: TagEditRequest,
     repo_: FileRepository = Depends(get_repo),
+    notif_repo_: NotificationRepository = Depends(get_notification_repo),
+    publisher_: NotificationPublisher = Depends(get_publisher),
     _user: str = Depends(get_current_user),
+    settings_: Settings = Depends(get_settings),
 ) -> dict:
-    records = repo_.by_keys(body.keys)
+    records = repo_.by_keys(
+        _normalise_media_references(body.keys, body.urls, settings_)
+    )
     if any(record.user_id != _user for record in records):
         raise HTTPException(status_code=403, detail=FORBIDDEN_OWNER_DETAIL)
-    normalised_tags = [_normalise_species(tag) for tag in body.tags]
+    normalised_tags = list(dict.fromkeys(_normalise_species(tag) for tag in body.tags))
     updated = 0
     for record in records:
+        old_tags = dict(record.tags)
         tags = dict(record.tags)
+        activated_tags: dict[str, int] = {}
         for tag in normalised_tags:
             if body.operation == 1:  # add
-                tags[tag] = tags.get(tag, 0) + 1
+                previous_count = tags.get(tag, 0)
+                tags[tag] = previous_count + 1
+                if previous_count <= 0 and tags[tag] > 0:
+                    activated_tags[tag] = tags[tag]
             else:  # remove — ignore tags that aren't present (spec requirement)
                 tags.pop(tag, None)
         repo_.update_tags(record.file_id, tags)
+        if record.status == "completed" and activated_tags:
+            try:
+                created_notifications = _ensure_notification_inbox(
+                    record.file_id, record.object_key, activated_tags, notif_repo_
+                )
+            except Exception:
+                try:
+                    repo_.update_tags(record.file_id, old_tags)
+                except Exception:
+                    logger.exception(
+                        "tag rollback failed after notification inbox persistence error",
+                        extra={"file_id": record.file_id},
+                    )
+                raise
+            _publish_notifications(created_notifications, notif_repo_, publisher_)
         updated += 1
     return {"updated": updated, "matched_keys": [r.object_key for r in records]}
 
@@ -447,8 +555,11 @@ def delete_files(
     repo_: FileRepository = Depends(get_repo),
     storage_: StorageClient = Depends(get_storage),
     _user: str = Depends(get_current_user),
+    settings_: Settings = Depends(get_settings),
 ) -> dict:
-    records = repo_.by_keys(body.keys)
+    records = repo_.by_keys(
+        _normalise_media_references(body.keys, body.urls, settings_)
+    )
     if any(record.user_id != _user for record in records):
         raise HTTPException(status_code=403, detail=FORBIDDEN_OWNER_DETAIL)
     keys_to_delete: list[str] = []
@@ -523,6 +634,42 @@ def list_notifications(
 # ---------------------------------------------------------------------------
 # Internal metadata state machine (Member B -> Member D)
 # ---------------------------------------------------------------------------
+def _is_canonical_archive_key(key: str) -> bool:
+    parts = key.split("/")
+    return (
+        len(parts) >= 3
+        and parts[0] in {"originals", "thumbnails"}
+        and all(part and part not in {".", ".."} and "\\" not in part for part in parts)
+    )
+
+
+@app.post("/internal/assets/authorize")
+def authorize_assets(
+    body: AssetAuthorizationRequest,
+    repo_: FileRepository = Depends(get_repo),
+    _internal_auth: None = Depends(require_internal_api_key),
+) -> dict:
+    keys = list(dict.fromkeys(body.keys))
+    valid_keys = [key for key in keys if len(key.encode("utf-8")) <= 1024 and _is_canonical_archive_key(key)]
+    records_by_key: dict[str, list[FileRecord]] = {key: [] for key in valid_keys}
+    for record in repo_.by_keys(valid_keys):
+        if record.object_key in records_by_key:
+            records_by_key[record.object_key].append(record)
+        if record.thumbnail_key in records_by_key:
+            records_by_key[record.thumbnail_key].append(record)
+    decisions = []
+    for key in keys:
+        if len(key.encode("utf-8")) > 1024 or not _is_canonical_archive_key(key):
+            decisions.append({"key": key, "allowed": False, "code": "FORBIDDEN_KEY"})
+        elif not records_by_key[key]:
+            decisions.append({"key": key, "allowed": False, "code": "NOT_FOUND"})
+        elif any(record.status == "completed" for record in records_by_key[key]):
+            decisions.append({"key": key, "allowed": True})
+        else:
+            decisions.append({"key": key, "allowed": False, "code": "NOT_COMPLETED"})
+    return {"decisions": decisions}
+
+
 @app.post("/internal/uploads/reserve", status_code=201)
 def reserve_upload(
     body: ReserveRequest,

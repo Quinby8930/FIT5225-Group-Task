@@ -7,19 +7,20 @@ async function loadServiceModule() {
 }
 
 
-test('signs each unique user-owned original and thumbnail in first-seen order', async () => {
+test('signs each metadata-authorized completed asset in first-seen order', async () => {
   const { createAssetUrlService } = await loadServiceModule();
   assert.equal(typeof createAssetUrlService, 'function');
 
   const signedKeys = [];
+  const original = 'originals/user-2/file-1/wombat.jpg';
+  const thumbnail = 'thumbnails/user-2/file-1/thumbnail.jpg';
   const service = createAssetUrlService({
+    authorize: async () => [{ key: original, allowed: true }, { key: thumbnail, allowed: true }],
     presignGet: async (key) => {
       signedKeys.push(key);
       return `https://signed.example/${key}`;
     },
   });
-  const original = 'originals/user-1/file-1/wombat.jpg';
-  const thumbnail = 'thumbnails/user-1/file-1/thumbnail.jpg';
 
   const result = await service.createUrlsForUser(
     'user-1',
@@ -40,34 +41,41 @@ test('signs each unique user-owned original and thumbnail in first-seen order', 
         expires_in: 900,
       },
     ],
+    errors: [],
   });
 });
 
 
-test('rejects every request containing a cross-user or internal processing key', async () => {
+test('returns per-key denial and preserves allowed assets when metadata denies a key', async () => {
   const { createAssetUrlService } = await loadServiceModule();
   assert.equal(typeof createAssetUrlService, 'function');
 
-  let signed = false;
+  const signed = [];
   const service = createAssetUrlService({
-    presignGet: async () => {
-      signed = true;
-      return 'https://must-not-be-created.example';
-    },
+    presignGet: async (key) => { signed.push(key); return `https://signed.example/${key}`; },
+    authorize: async (keys) => keys.map((key) => key === 'processing/user-1/file.jpg'
+      ? { key, allowed: false, code: 'FORBIDDEN_KEY' }
+      : { key, allowed: true }),
   });
+  const allowed = 'originals/another-user/file.jpg';
+  const result = await service.createUrlsForUser('user-1', [allowed, 'processing/user-1/file.jpg']);
+  assert.deepEqual(signed, [allowed]);
+  assert.deepEqual(result.errors, [{ key: 'processing/user-1/file.jpg', code: 'FORBIDDEN_KEY' }]);
+});
 
-  for (const key of [
-    'originals/user-2/file-1/wombat.jpg',
-    'thumbnails/user-10/file-1/thumbnail.jpg',
-    'processing/user-1/file-1/frames/frame-000001.jpg',
-    'originals/user-1/',
-  ]) {
-    await assert.rejects(
-      service.createUrlsForUser('user-1', [key]),
-      (error) => error?.code === 'FORBIDDEN_KEY',
-    );
-  }
-  assert.equal(signed, false);
+test('isolates one presigning failure without dropping other authorized assets', async () => {
+  const { createAssetUrlService } = await loadServiceModule();
+  assert.equal(typeof createAssetUrlService, 'function');
+  const ok = 'originals/u/ok.jpg';
+  const broken = 'thumbnails/u/broken.jpg';
+  const service = createAssetUrlService({
+    authorize: async (keys) => keys.map((key) => ({ key, allowed: true })),
+    presignGet: async (key) => { if (key === broken) throw new Error('s3'); return 'https://signed.example/ok'; },
+  });
+  assert.deepEqual(await service.createUrlsForUser('user-1', [ok, broken]), {
+    assets: [{ key: ok, url: 'https://signed.example/ok', expires_in: 900 }],
+    errors: [{ key: broken, code: 'SIGNING_FAILED' }],
+  });
 });
 
 
@@ -77,6 +85,7 @@ test('rejects malformed or oversized batches before signing', async () => {
 
   let signed = false;
   const service = createAssetUrlService({
+    authorize: async () => [],
     presignGet: async () => {
       signed = true;
       return 'https://must-not-be-created.example';

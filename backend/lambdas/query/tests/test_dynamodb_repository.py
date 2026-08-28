@@ -33,6 +33,7 @@ class _PagedTable:
         self.scan_pages = scan_pages or []
         self.query_pages = query_pages or []
         self.updated = None
+        self.deleted = None
         self.scan_calls = []
         self.get_calls = []
         self.put_calls = []
@@ -58,6 +59,9 @@ class _PagedTable:
 
     def put_item(self, **kwargs):
         self.put_calls.append(kwargs)
+
+    def delete_item(self, **kwargs):
+        self.deleted = kwargs
 
 
 class _TransactionClient:
@@ -686,11 +690,42 @@ def test_ensure_notification_does_not_overwrite_existing_delivery_state():
         object_key="originals/u1/f1.jpg",
     )
 
-    repository.add_notification(notification)
+    assert repository.add_notification(notification) is False
 
     assert put_calls[0]["ConditionExpression"] == (
         "attribute_not_exists(notification_id)"
     )
+
+
+def test_add_notification_reports_successful_atomic_create():
+    repository = _notification_repo(_PagedTable(), _PagedTable())
+    notification = Notification(
+        notification_id="created",
+        user_id="u1",
+        file_id="f1",
+        species="wombat",
+        object_key="originals/u1/f1.jpg",
+    )
+
+    assert repository.add_notification(notification) is True
+
+
+def test_delete_notification_uses_full_dynamodb_key():
+    notifications = _PagedTable()
+    repository = _notification_repo(_PagedTable(), notifications)
+    notification = Notification(
+        notification_id="compensated",
+        user_id="u2",
+        file_id="f1",
+        species="wombat",
+        object_key="originals/u1/f1.jpg",
+    )
+
+    repository.delete_notification(notification)
+
+    assert notifications.deleted == {
+        "Key": {"user_id": "u2", "notification_id": "compensated"}
+    }
 
 
 def test_pending_notifications_are_scanned_by_file_and_marked_delivered():

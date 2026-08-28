@@ -44,9 +44,9 @@ Public (Cognito-protected, called by the frontend):
 
 | Method | Path | Purpose |
 |--------|------|---------|
-| POST | `/query/by-tags` | Find files by tags with minimum counts (AND) |
-| POST | `/query/by-species` | Find files containing a species |
-| GET  | `/query/by-thumbnail?key=...` | Map thumbnail key -> full-size object key |
+| POST | `/query/by-tags` | Find completed files by tags with minimum counts (AND) |
+| POST | `/query/by-species` | Find completed files containing a species |
+| GET  | `/query/by-thumbnail?key=...` | Map thumbnail key or trusted S3 HTTPS URL -> full-size object key plus structured `item` metadata |
 | POST | `/query/by-file` | Detect tags on an uploaded file, return matches |
 | POST | `/tags/edit` | Bulk add/remove tags (`operation` 1=add, 0=remove) |
 | POST | `/files/delete` | Bulk delete (database + storage) |
@@ -54,6 +54,14 @@ Public (Cognito-protected, called by the frontend):
 | DELETE | `/notifications/subscribe` | Unsubscribe a user from a species tag |
 | GET  | `/notifications/subscriptions?user_id=...` | List a user's subscriptions |
 | GET  | `/notifications?user_id=...` | List a user's notifications |
+
+Query responses retain the legacy `results` and `count` fields and add `items`.
+Each item contains only `file_id`, `file_type`, `display_key`, `original_key`,
+`thumbnail_key`, `can_preview`, and `can_manage`; `can_manage` is true only
+for the authenticated owner. Tag edit/delete accept legacy `keys` and `urls`;
+either field may be omitted, but at least one reference is required. URLs accept
+only canonical archive keys or trusted HTTPS URLs for `QUERY_INPUT_BUCKET` and
+are normalized before use.
 
 Internal metadata state machine (called by Member B, see
 [`docs/member-b/api-contracts.md`](../../docs/member-b/api-contracts.md)):

@@ -10,6 +10,9 @@ Parameters:
   AllowedOrigin:
     Type: String
     Default: http://localhost:3000
+  PublicAllowedOrigin:
+    Type: String
+    Default: https://quinby8930.github.io
   QueryInputBucketName:
     Type: String
     AllowedPattern: '^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$'
@@ -133,7 +136,7 @@ Resources:
           INTERNAL_API_KEY: !Ref InternalApiKey
           NOTIFICATION_PUBLISHER: sns
           SNS_TOPIC_ARN: !Ref NotificationTopic
-          CORS_ORIGINS: !Ref AllowedOrigin
+          CORS_ORIGINS: !Join [',', [!Ref AllowedOrigin, !Ref PublicAllowedOrigin]]
       Policies:
         - AWSLambdaBasicExecutionRole
         - Statement:
@@ -216,6 +219,9 @@ Resources:
   FailFileRoute:
     Type: AWS::ApiGatewayV2::Route
     Properties: {ApiId: !Ref ExistingHttpApiId, RouteKey: 'PUT /internal/files/{file_id}/failed', AuthorizationType: NONE, Target: !Sub 'integrations/${QueryIntegration}'}
+  AuthorizeAssetsRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties: {ApiId: !Ref ExistingHttpApiId, RouteKey: 'POST /internal/assets/authorize', AuthorizationType: NONE, Target: !Sub 'integrations/${QueryIntegration}'}
 
   QueryByTagsOptionsRoute:
     Type: AWS::ApiGatewayV2::Route
@@ -287,6 +293,9 @@ Resources:
   FailFilePermission:
     Type: AWS::Lambda::Permission
     Properties: {Action: lambda:InvokeFunction, FunctionName: !Ref QueryFunction, Principal: apigateway.amazonaws.com, SourceArn: !Sub 'arn:${AWS::Partition}:execute-api:${AWS::Region}:${AWS::AccountId}:${ExistingHttpApiId}/*/PUT/internal/files/*/failed'}
+  AuthorizeAssetsPermission:
+    Type: AWS::Lambda::Permission
+    Properties: {Action: lambda:InvokeFunction, FunctionName: !Ref QueryFunction, Principal: apigateway.amazonaws.com, SourceArn: !Sub 'arn:${AWS::Partition}:execute-api:${AWS::Region}:${AWS::AccountId}:${ExistingHttpApiId}/*/POST/internal/assets/authorize'}
   QueryByTagsOptionsPermission:
     Type: AWS::Lambda::Permission
     Properties: {Action: lambda:InvokeFunction, FunctionName: !Ref QueryFunction, Principal: apigateway.amazonaws.com, SourceArn: !Sub 'arn:${AWS::Partition}:execute-api:${AWS::Region}:${AWS::AccountId}:${ExistingHttpApiId}/*/OPTIONS/query/by-tags'}

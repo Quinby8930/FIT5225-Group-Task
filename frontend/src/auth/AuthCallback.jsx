@@ -1,5 +1,7 @@
 import React, { useEffect, useRef, useState } from "react";
-import { handleAuthCallback, getCurrentUser } from "./cognitoAuth";
+import { handleAuthCallback, getCurrentUser, signIn } from "./cognitoAuth";
+import { appConfig } from "./cognitoConfig";
+import { postAuthHomePath } from "../lib/appRoutes.mjs";
 
 export default function AuthCallback() {
   const [status, setStatus] = useState("Signing you in...");
@@ -16,8 +18,9 @@ export default function AuthCallback() {
         navigationStarted.current = true;
         setUser(getCurrentUser());
         setStatus("Signed in successfully.");
-        window.history.replaceState({}, document.title, "/");
-        window.setTimeout(() => window.location.assign("/"), 500);
+        const homePath = postAuthHomePath(appConfig);
+        window.history.replaceState({}, document.title, homePath);
+        window.setTimeout(() => window.location.assign(homePath), 500);
       })
       .catch((error) => {
         if (!active) return;
@@ -31,7 +34,8 @@ export default function AuthCallback() {
 
   return (
     <main>
-      <h1>{status}</h1>
+      <h1 role="status" aria-live="polite">{status}</h1>
+      {!user && status !== "Signing you in..." && <button type="button" onClick={signIn}>Sign in again</button>}
       {user && (
         <dl>
           <dt>Email</dt>

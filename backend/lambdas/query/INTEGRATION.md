@@ -202,10 +202,11 @@ POST /query/by-tags
 {"tags": {"dingo": 1, "wombat": 1}}
 ```
 
-响应（图片给缩略图 key，视频给原图 key）：
+响应保留 `results/count`（图片给缩略图 key，视频给原图 key），并新增不含
+owner ID 的 `items`。只有 `status=completed` 的归档记录会出现在查询结果中：
 
 ```json
-{"results": ["thumbnails/u1/a1.jpg", "originals/u1/v1.mp4"], "count": 2}
+{"results":["thumbnails/u1/a1.jpg","originals/u1/v1.mp4"],"count":2,"items":[{"file_id":"f1","file_type":"image","display_key":"thumbnails/u1/a1.jpg","original_key":"originals/u1/a1.jpg","thumbnail_key":"thumbnails/u1/a1.jpg","can_preview":true,"can_manage":true}]}
 ```
 
 ### 5.2 按物种查询（≥1 只）
@@ -223,7 +224,10 @@ POST /query/by-species
 GET /query/by-thumbnail?key=thumbnails%2Fu1%2Fa1.jpg
 ```
 
-响应：`{"original_key": "originals/u1/a1.jpg", "file_id": "f1"}`
+`key` 也可为 `QUERY_INPUT_BUCKET` 的 trusted HTTPS/presigned URL；服务会只解析并
+规范化为 key，不会抓取或记录 URL。非法引用返回 `422 INVALID_MEDIA_REFERENCE`，未找到
+缩略图返回 `404 THUMBNAIL_NOT_FOUND`。成功响应保留 `original_key` 与 `file_id`，并新增完整的安全 `item`（字段同查询 `items`，供前端预览/管理）：
+`{"original_key":"originals/u1/a1.jpg","file_id":"f1","item":{"file_id":"f1","file_type":"image","display_key":"thumbnails/u1/a1.jpg","original_key":"originals/u1/a1.jpg","thumbnail_key":"thumbnails/u1/a1.jpg","can_preview":true,"can_manage":true}}`
 
 ### 5.4 按上传文件查询（不落库）
 
@@ -231,16 +235,17 @@ GET /query/by-thumbnail?key=thumbnails%2Fu1%2Fa1.jpg
 POST /query/by-file        (multipart/form-data, 字段名 file)
 ```
 
-响应：`{"results": [...], "count": N}`。上传的查询文件**不会**被存进数据库。
+响应：`{"results": [...], "count": N, "items": [...]}`。上传的查询文件**不会**被存进数据库。
 
 ### 5.5 批量改标签
 
 ```
 POST /tags/edit
-{"keys": ["originals/u1/a1.jpg"], "tags": ["dingo"], "operation": 1}
+{"keys": ["originals/u1/a1.jpg"], "urls": ["https://bucket.s3.ap-southeast-2.amazonaws.com/originals/u1/a1.jpg?X-Amz-Signature=..."], "tags": ["dingo"], "operation": 1}
 ```
 
-`operation`：`1`=添加，`0`=删除。删除不存在的 tag 会被忽略（不报错）。
+`operation`：`1`=添加，`0`=删除。`keys` 和 `urls` 可单独省略，但不能同时为空；它们会
+规范化、去重后一起匹配。未知但有效的引用仍是 no-op。删除不存在的 tag 会被忽略（不报错）。
 
 响应：`{"updated": 1, "matched_keys": ["originals/u1/a1.jpg"]}`
 
@@ -251,7 +256,7 @@ POST /tags/edit
 
 ```
 POST /files/delete
-{"keys": ["originals/u1/a5.jpg"]}
+{"keys": ["originals/u1/a5.jpg"], "urls": []}
 ```
 
 响应：`{"deleted_db_records": 1, "storage_objects_removed": 2}`

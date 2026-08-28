@@ -42,17 +42,42 @@ test('maps an over-limit file to HTTP 413', async () => {
   assert.equal(response.statusCode, 413); assert.deepEqual(body(response), { code: 'FILE_TOO_LARGE' });
 });
 
-test('maps duplicate reservations and supplies configured CORS headers', async () => {
+test('maps duplicate reservations and echoes an allowed request origin', async () => {
   const duplicate = new Error('duplicate'); duplicate.code = 'DUPLICATE_FILE'; duplicate.existing_file_id = 'existing-file';
   const handler = createHandler({ allowedOrigin: 'https://app.example', createService: () => ({ createUpload: async () => { throw duplicate; } }) });
-  const response = await handler(event());
+  const response = await handler(event({ headers: { origin: 'https://app.example' } }));
   assert.equal(response.statusCode, 409); assert.deepEqual(body(response), { code: 'DUPLICATE_FILE', existing_file_id: 'existing-file' });
   assert.equal(response.headers['Access-Control-Allow-Origin'], 'https://app.example');
 });
 
 test('handles CORS preflight without invoking the service', async () => {
-  const response = await createHandler({ createService: () => { throw new Error('must not be called'); } })(event({ requestContext: {}, requestContext: {}, body: null, version: '2.0', routeKey: 'OPTIONS /upload-url', requestContext: { http: { method: 'OPTIONS' } } }));
+  const response = await createHandler({ createService: () => { throw new Error('must not be called'); } })(event({ headers: { origin: 'http://localhost:3000' }, body: null, version: '2.0', routeKey: 'OPTIONS /upload-url', requestContext: { http: { method: 'OPTIONS' } } }));
   assert.equal(response.statusCode, 204); assert.equal(response.headers['Access-Control-Allow-Origin'], 'http://localhost:3000');
+});
+
+test('echoes only allowlisted local and GitHub Pages origins', async () => {
+  const handler = createHandler({
+    allowedOrigin: 'http://localhost:3000',
+    allowedOrigins: ['http://localhost:3000', 'https://quinby8930.github.io'],
+    createService: () => ({ createUpload: async () => ({ file_id: 'file-1' }) }),
+  });
+
+  for (const origin of ['http://localhost:3000', 'https://quinby8930.github.io']) {
+    const response = await handler(event({ headers: { Origin: origin } }));
+    assert.equal(response.headers['Access-Control-Allow-Origin'], origin);
+  }
+});
+
+test('omits allow-origin for a request origin outside the configured allowlist', async () => {
+  const handler = createHandler({
+    allowedOrigins: ['http://localhost:3000', 'https://quinby8930.github.io'],
+    createService: () => ({ createUpload: async () => ({ file_id: 'file-1' }) }),
+  });
+
+  const response = await handler(event({ headers: { origin: 'https://untrusted.example' } }));
+
+  assert.equal(response.statusCode, 200);
+  assert.equal('Access-Control-Allow-Origin' in response.headers, false);
 });
 
 test('maps unexpected failures to an internal error without exposing details', async () => {

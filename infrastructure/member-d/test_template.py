@@ -15,6 +15,7 @@ class CloudFormationLoader(yaml.SafeLoader):
 INTRINSIC_NAMES = {
     "Equals": "Fn::Equals",
     "GetAtt": "Fn::GetAtt",
+    "Join": "Fn::Join",
     "Not": "Fn::Not",
     "Sub": "Fn::Sub",
 }
@@ -61,6 +62,7 @@ INTERNAL_ROUTES = {
     "POST /internal/files/{file_id}/processing",
     "PUT /internal/files/{file_id}/complete",
     "PUT /internal/files/{file_id}/failed",
+    "POST /internal/assets/authorize",
 }
 OPTIONS_ROUTES = {
     "OPTIONS /query/by-tags",
@@ -92,6 +94,8 @@ def test_template_is_sam_and_requires_external_deployment_values(template):
         "NoEcho": True,
         "MinLength": 1,
     }
+    assert parameters["AllowedOrigin"]["Default"] == "http://localhost:3000"
+    assert parameters["PublicAllowedOrigin"]["Default"] == "https://quinby8930.github.io"
     assert "HTTPS" in parameters["InferenceApiBaseUrl"]["ConstraintDescription"]
     assert parameters["NotificationEmailEndpoint"] == {
         "Type": "String",
@@ -166,7 +170,12 @@ def test_query_function_runtime_handler_and_production_environment(template):
         "INTERNAL_API_KEY": {"Ref": "InternalApiKey"},
         "NOTIFICATION_PUBLISHER": "sns",
         "SNS_TOPIC_ARN": {"Ref": "NotificationTopic"},
-        "CORS_ORIGINS": {"Ref": "AllowedOrigin"},
+        "CORS_ORIGINS": {
+            "Fn::Join": [
+                ",",
+                [{"Ref": "AllowedOrigin"}, {"Ref": "PublicAllowedOrigin"}],
+            ]
+        },
     }
 
 
