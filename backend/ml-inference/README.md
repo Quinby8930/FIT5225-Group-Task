@@ -11,6 +11,7 @@ The service provides:
 - `tags`, `detections`, and model version;
 - `X-Internal-Api-Key` authentication for the internal cross-cloud call;
 - request/file/URL limits, validation, timeouts, structured errors, and logs;
+- HTTPS-only, S3-host allowlisted source downloads with redirects disabled;
 - `/health` and `/ready` deployment probes;
 - configurable model path/version so model upgrades do not require caller code changes;
 - MegaDetector animal detection followed by fine-tuned SpeciesNet classification;
@@ -29,7 +30,7 @@ production inference. The `config/labels.txt` file is included.
 For contract and API development without PyTorch:
 
 ```bash
-cd pacific_bioarchive_ml
+cd backend/ml-inference
 python3 -m venv .venv
 . .venv/bin/activate
 pip install -r requirements-dev.txt
@@ -64,7 +65,9 @@ docker run --rm -p 9000:9000 \
 For Alibaba Cloud Function Compute, use the same Python 3.12 application
 contract or deploy the container image. Store model files in private OSS,
 inject `MODEL_PATH`/`MODEL_VERSION` through the function environment, and put
-`INTERNAL_API_KEY` in the platform secret store.
+`INTERNAL_API_KEY` in the platform secret store. Set `ML_IMAGE` to C's private
+Alibaba Container Registry image before running `s deploy`; do not edit a real
+registry path into `s.yaml`.
 
 ## Verification
 
@@ -73,8 +76,9 @@ pytest -q
 ```
 
 Read `docs/API_CONTRACT.md` before integrating with B. The remaining
-integration work is deployment of the Alibaba endpoint and configuration of
-B's `INFERENCE_API_URL` and matching `INTERNAL_API_KEY`.
+integration work is C's deployment of the Alibaba endpoint and A's
+configuration of the AWS media service `INFERENCE_API_URL` and matching
+`INTERNAL_API_KEY`.
 
 ## AI acknowledgement
 

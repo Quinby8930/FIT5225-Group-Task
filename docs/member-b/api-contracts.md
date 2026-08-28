@@ -4,6 +4,9 @@ These JSON/HTTP boundaries let Member B integrate with Member C and Member D
 without depending on their hosting provider, model implementation, or database.
 All deployed internal HTTP requests use `Content-Type: application/json` and
 send the required non-empty `INTERNAL_API_KEY` as `X-Internal-Api-Key`.
+Member A configures all AWS B/D resources and their environment variables;
+Member C configures only the Alibaba Cloud side. The shared key is handled only
+by A/C through a secure channel and must never be committed to Git or posted in chat.
 `METADATA_API_BASE_URL` and `INFERENCE_API_URL` must be valid HTTPS URLs;
 clients reject plaintext or malformed endpoint configuration before sending a
 request. Authenticated requests do not follow redirects, so the shared key is
@@ -152,8 +155,14 @@ POST {METADATA_API_BASE_URL}/internal/uploads/reserve
 }
 ```
 
-- `201` reserves a unique `(user_id, checksum)` pair.
-- `409` returns `{"existing_file_id":"existing-uuid"}`.
+- `201` returns `{"file_id":"...","object_key":"...","status":"pending_upload",`
+  `"reused":false}` for a new claim. An abandoned `pending_upload` or `failed`
+  claim returns the same shape with the original `file_id/object_key` and
+  `"reused":true`; Member B must pre-sign that returned key.
+- `processing` or `completed` claims return `409`
+  `{"existing_file_id":"existing-uuid"}` (`DUPLICATE_FILE`).
+- A reusable claim whose filename, file type, content type, or size differs
+  returns `409 METADATA_CONFLICT` and is not reset.
 - Other responses are treated as `DEPENDENCY_UNAVAILABLE` by the upload
   boundary.
 - The upload boundary aborts a stalled reservation request after five seconds
@@ -161,11 +170,11 @@ POST {METADATA_API_BASE_URL}/internal/uploads/reserve
 - A `409` duplicate response is read with the same 1 MiB JSON limit and strict
   UTF-8 decoding; oversized or malformed bodies map to `DEPENDENCY_UNAVAILABLE`.
 
-A reservation can be committed as `pending_upload` even if pre-signing fails or
-the response containing the upload URL never reaches the browser. Before live
-integration, Member D and Member B must agree on recovery or cleanup for that
-state. No replay, cancellation, or cleanup endpoint is implemented or assumed
-by this contract.
+A reservation can remain `pending_upload` if pre-signing fails or the response
+never reaches the browser. Repeating the upload request with identical immutable
+metadata reuses its identity and creates a fresh presigned URL. A `failed` row is
+also reset to `pending_upload`. Deleting the file clears its checksum reservation,
+so a later upload can create a new identity.
 
 ### Acquire the processing lease
 
@@ -181,18 +190,23 @@ POST {METADATA_API_BASE_URL}/internal/files/{file_id}/processing
 }
 ```
 
-`200` returns exactly a JSON object containing a Boolean lease decision:
+`200` returns a JSON object containing a Boolean lease decision and, on current
+Member D deployments, a state discriminator:
 
 ```json
-{"should_process": true}
+{"should_process": true, "state": "acquired"}
 ```
 
-`false` means the duplicate or stale event is a successful no-op before S3
-download. Member D must return `false` when the file is already completed. A
-failed or lease-expired interrupted attempt must be re-acquirable with the same
-sequencer; an active attempt must not be granted twice. Transport, non-success,
-invalid UTF-8/JSON, oversized JSON, and malformed responses are retryable
-dependency failures.
+The three valid states are `acquired` with `should_process:true`, `completed`
+with `should_process:false`, and `lease_active` with `should_process:false`.
+`completed` is a successful no-op before S3 download. `lease_active` is a
+retryable processing error, so a concurrent S3 delivery is retried after the
+current lease expires or clears. For backwards compatibility, B also accepts
+the legacy object with only `should_process`: `true` proceeds and `false` is a
+successful no-op. A failed or lease-expired interrupted attempt must be
+re-acquirable with the same sequencer; an active attempt must not be granted
+twice. Transport, non-success, invalid UTF-8/JSON, oversized JSON, and
+malformed responses are retryable dependency failures.
 
 ### Complete processing
 
@@ -217,8 +231,11 @@ Image payload:
 
 For videos, `file_type` is `video` and `thumbnail_key` is `null`. Member D must
 return a successful status with a JSON object, for example `200 {}`. Completion
-is an idempotent PUT: replaying the same completion produces the same completed
-state without duplicated effects.
+is idempotent for metadata and deterministic inbox identity. A completed replay
+publishes only already-persisted pending inbox entries; it does not re-read
+current subscriptions or create historical notifications for late subscribers.
+Delivery is at-least-once, so consumers should dedupe by
+`notification_id` if SNS succeeded before delivery-state persistence failed.
 
 ### Record a bounded processing failure
 
@@ -235,16 +252,16 @@ PUT {METADATA_API_BASE_URL}/internal/files/{file_id}/failed
 }
 ```
 
-The message is truncated to 240 characters. Reportable error codes are
-`INVALID_MEDIA`, `FRAME_EXTRACTION_FAILED`, `INFERENCE_FAILED`,
-`INFERENCE_AUTH_FAILED`, `INFERENCE_REJECTED`, `INFERENCE_UNAVAILABLE`, and
-`PROCESSING_TIME_BUDGET_EXHAUSTED`. B always records the failed transition
-first. A non-retryable error then returns a stable failed result so Lambda does
-not retry a terminal 401/4xx/contract rejection forever. A retryable error
-rethrows only after Member D clears the active lease, permitting the same S3
-event to acquire processing again. Member D must return a successful status
-with a JSON object; failure of that metadata PUT propagates as retryable
-`DEPENDENCY_UNAVAILABLE`. The failure PUT is idempotent for a replayed attempt.
+The message is truncated to 240 characters. B reports every error after it has
+acquired a lease: known `MediaPipelineError` values retain their error code,
+while an unexpected original exception uses the stable `PROCESSING_FAILED`
+code and the bounded generic message. B always attempts the failed transition
+first; an error from that best-effort reporting call never replaces the original
+processing error. A non-retryable media error then returns a stable failed
+result so Lambda does not retry a terminal 401/4xx/contract rejection forever.
+A retryable error rethrows after the failed transition is attempted, permitting
+the same S3 event to acquire processing again. The failure PUT is idempotent
+for a replayed attempt.
 
 ## Member C inference contract
 

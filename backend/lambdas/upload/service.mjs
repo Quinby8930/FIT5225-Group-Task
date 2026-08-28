@@ -6,7 +6,7 @@ export function createUploadService({ createFileId, reserveUpload, presignUpload
       const upload = validateUploadRequest(request, { maxBytes, maxImageBytes });
       const fileId = createFileId();
       const objectKey = `originals/${userId}/${fileId}/${upload.filename}`;
-      await reserveUpload({
+      const reservation = await reserveUpload({
         file_id: fileId,
         user_id: userId,
         checksum: upload.checksumSha256,
@@ -17,15 +17,17 @@ export function createUploadService({ createFileId, reserveUpload, presignUpload
         object_key: objectKey,
         status: 'pending_upload',
       });
+      const reservedFileId = reservation?.file_id ?? fileId;
+      const reservedObjectKey = reservation?.object_key ?? objectKey;
       const uploadUrl = await presignUpload({
-        objectKey,
+        objectKey: reservedObjectKey,
         contentType: upload.contentType,
         checksumSha256: upload.checksumSha256,
         sizeBytes: upload.sizeBytes,
       });
       return {
-        file_id: fileId,
-        object_key: objectKey,
+        file_id: reservedFileId,
+        object_key: reservedObjectKey,
         upload_url: uploadUrl,
         expires_in: expiresIn,
         required_headers: {

@@ -1,6 +1,9 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 
+const API_BASE_URL =
+  "https://2dd2aqb32j.execute-api.ap-southeast-2.amazonaws.com/dev";
+
 function storage() {
   const values = new Map();
   return {
@@ -38,7 +41,7 @@ test("member E browser flow calls the agreed upload, query, edit, delete and not
   globalThis.fetch = async (url, options = {}) => {
     calls.push({ url: String(url), options });
 
-    if (String(url).endsWith("/upload-url")) {
+    if (String(url) === `${API_BASE_URL}/upload-url`) {
       assert.equal(options.headers.Authorization.startsWith("Bearer "), true);
       assert.deepEqual(JSON.parse(options.body), {
         filename: "wombat.jpg",
@@ -66,7 +69,7 @@ test("member E browser flow calls the agreed upload, query, edit, delete and not
       return new Response("", { status: 200 });
     }
 
-    if (String(url).endsWith("/query/by-tags")) {
+    if (String(url) === `${API_BASE_URL}/query/by-tags`) {
       assert.deepEqual(JSON.parse(options.body), { tags: { wombat: 1 } });
       return new Response(
         JSON.stringify({ results: ["thumbnails/user-123/file-1/thumbnail.jpg"], count: 1 }),
@@ -74,7 +77,7 @@ test("member E browser flow calls the agreed upload, query, edit, delete and not
       );
     }
 
-    if (String(url).endsWith("/asset-urls")) {
+    if (String(url) === `${API_BASE_URL}/asset-urls`) {
       assert.equal(options.headers.Authorization.startsWith("Bearer "), true);
       assert.deepEqual(JSON.parse(options.body), {
         keys: ["thumbnails/user-123/file-1/thumbnail.jpg"],
@@ -91,7 +94,7 @@ test("member E browser flow calls the agreed upload, query, edit, delete and not
       );
     }
 
-    if (String(url).endsWith("/tags/edit")) {
+    if (String(url) === `${API_BASE_URL}/tags/edit`) {
       assert.deepEqual(JSON.parse(options.body), {
         keys: ["originals/user-123/file-1/wombat.jpg"],
         tags: ["wombat"],
@@ -100,7 +103,7 @@ test("member E browser flow calls the agreed upload, query, edit, delete and not
       return new Response(JSON.stringify({ updated: 1 }), { status: 200 });
     }
 
-    if (String(url).endsWith("/files/delete")) {
+    if (String(url) === `${API_BASE_URL}/files/delete`) {
       assert.deepEqual(JSON.parse(options.body), {
         keys: ["originals/user-123/file-1/wombat.jpg"],
       });
@@ -110,7 +113,7 @@ test("member E browser flow calls the agreed upload, query, edit, delete and not
       );
     }
 
-    if (String(url).endsWith("/notifications/subscribe") && options.method === "POST") {
+    if (String(url) === `${API_BASE_URL}/notifications/subscribe` && options.method === "POST") {
       assert.deepEqual(JSON.parse(options.body), {
         species: "wombat",
       });
@@ -120,18 +123,18 @@ test("member E browser flow calls the agreed upload, query, edit, delete and not
       );
     }
 
-    if (String(url).endsWith("/notifications/subscribe?species=wombat")) {
+    if (String(url) === `${API_BASE_URL}/notifications/subscribe?species=wombat`) {
       assert.equal(options.method, "DELETE");
       assert.equal(String(url).includes("user_id"), false);
       return new Response(JSON.stringify({ species: "wombat", subscribed: false }), { status: 200 });
     }
 
-    if (String(url).endsWith("/notifications/subscriptions")) {
+    if (String(url) === `${API_BASE_URL}/notifications/subscriptions`) {
       assert.equal(String(url).includes("user_id"), false);
       return new Response(JSON.stringify({ species: ["wombat"] }), { status: 200 });
     }
 
-    if (String(url).endsWith("/notifications")) {
+    if (String(url) === `${API_BASE_URL}/notifications`) {
       assert.equal(String(url).includes("user_id"), false);
       return new Response(JSON.stringify({ notifications: [] }), { status: 200 });
     }
@@ -180,4 +183,19 @@ test("member E browser flow calls the agreed upload, query, edit, delete and not
   assert.deepEqual(await mediaApi.listSubscriptions(), { species: ["wombat"] });
   assert.deepEqual(await mediaApi.listNotifications(), { notifications: [] });
   assert.equal(calls.length, 10);
+  assert.deepEqual(
+    calls.map(({ url }) => url),
+    [
+      `${API_BASE_URL}/upload-url`,
+      "https://upload.example.test/presigned",
+      `${API_BASE_URL}/query/by-tags`,
+      `${API_BASE_URL}/asset-urls`,
+      `${API_BASE_URL}/tags/edit`,
+      `${API_BASE_URL}/files/delete`,
+      `${API_BASE_URL}/notifications/subscribe`,
+      `${API_BASE_URL}/notifications/subscribe?species=wombat`,
+      `${API_BASE_URL}/notifications/subscriptions`,
+      `${API_BASE_URL}/notifications`,
+    ]
+  );
 });

@@ -12,16 +12,9 @@ from .video_processor import (
 
 IMAGE_CONTENT_TYPES = {"image/jpeg", "image/png", "image/webp"}
 VIDEO_CONTENT_TYPES = {"video/mp4", "video/quicktime"}
-REPORTABLE_FAILURES = {
-    "INVALID_MEDIA",
-    "FRAME_EXTRACTION_FAILED",
-    "INFERENCE_AUTH_FAILED",
-    "INFERENCE_FAILED",
-    "INFERENCE_REJECTED",
-    "INFERENCE_UNAVAILABLE",
-    "PROCESSING_TIME_BUDGET_EXHAUSTED",
-}
 FINALIZATION_RESERVE_MILLIS = 180_000
+UNEXPECTED_PROCESSING_FAILURE_CODE = "PROCESSING_FAILED"
+UNEXPECTED_PROCESSING_FAILURE_MESSAGE = "Media processing failed unexpectedly"
 
 
 def _time_budget_error():
@@ -76,7 +69,9 @@ class MediaPipeline:
             "object_key": record.key,
             "sequencer": record.sequencer,
         }
-        if not self.metadata.begin_processing(record.file_id, lease_payload):
+        if self._skip_or_retry_processing_lease(
+            self.metadata.begin_processing(record.file_id, lease_payload)
+        ):
             return {"status": "skipped", "file_id": record.file_id}
 
         try:
@@ -112,24 +107,77 @@ class MediaPipeline:
                 }
                 self.metadata.complete(record.file_id, completion)
             return {"status": "completed", "file_id": record.file_id}
-        except MediaPipelineError as error:
-            if error.code in REPORTABLE_FAILURES:
+        except Exception as error:
+            if isinstance(error, MediaPipelineError):
+                error_code = error.code
+                message = error.message[:240]
+                retryable = error.retryable
+            else:
+                error_code = UNEXPECTED_PROCESSING_FAILURE_CODE
+                message = UNEXPECTED_PROCESSING_FAILURE_MESSAGE
+                retryable = True
+            failure_recorded = False
+            try:
                 self.metadata.fail(
                     record.file_id,
                     {
                         "user_id": record.user_id,
-                        "error_code": error.code,
-                        "message": error.message[:240],
+                        "error_code": error_code,
+                        "message": message,
                         "status": "failed",
                     },
                 )
-                if not error.retryable:
-                    return {
-                        "status": "failed",
-                        "file_id": record.file_id,
-                        "error_code": error.code,
-                    }
+                failure_recorded = True
+            except Exception:
+                pass
+            if (
+                isinstance(error, MediaPipelineError)
+                and not retryable
+                and failure_recorded
+            ):
+                return {
+                    "status": "failed",
+                    "file_id": record.file_id,
+                    "error_code": error_code,
+                }
             raise
+
+    @staticmethod
+    def _skip_or_retry_processing_lease(lease_response):
+        if type(lease_response) is bool:
+            return not lease_response
+        if not isinstance(lease_response, dict):
+            raise MediaPipelineError(
+                "DEPENDENCY_UNAVAILABLE",
+                "Metadata response did not match its contract",
+                retryable=True,
+            )
+
+        should_process = lease_response.get("should_process")
+        state = lease_response.get("state")
+        if type(should_process) is not bool:
+            raise MediaPipelineError(
+                "DEPENDENCY_UNAVAILABLE",
+                "Metadata response did not match its contract",
+                retryable=True,
+            )
+        if state is None:
+            return not should_process
+        if state == "completed" and not should_process:
+            return True
+        if state == "lease_active" and not should_process:
+            raise MediaPipelineError(
+                "PROCESSING_LEASE_ACTIVE",
+                "Processing lease is active",
+                retryable=True,
+            )
+        if state == "acquired" and should_process:
+            return False
+        raise MediaPipelineError(
+            "DEPENDENCY_UNAVAILABLE",
+            "Metadata response did not match its contract",
+            retryable=True,
+        )
 
     @staticmethod
     def _media_type(content_type):
@@ -169,6 +217,7 @@ class MediaPipeline:
         get_remaining_time_in_millis,
     ):
         uploaded_keys = []
+        primary_error = None
         try:
             remaining = _require_finalization_reserve(get_remaining_time_in_millis)
             extraction_timeout = DEFAULT_FFMPEG_TIMEOUT_SECONDS
@@ -200,6 +249,13 @@ class MediaPipeline:
                 }
             )
             return None, result
+        except Exception as error:
+            primary_error = error
+            raise
         finally:
             if uploaded_keys:
-                self.storage.delete(record.bucket, uploaded_keys)
+                try:
+                    self.storage.delete(record.bucket, uploaded_keys)
+                except Exception:
+                    if primary_error is None:
+                        raise

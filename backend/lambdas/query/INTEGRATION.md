@@ -12,7 +12,8 @@
 | **B (上传/存储)** | 写库（reserve/complete 状态机）+ 删 storage | §3 数据 schema + §4.2 + §5.7 |
 | **A (认证)** | 保护所有公开端点 | §4.3 |
 | **E (前端)** | 调用查询/编辑/订阅/通知 API | §5 API 契约（含 §5.8 订阅通知） |
-| **E (通知体验)** | 实现通知投递（SNS/邮件/推送） | §4.4 NotificationPublisher |
+| **D (通知服务)** | 已实现 Dynamo inbox + SNS publisher | §4.4 NotificationPublisher |
+| **E (通知体验)** | 实现前端/站内通知体验 | §5.8 订阅通知 API |
 
 ---
 
@@ -102,6 +103,7 @@ mapper.common_name("Canis_familiaris")   # -> "dingo"
 | `species` | string | 命中的物种 |
 | `object_key` | string | 该文件原图 key |
 | `created_at` | string | ISO-8601 |
+| `delivery_status` | string | 内部 outbox 状态：`pending` / `delivered`（公开响应不暴露） |
 
 ---
 
@@ -137,7 +139,9 @@ adapter 失败返回稳定的 502 且保留 metadata；未配置返回 503。stu
 内部状态机端点（§5.7）由成员 B 的 Lambda 调用，并统一要求
 `X-Internal-Api-Key`。D 的环境变量 `INTERNAL_API_KEY` 未设置/为空时返回 `503`；
 其 `detail.code` 为 `INTERNAL_AUTH_NOT_CONFIGURED`。header 缺失或不匹配时返回
-`401`，其 `detail.code` 为 `INVALID_INTERNAL_API_KEY`。B 和 D 必须配置相同的非空 secret。
+`401`，其 `detail.code` 为 `INVALID_INTERNAL_API_KEY`。所有 AWS B/D Lambda 资源与环境变量
+由成员 A 操作；共享 secret 仅由 A 与负责阿里云部署的 C 通过安全渠道配置，B/D 不自行
+配置。secret 不得提交 Git、写入文档或发送到群聊。
 
 真实 Cognito 配置（成员 A 提供，已写进 `examples/cognito_auth_example.py`）：
 
@@ -158,19 +162,13 @@ adapter 失败返回稳定的 502 且保留 metadata；未配置返回 503。stu
 接好后：未登录请求自动 401，且 `sub` 会一路流到 `FileRecord.user_id`。
 **成员 B 写库时 `user_id` 必须用 `claims.sub`，不是 email。**
 
-### 4.4 成员 E — `NotificationPublisher`（通知投递）
+### 4.4 成员 D — `NotificationPublisher`（通知投递）
 
 接口：`app/notification_client.py`，方法 `publish(notification) -> None`。
 
-作用：新文件 `complete` 时，Member D 的触发器会匹配所有订阅并写一条通知记录，
-然后调 `publisher.publish(notification)` 真正送达用户。**投递通道（SNS / 邮件 /
-推送 / 站内 UI）由成员 E 实现**，D 只负责「触发」+「持久化」+「查询」。接好后改
-`app/main.py` 一行：
-
-```python
-from examples.sns_notification_example import SNSNotificationPublisher
-publisher: NotificationPublisher = SNSNotificationPublisher()
-```
+作用：新文件 `complete` 时，Member D 先用 `(file_id,user_id,species)` 确定性 ID
+幂等 ensure pending inbox，再标记 file completed，最后调用 publisher。SAM 已将生产
+publisher 接到单一 SNS Topic；成员 E 在此之上负责前端/站内通知体验。
 
 通知数据模型见 §3.1，订阅/通知端点见 §5.8。
 
@@ -278,8 +276,15 @@ POST /internal/uploads/reserve
  "status": "pending_upload"}
 ```
 
-- `201` → 预约成功，落一条 `pending_upload` 记录。
-- `409` → `(user_id, checksum)` 已存在，返回 `{"existing_file_id": "<uuid>"}`。
+- 新预约 `201` → 返回 `file_id/object_key/status/reused=false`。
+- 旧状态为 `pending_upload` / `failed` 且不可变元数据一致 → `201` 返回旧
+  `file_id/object_key`、`reused=true`，供成员 B 重新 presign；failed 重置为 pending。
+- 旧状态为 `processing` / `completed` → `409` + `existing_file_id`。
+- filename/type/content-type/size 不一致 → `409 METADATA_CONFLICT`。
+- DynamoDB 用 reservation table + transaction 保证并发唯一；删除文件同时释放 claim。
+- 对已有 FilesTable，成员 A 必须暂停所有 Files/Reservations mutation（reserve、
+  processing/complete/failed 回调和 delete）并用 `migrate_reservations.py` 执行
+  verify → backfill → verify；运行时强一致 fallback transaction 只是 fail-closed 保护。
 
 **② 获取处理租约（processing）**
 
@@ -288,8 +293,9 @@ POST /internal/files/{file_id}/processing
 {"user_id": "<sub>", "object_key": "originals/.../wombat.jpg", "sequencer": "<S3事件序列号>"}
 ```
 
-- `200 {"should_process": true}` → 可以处理（刚预约 / 上次失败 / 租约已过期）。
-- `200 {"should_process": false}` → 已完成，或已有活跃租约（不重复处理）。
+- `200 {"should_process": true, "state": "acquired"}` → 原子取得租约。
+- `200 {"should_process": false, "state": "completed"}` → 已完成。
+- `200 {"should_process": false, "state": "lease_active"}` → 已有活跃租约。
 - 租约窗口 900 秒（对应成员 B 处理 Lambda 的 900s 超时）。
 - `user_id` 或 `object_key` 与 reserve 记录不一致 → `409 METADATA_CONFLICT`，状态不变。
 
@@ -360,7 +366,11 @@ GET /notifications
 
 **触发时机**：当成员 B 对某个文件调用 `complete`（§5.7③）且该文件的 `tags` 里有
 数量 ≥1 的物种时，Member D 会为**每个订阅了该物种的用户**写一条通知并调
-`NotificationPublisher.publish` 投递（§4.4）。完成是幂等的，所以重放不会重复通知。
+`NotificationPublisher.publish` 投递（§4.4）。inbox 在 completed 前 ensure，故
+mark_completed 失败时允许短暂 pre-completion pending；重试使用确定性 ID。completed
+重放只 publish 已存在的 pending inbox，不重新读取当前订阅，也不给晚订阅者补发历史
+通知。没有周期 worker/DLQ，恢复依赖自动/人工重放；投递为 at-least-once，SNS 成功但
+delivered 更新失败时可能重复。
 订阅/取消订阅的 `species` 也会在持久化前统一映射为团队短名。
 
 ---

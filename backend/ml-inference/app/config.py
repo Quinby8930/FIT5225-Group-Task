@@ -16,6 +16,23 @@ def _positive_int(name: str, default: int) -> int:
     return value
 
 
+def _source_hosts() -> tuple[str, ...]:
+    raw = os.getenv(
+        "ALLOWED_SOURCE_HOSTS",
+        "s3.amazonaws.com,s3.ap-southeast-2.amazonaws.com",
+    )
+    hosts = tuple(
+        dict.fromkeys(
+            host.strip().lower().rstrip(".")
+            for host in raw.split(",")
+            if host.strip()
+        )
+    )
+    if not hosts:
+        raise ValueError("ALLOWED_SOURCE_HOSTS must contain at least one host")
+    return hosts
+
+
 @dataclass(frozen=True)
 class Settings:
     model_version: str
@@ -32,6 +49,10 @@ class Settings:
     allow_remote_urls: bool
     remote_url_timeout_seconds: int
     allow_unauthenticated_inference: bool = False
+    allowed_source_hosts: tuple[str, ...] = (
+        "s3.amazonaws.com",
+        "s3.ap-southeast-2.amazonaws.com",
+    )
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -66,4 +87,5 @@ class Settings:
                 "ALLOW_UNAUTHENTICATED_INFERENCE", "false"
             ).lower()
             in {"1", "true", "yes"},
+            allowed_source_hosts=_source_hosts(),
         )

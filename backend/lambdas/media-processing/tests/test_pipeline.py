@@ -141,6 +141,7 @@ class FakeMetadata:
         self.should_process = should_process
         self.completed = []
         self.failed = []
+        self.complete_error = None
         self.fail_error = None
 
     def begin_processing(self, file_id, payload):
@@ -151,6 +152,8 @@ class FakeMetadata:
     def complete(self, file_id, payload):
         self.order.append("complete")
         self.completed.append((file_id, payload))
+        if self.complete_error:
+            raise self.complete_error
 
     def fail(self, file_id, payload):
         self.order.append("fail")
@@ -260,6 +263,34 @@ def test_duplicate_event_stops_before_any_s3_access():
             "sequencer": "abc123",
         },
     )
+
+
+def test_completed_processing_state_stops_before_any_s3_access():
+    pipeline, storage, metadata, inference, order = make_pipeline(
+        should_process={"should_process": False, "state": "completed"}
+    )
+
+    result = pipeline.process_record(s3_record())
+
+    assert result == {"status": "skipped", "file_id": "file-1"}
+    assert order == ["begin"]
+    assert storage.downloads == []
+    assert inference.calls == []
+
+
+def test_active_processing_lease_raises_a_retryable_error_before_s3_access():
+    pipeline, storage, metadata, inference, order = make_pipeline(
+        should_process={"should_process": False, "state": "lease_active"}
+    )
+
+    with pytest.raises(MediaPipelineError) as caught:
+        pipeline.process_record(s3_record())
+
+    assert caught.value.code == "PROCESSING_LEASE_ACTIVE"
+    assert caught.value.retryable is True
+    assert order == ["begin"]
+    assert storage.downloads == []
+    assert inference.calls == []
 
 
 def test_image_pipeline_stores_deterministic_thumbnail_and_serializes_completion():
@@ -480,9 +511,11 @@ def test_unsupported_content_type_records_invalid_media_without_downloading():
     assert metadata.failed[0][1]["error_code"] == "INVALID_MEDIA"
 
 
-def test_metadata_failure_while_recording_media_error_is_not_swallowed():
+def test_failure_reporting_does_not_replace_the_original_media_error():
     pipeline, _, metadata, inference, _ = make_pipeline()
-    inference.error = MediaPipelineError("INFERENCE_FAILED", "inference unavailable")
+    inference.error = MediaPipelineError(
+        "INFERENCE_FAILED", "inference unavailable", retryable=True
+    )
     metadata.fail_error = MediaPipelineError(
         "DEPENDENCY_UNAVAILABLE", "metadata unavailable", retryable=True
     )
@@ -490,4 +523,112 @@ def test_metadata_failure_while_recording_media_error_is_not_swallowed():
     with pytest.raises(MediaPipelineError) as caught:
         pipeline.process_record(s3_record())
 
+    assert caught.value.code == "INFERENCE_FAILED"
+
+
+def test_terminal_error_rethrows_when_failure_reporting_cannot_clear_lease():
+    pipeline, _, metadata, inference, order = make_pipeline()
+    inference.error = MediaPipelineError(
+        "INFERENCE_REJECTED", "terminal inference rejection", retryable=False
+    )
+    metadata.fail_error = MediaPipelineError(
+        "DEPENDENCY_UNAVAILABLE", "metadata unavailable", retryable=True
+    )
+
+    with pytest.raises(MediaPipelineError) as caught:
+        pipeline.process_record(s3_record())
+
+    assert caught.value.code == "INFERENCE_REJECTED"
+    assert caught.value.retryable is False
+    assert order[-1] == "fail"
+
+
+def test_original_os_error_releases_lease_with_a_bounded_generic_failure():
+    pipeline, storage, metadata, _, order = make_pipeline()
+
+    def raise_os_error(bucket, key, destination):
+        raise OSError("source media disappeared")
+
+    storage.download = raise_os_error
+
+    with pytest.raises(OSError, match="source media disappeared"):
+        pipeline.process_record(s3_record())
+
+    assert order == ["begin", "content_type", "fail"]
+    assert metadata.failed == [
+        (
+            "file-1",
+            {
+                "user_id": "user-1",
+                "error_code": "PROCESSING_FAILED",
+                "message": "Media processing failed unexpectedly",
+                "status": "failed",
+            },
+        )
+    ]
+
+
+def test_storage_delete_error_releases_lease_and_remains_the_primary_error():
+    pipeline, storage, metadata, _, _ = make_pipeline(content_type="video/mp4")
+    storage.delete = lambda bucket, keys: (_ for _ in ()).throw(
+        MediaPipelineError("STORAGE_DELETE_FAILED", "delete failed", retryable=True)
+    )
+
+    with pytest.raises(MediaPipelineError) as caught:
+        pipeline.process_record(s3_record("wombat.mp4"))
+
+    assert caught.value.code == "STORAGE_DELETE_FAILED"
+    assert metadata.failed[0][1]["error_code"] == "STORAGE_DELETE_FAILED"
+
+
+def test_video_cleanup_failure_reports_the_original_terminal_inference_error():
+    pipeline, storage, metadata, inference, _ = make_pipeline(content_type="video/mp4")
+    inference.error = MediaPipelineError(
+        "INFERENCE_AUTH_FAILED", "inference authentication failed", retryable=False
+    )
+    storage.delete = lambda bucket, keys: (_ for _ in ()).throw(
+        MediaPipelineError("STORAGE_DELETE_FAILED", "delete failed", retryable=True)
+    )
+
+    result = pipeline.process_record(s3_record("wombat.mp4"))
+
+    assert result == {
+        "status": "failed",
+        "file_id": "file-1",
+        "error_code": "INFERENCE_AUTH_FAILED",
+    }
+    assert metadata.failed[0][1]["error_code"] == "INFERENCE_AUTH_FAILED"
+
+
+def test_video_cleanup_failure_rethrows_the_original_retryable_inference_error():
+    pipeline, storage, metadata, inference, _ = make_pipeline(content_type="video/mp4")
+    inference.error = MediaPipelineError(
+        "INFERENCE_UNAVAILABLE", "inference unavailable", retryable=True
+    )
+    storage.delete = lambda bucket, keys: (_ for _ in ()).throw(
+        MediaPipelineError("STORAGE_DELETE_FAILED", "delete failed", retryable=True)
+    )
+
+    with pytest.raises(MediaPipelineError) as caught:
+        pipeline.process_record(s3_record("wombat.mp4"))
+
+    assert caught.value.code == "INFERENCE_UNAVAILABLE"
+    assert caught.value.retryable is True
+    assert metadata.failed[0][1]["error_code"] == "INFERENCE_UNAVAILABLE"
+
+
+def test_completion_dependency_error_releases_lease_and_remains_primary_error():
+    pipeline, _, metadata, _, order = make_pipeline()
+    metadata.complete_error = MediaPipelineError(
+        "DEPENDENCY_UNAVAILABLE", "complete request failed", retryable=True
+    )
+    metadata.fail_error = MediaPipelineError(
+        "DEPENDENCY_UNAVAILABLE", "failed request failed", retryable=True
+    )
+
+    with pytest.raises(MediaPipelineError) as caught:
+        pipeline.process_record(s3_record())
+
     assert caught.value.code == "DEPENDENCY_UNAVAILABLE"
+    assert order[-2:] == ["complete", "fail"]
+    assert metadata.failed[0][1]["error_code"] == "DEPENDENCY_UNAVAILABLE"

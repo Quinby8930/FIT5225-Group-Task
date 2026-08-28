@@ -4,7 +4,7 @@ access: default
 
 vars:
   region: ap-southeast-1
-  image: registry.example.com/pacific-bioarchive/ml-inference:v1
+  image: ${env(ML_IMAGE)}
 
 resources:
   ml_inference:
@@ -38,6 +38,8 @@ resources:
         MAX_DETECTIONS: "1000"
         MAX_SOURCE_URLS: "900"
         MAX_REQUEST_BYTES: "26214400"
+        REMOTE_URL_TIMEOUT_SECONDS: "20"
+        ALLOWED_SOURCE_HOSTS: s3.amazonaws.com,s3.ap-southeast-2.amazonaws.com
         INTERNAL_API_KEY: ${env(INTERNAL_API_KEY)}
         ALLOW_UNAUTHENTICATED_INFERENCE: "false"
       triggers:

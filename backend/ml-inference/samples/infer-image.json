@@ -2,6 +2,6 @@
   "file_id": "11111111-2222-4333-8444-555555555555",
   "media_type": "image",
   "image_urls": [
-    "https://temporary-original-url.example/image.jpg"
+    "https://example-bucket.s3.ap-southeast-2.amazonaws.com/uploads/image.jpg?X-Amz-Signature=replace-with-a-real-presigned-url"
   ]
 }

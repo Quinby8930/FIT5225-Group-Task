@@ -69,23 +69,25 @@ Member B's ingestion boundary drives a four-step lifecycle over HTTP (defined in
 
 ### Subscription & notification trigger
 
-Member D owns the subscription data model and the notification *trigger* (the
-doc's 「通知触发」); Member E owns the delivery UX. A user subscribes to a species
+Member D owns the subscription data model, notification *trigger*, Dynamo inbox,
+and SNS publisher; Member E owns the frontend/in-app UX. A user subscribes to a species
 short name; when a newly completed file's `tags` contain that species (`count >= 1`),
 the trigger writes a `Notification` record and hands it to a `NotificationPublisher`.
 
 - `subscriptions` table — `(user_id, species)`, idempotent subscribe/unsubscribe.
 - `notifications` table — one row per (subscribed user, matched species), pointing
   at the triggering file.
-- Trigger is wired into `complete` only, so the idempotent-complete guarantee
-  means a replayed completion cannot produce duplicate notifications.
-- `NotificationPublisher` is an integration slot (like `StorageClient`/`TagDetector`)
-  for Member E's real SNS/email/push delivery.
+- Initial `complete` deterministically ensures inbox rows before the completed
+  transition. A completed replay only retries existing pending rows and does
+  not create historical notifications for late subscribers.
+- The production `NotificationPublisher` is the included SNS implementation;
+  Member E consumes the notification API for the UI.
 
 ### Cross-module boundaries
 
 - **ML (C):** `TagDetector` interface; C provides a MegaDetector + SpeciesNet adapter.
 - **Storage (B):** `StorageClient` interface; B provides the guarded storage-delete
   Lambda (deletes S3 keys, enforced per-owner via `delete(user_id, keys)`).
-- **Notifications (E):** `NotificationPublisher` interface; E provides delivery.
+- **Notifications (D/E):** D provides Dynamo inbox + SNS publishing; E provides
+  frontend/in-app notification experience.
 - **Auth (A):** `get_current_user` dependency already applied to every public route.

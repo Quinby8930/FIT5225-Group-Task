@@ -93,8 +93,8 @@ class QueryResponse(BaseModel):
 
 
 # ---------------------------------------------------------------------------
-# Subscription & notification (Member D owns the data model + trigger;
-# Member E owns the delivery/UX on top of these endpoints)
+# Subscription & notification (Member D owns data, trigger, and SNS publisher;
+# Member E owns the frontend/in-app UX on top of these endpoints)
 # ---------------------------------------------------------------------------
 class SubscribeRequest(BaseModel):
     """Subscribe (or unsubscribe) a user to a species tag.
@@ -118,8 +118,8 @@ class SubscriptionListResponse(BaseModel):
 
 class Notification(BaseModel):
     """One notification produced by the trigger when a completed file's tags
-    match a subscription. The delivery channel (SNS/email/UI) is Member E's
-    concern; this is the durable record the trigger writes."""
+    match a subscription. Member D persists this inbox row and publishes it to
+    SNS; Member E presents it through the frontend/in-app experience."""
 
     notification_id: str
     user_id: str

@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import { ApiError, apiRequest, isDuplicateFileError } from "./apiClient.js";
+import * as cognitoConfig from "../auth/cognitoConfig.js";
 
 function storage() {
   const values = new Map();
@@ -92,4 +93,30 @@ test("duplicate upload decisions use the structured backend code only", () => {
     payload: { code: "DUPLICATE_FILE" },
   })), true);
   assert.equal(isDuplicateFileError(new Error("DUPLICATE_FILE appeared in prose")), false);
+});
+
+test("configured API bases remove trailing slashes before paths are appended", () => {
+  assert.equal(typeof cognitoConfig.normalizeApiBaseUrl, "function");
+  assert.equal(
+    cognitoConfig.normalizeApiBaseUrl(
+      "https://2dd2aqb32j.execute-api.ap-southeast-2.amazonaws.com/dev///"
+    ),
+    "https://2dd2aqb32j.execute-api.ap-southeast-2.amazonaws.com/dev"
+  );
+});
+
+test("default API requests use the complete dev-stage cloud URL", async () => {
+  installStorage();
+  let requestedUrl = null;
+  globalThis.fetch = async (url) => {
+    requestedUrl = String(url);
+    return new Response(JSON.stringify({ ok: true }), { status: 200 });
+  };
+
+  await apiRequest("/stage-contract");
+
+  assert.equal(
+    requestedUrl,
+    "https://2dd2aqb32j.execute-api.ap-southeast-2.amazonaws.com/dev/stage-contract"
+  );
 });

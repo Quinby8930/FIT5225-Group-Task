@@ -16,14 +16,16 @@ C owns a standalone HTTPS inference service with:
 
 ## What B must confirm before integration
 
-1. B will provide short-lived HTTPS URLs in `image_urls`.
+1. The B media service will provide short-lived AWS S3 HTTPS URLs in
+   `image_urls`; C rejects other hosts and redirects by default.
 2. B will extract video frames at one frame per second.
 3. B sends `file_id`, `media_type` (`image` or `video`), and `image_urls`
    exactly as specified in `docs/API_CONTRACT.md`.
 4. B will store `tags`, `detections`, and `model_version` through D's metadata
    API.
-5. B will agree on the internal secret delivery mechanism. The secret is
-   required in production, configuration-only, and must not be committed.
+5. A and C will configure the same internal secret in AWS and Alibaba Cloud.
+   It is required in production, configuration-only, and must not be
+   committed or posted in group chat.
 
 C returns `503` if its server key is absent and `401` if B omits or supplies
 the wrong key. Unauthenticated local testing requires the explicit
@@ -36,17 +38,21 @@ are `false`. Health and readiness routes remain public.
   uploads keep B's separate 262,144,000-byte cap.
 - C accepts at most 900 source URLs and returns at most 1,000 detections.
 - C's application deadline is 45 seconds, its Function Compute timeout is 60
-  seconds, and B's inference HTTP timeout is 70 seconds.
+  seconds, and B's inference HTTP timeout is 70 seconds. C also caps each
+  source socket timeout to the remaining application deadline.
 - C returns HTTP `422` with `detection_limit_exceeded` instead of a partial
   response when prediction 1,001 would be added, and returns HTTP `504` when
   the application deadline is crossed.
+- C returns `503`/`504` for temporary source download failures so the B media
+  service retries them; invalid/disallowed source input remains `422`.
 - B treats C `401` as non-retryable `INFERENCE_AUTH_FAILED`, other C 4xx
   responses as non-retryable `INFERENCE_REJECTED`, and C 5xx/504 or transport
   failures as retryable `INFERENCE_UNAVAILABLE`.
 
-The local service and real supplied models have already been tested. The only
-remaining C/B work is to replace the local endpoint with the deployed Alibaba
-Cloud HTTPS URL and confirm the exact signed-URL lifetime and request timeout.
+The local service and real supplied models have already been tested. The
+remaining deployment work is for C to publish the updated Alibaba image and
+for A to configure its HTTPS endpoint, matching secret, signed-URL lifetime,
+and request timeout in AWS.
 
 ## Integration smoke test
 

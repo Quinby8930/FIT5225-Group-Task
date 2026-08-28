@@ -62,24 +62,29 @@ parameter values; do not replace the parameters with guessed or fake endpoints.
 
 Before live integration, agree with Member D on recovery or cleanup for a
 committed `pending_upload` reservation when pre-signing fails or the browser
-never receives the URL. Also confirm the lease semantics: completed files
-return `should_process:false`, failed or expired interrupted work is
-re-acquirable with the same sequencer, and completion/failure PUTs are
-idempotent. In particular, `PROCESSING_TIME_BUDGET_EXHAUSTED` must clear the
-lease through the existing failed transition so the Lambda retry is not
-mistaken for a completed duplicate. Do not invent a replay or lease-token
-endpoint to fill this gate.
+never receives the URL. Also confirm the lease response state: `acquired`
+returns `should_process:true`, `completed` returns `should_process:false` and
+is a successful no-op, and `lease_active` returns `should_process:false` but
+must be retried rather than treated as a completed duplicate. Failed or expired
+interrupted work is re-acquirable with the same sequencer, and completion/failure
+PUTs are idempotent. Any post-acquisition processing error must make a
+best-effort failed transition so the lease is released; a failure to report it
+must not replace the original processing error. Do not invent a replay or
+lease-token endpoint to fill this gate.
 
-Obtain the team's non-empty shared internal API key and pass the same value to
-Members B, C, and D using the course-approved secret workflow. Do not put the
+Obtain the team's non-empty shared internal API key through the course-approved
+secret workflow for only Member A's AWS deployment and Member C's Alibaba Cloud
+service. Member A configures the AWS services owned by B and D; Member C
+configures the Alibaba Cloud inference service. No team member may put the
 value in Git, documentation, screenshots, chat, or a saved command line.
 
 ### 4. Provide the FFmpeg Lambda layer
 
-Obtain or build an approved layer compatible with the processing function's
-Python 3.12 Lambda environment and architecture. It must expose an executable
-at exactly `/opt/bin/ffmpeg`. Record the layer ARN as the `FfmpegLayerArn`
-deployment parameter only after checking its source and permissions.
+Obtain or build an approved versioned Lambda layer compatible with the
+processing function's Python 3.12 Lambda environment and architecture. It must
+expose an executable at exactly `/opt/bin/ffmpeg`. `FfmpegLayerArn` is required
+at deployment and must be a valid Lambda Layer ARN; check its source and
+permissions before supplying it.
 
 The repository does not contain FFmpeg binaries, archives, or a layer ARN.
 
@@ -152,8 +157,11 @@ public for screenshots.
   endpoints, enforces unique `(user_id, checksum)` reservations, implements the
   agreed reservation recovery/cleanup, and satisfies the lease/idempotency
   semantics above.
-- Give Member D the `StorageDeleteFunctionArn` output and agree on an
-  invocation permission/role before its public delete workflow invokes it.
+- When Member A deploys Member D's stack, pass the `StorageDeleteFunctionName`
+  output to its `StorageDeleteFunctionName` parameter. Keep
+  `StorageDeleteFunctionArn` only for audit/IAM reference; it is not the value
+  accepted by that parameter. Confirm the invocation permission/role before
+  the public delete workflow invokes it.
 - Exercise success, duplicate/stale-event skip, inference failure, and metadata
   retry behavior end to end.
 

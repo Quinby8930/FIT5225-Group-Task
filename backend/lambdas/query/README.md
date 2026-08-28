@@ -60,15 +60,19 @@ Internal metadata state machine (called by Member B, see
 
 | Method | Path | Purpose |
 |--------|------|---------|
-| POST | `/internal/uploads/reserve` | Reserve a unique `(user_id, checksum)` upload (`201`/`409`) |
-| POST | `/internal/files/{id}/processing` | Acquire the processing lease (`{"should_process": bool}`) |
+| POST | `/internal/uploads/reserve` | Atomically reserve or reuse `(user_id, checksum)` (`201`/`409`) |
+| POST | `/internal/files/{id}/processing` | Atomically acquire lease (`should_process` + `state`) |
 | PUT  | `/internal/files/{id}/complete` | Record a completed run (idempotent) |
 | PUT  | `/internal/files/{id}/failed` | Record a bounded failure (idempotent, message ≤240 chars) |
 
 `complete` also fires the **notification trigger**: every user subscribed to a
 species the file detected (count ≥1) gets a notification record + a
-`NotificationPublisher.publish` call. Subscriptions and notifications live in
-their own tables (`subscriptions` / `notifications`), same SQLite/DynamoDB swap.
+`NotificationPublisher.publish` call. Deterministic inbox rows are idempotently
+persisted pending before the completed transition. Failed publish/state updates
+are logged; completed replay publishes only inbox rows that already remain
+pending. It does not re-read current subscriptions or notify late subscribers.
+There is no periodic worker/DLQ: recovery uses automatic/manual complete replay,
+with at-least-once delivery if SNS succeeded before state persistence failed.
 
 Import `postman_collection.json` into Postman for ready-made requests, or replay
 the JSON fixtures in `events/` with `curl` (see `events/README.md`).
@@ -104,19 +108,25 @@ The query API code is unchanged — only the repository backend swaps
 - **Member A (auth):** replace the body of `get_current_user` in `app/main.py`
   with `build_get_current_user()` from `examples/cognito_auth_example.py`
   (real Cognito params already filled in) — every public route already depends on it.
-- **Member E (notifications):** replace `StubNotificationPublisher` with a real
-  SNS/email/push implementation. This repo now includes an SNS publisher that
-  is enabled with `NOTIFICATION_PUBLISHER=sns` plus either `SNS_TOPIC_ARN` or
-  `SNS_TOPIC_ARN_TEMPLATE`. Member D owns the trigger + durable records +
-  subscription/notification endpoints; Member E owns the delivery UX on top.
+- **Member D (notifications):** the module already includes the DynamoDB inbox,
+  trigger, SNS publisher, and subscription/notification endpoints. Member A's
+  SAM deployment enables it with `NOTIFICATION_PUBLISHER=sns` and the exact
+  `SNS_TOPIC_ARN`; an optional email endpoint can subscribe to the topic.
+- **Member E (experience):** owns the frontend and in-app notification UX on
+  top of Member D's API; E does not need to implement the SNS publisher.
 
 ## Cloud database setup (for the AWS operator)
 
-Three DynamoDB tables (`PacificBioArchiveFiles`, `PacificBioArchiveSubscriptions`,
-`PacificBioArchiveNotifications`) and the Lambda IAM role are declared in
+Four DynamoDB tables (`PacificBioArchiveFiles`, `PacificBioArchiveUploadReservations`,
+`PacificBioArchiveSubscriptions`, `PacificBioArchiveNotifications`), the SNS topic,
+and the Lambda IAM role are declared in
 [`infrastructure/member-d/dynamodb.yaml`](../../infrastructure/member-d/dynamodb.yaml).
 The step-by-step operator guide (which file to read, what to run, and the env
 vars to pass to the API) lives in
 [`docs/member-d/database-setup.md`](../../docs/member-d/database-setup.md); the
 failure-mode reference is
 [`docs/member-d/troubleshooting.md`](../../docs/member-d/troubleshooting.md).
+Existing retained file rows require Member A to pause every Files/Reservations
+mutation (reserve, processing/complete/failed callbacks, and delete) during the
+`migrate_reservations.py` verify/backfill/verify cutover; runtime fallback is not
+a migration substitute.

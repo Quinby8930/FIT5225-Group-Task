@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import http.client
 import io
 import json
 import threading
@@ -65,6 +66,27 @@ def test_auth_config_defaults_closed_and_requires_explicit_local_switch(
     assert local_only.allow_unauthenticated_inference is True
 
 
+def test_source_host_config_defaults_to_aws_s3_and_accepts_an_override(
+    monkeypatch, tmp_path: Path
+) -> None:
+    monkeypatch.setenv("ML_SERVICE_ROOT", str(tmp_path))
+    monkeypatch.delenv("ALLOWED_SOURCE_HOSTS", raising=False)
+
+    assert Settings.from_env().allowed_source_hosts == (
+        "s3.amazonaws.com",
+        "s3.ap-southeast-2.amazonaws.com",
+    )
+
+    monkeypatch.setenv(
+        "ALLOWED_SOURCE_HOSTS",
+        "assets.example.com, images.example.net ,assets.example.com",
+    )
+    assert Settings.from_env().allowed_source_hosts == (
+        "assets.example.com",
+        "images.example.net",
+    )
+
+
 def test_production_manifest_explicitly_disables_unauthenticated_inference() -> None:
     manifest = yaml.safe_load(
         (Path(__file__).resolve().parents[1] / "s.yaml").read_text(encoding="utf-8")
@@ -73,6 +95,20 @@ def test_production_manifest_explicitly_disables_unauthenticated_inference() -> 
         "environmentVariables"
     ]
     assert environment["ALLOW_UNAUTHENTICATED_INFERENCE"] == "false"
+
+
+def test_production_manifest_takes_the_image_from_deployment_environment() -> None:
+    manifest = yaml.safe_load(
+        (Path(__file__).resolve().parents[1] / "s.yaml").read_text(encoding="utf-8")
+    )
+    environment = manifest["resources"]["ml_inference"]["props"][
+        "environmentVariables"
+    ]
+
+    assert manifest["vars"]["image"] == "${env(ML_IMAGE)}"
+    assert environment["ALLOWED_SOURCE_HOSTS"] == (
+        "s3.amazonaws.com,s3.ap-southeast-2.amazonaws.com"
+    )
 
 
 def test_species_mapper_uses_scientific_columns_and_team_short_name() -> None:
@@ -108,6 +144,229 @@ def test_image_request_requires_exactly_one_image_url() -> None:
             },
             max_source_urls=3,
         )
+
+
+def test_inference_request_rejects_plain_http_source_urls() -> None:
+    with pytest.raises(RequestValidationError, match="HTTPS URL"):
+        parse_inference_request(
+            {
+                "file_id": "image-http",
+                "media_type": "image",
+                "image_urls": ["http://bucket.s3.amazonaws.com/image.jpg"],
+            },
+            max_source_urls=3,
+        )
+
+
+@pytest.mark.parametrize(
+    "source_url",
+    [
+        "https://example.com/image.jpg",
+        "https://attacker:secret@bucket.s3.ap-southeast-2.amazonaws.com/image.jpg",
+        "https://bucket.s3.ap-southeast-2.amazonaws.com:8443/image.jpg",
+    ],
+)
+def test_remote_fetcher_rejects_unsafe_sources_before_network_access(
+    monkeypatch, tmp_path: Path, source_url: str
+) -> None:
+    from app.inference import InferenceInputError
+    from app.main import build_fetcher
+
+    def unexpected_network_access(*args, **kwargs):
+        del args, kwargs
+        pytest.fail("unsafe source reached the network client")
+
+    class RejectingOpener:
+        open = unexpected_network_access
+
+    monkeypatch.setattr(
+        urllib.request, "build_opener", lambda *handlers: RejectingOpener()
+    )
+
+    with pytest.raises(InferenceInputError, match="source URL is not permitted"):
+        build_fetcher(settings(tmp_path))(source_url)
+
+
+@pytest.mark.parametrize(
+    ("network_error", "expected_error_name"),
+    [
+        (urllib.error.URLError("DNS unavailable"), "SourceUnavailableError"),
+        (
+            urllib.error.HTTPError(
+                "https://bucket.s3.ap-southeast-2.amazonaws.com/image.jpg",
+                403,
+                "expired signature",
+                {},
+                None,
+            ),
+            "SourceUnavailableError",
+        ),
+        (
+            urllib.error.HTTPError(
+                "https://bucket.s3.ap-southeast-2.amazonaws.com/image.jpg",
+                429,
+                "rate limited",
+                {},
+                None,
+            ),
+            "SourceUnavailableError",
+        ),
+        (
+            urllib.error.HTTPError(
+                "https://bucket.s3.ap-southeast-2.amazonaws.com/image.jpg",
+                503,
+                "upstream unavailable",
+                {},
+                None,
+            ),
+            "SourceUnavailableError",
+        ),
+        (TimeoutError("source timed out"), "SourceTimeoutError"),
+        (ConnectionResetError("connection reset"), "SourceUnavailableError"),
+        (http.client.IncompleteRead(b"partial", 100), "SourceUnavailableError"),
+    ],
+)
+def test_remote_fetcher_maps_transient_download_failures_to_retryable_errors(
+    monkeypatch,
+    tmp_path: Path,
+    network_error: Exception,
+    expected_error_name: str,
+) -> None:
+    from app import inference as inference_module
+    from app.main import build_fetcher
+
+    class FailingOpener:
+        def open(self, request, timeout):
+            del request, timeout
+            raise network_error
+
+    monkeypatch.setattr(
+        urllib.request, "build_opener", lambda *handlers: FailingOpener()
+    )
+    monkeypatch.setattr(
+        urllib.request,
+        "urlopen",
+        lambda *args, **kwargs: pytest.fail("safe opener was bypassed"),
+    )
+
+    expected_error = getattr(inference_module, expected_error_name)
+    with pytest.raises(expected_error):
+        build_fetcher(settings(tmp_path))(
+            "https://bucket.s3.ap-southeast-2.amazonaws.com/image.jpg"
+        )
+
+
+def test_remote_fetcher_maps_response_read_disconnect_to_retryable_error(
+    monkeypatch, tmp_path: Path
+) -> None:
+    from app.inference import SourceUnavailableError
+    from app.main import build_fetcher
+
+    class DisconnectingResponse:
+        headers = {}
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            del args
+
+        def read(self, size):
+            del size
+            raise ConnectionResetError("connection reset while reading")
+
+    class Opener:
+        def open(self, request, timeout):
+            del request, timeout
+            return DisconnectingResponse()
+
+    monkeypatch.setattr(urllib.request, "build_opener", lambda *handlers: Opener())
+
+    with pytest.raises(SourceUnavailableError):
+        build_fetcher(settings(tmp_path))(
+            "https://bucket.s3.ap-southeast-2.amazonaws.com/image.jpg"
+        )
+
+
+def test_remote_fetcher_caps_socket_timeout_to_remaining_request_budget(
+    monkeypatch, tmp_path: Path
+) -> None:
+    from app import main as main_module
+    from app.main import build_fetcher
+
+    observed_timeouts = []
+    image_bytes = png_bytes()
+
+    class Response:
+        headers = {}
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            del args
+
+        def read(self, size):
+            assert size == settings(tmp_path).max_image_bytes + 1
+            return image_bytes
+
+    class Opener:
+        def open(self, request, timeout):
+            del request
+            observed_timeouts.append(timeout)
+            return Response()
+
+    monkeypatch.setattr(urllib.request, "build_opener", lambda *handlers: Opener())
+    monkeypatch.setattr(main_module.time, "monotonic", lambda: 100.0)
+
+    result = build_fetcher(settings(tmp_path))(
+        "https://bucket.s3.ap-southeast-2.amazonaws.com/image.jpg",
+        deadline=101.25,
+    )
+
+    assert result == image_bytes
+    assert observed_timeouts == [1.25]
+
+
+def test_remote_fetcher_installs_a_no_redirect_policy(
+    monkeypatch, tmp_path: Path
+) -> None:
+    from app.inference import SourceUnavailableError
+    from app.main import build_fetcher
+
+    configured_handlers = []
+
+    class RedirectingOpener:
+        def open(self, request, timeout):
+            del timeout
+            raise urllib.error.HTTPError(
+                request.full_url,
+                302,
+                "redirect",
+                {"Location": "https://example.com/redirected.jpg"},
+                None,
+            )
+
+    def build_opener(*handlers):
+        configured_handlers.extend(handlers)
+        return RedirectingOpener()
+
+    monkeypatch.setattr(urllib.request, "build_opener", build_opener)
+    monkeypatch.setattr(
+        urllib.request,
+        "urlopen",
+        lambda *args, **kwargs: pytest.fail("safe opener was bypassed"),
+    )
+
+    with pytest.raises(SourceUnavailableError):
+        build_fetcher(settings(tmp_path))(
+            "https://bucket.s3.ap-southeast-2.amazonaws.com/image.jpg"
+        )
+
+    assert configured_handlers
+    assert configured_handlers[0].redirect_request(
+        None, None, 302, "redirect", {}, "https://example.com/redirected.jpg"
+    ) is None
 
 
 def test_b_video_request_is_bounded() -> None:
@@ -151,7 +410,7 @@ def test_inference_matches_b_response_contract() -> None:
     )
     result = InferenceService(
         Backend(),
-        lambda url: frames[int(url.rsplit("/", 1)[1]) - 1],
+        lambda url, *, deadline=None: frames[int(url.rsplit("/", 1)[1]) - 1],
         SpeciesMapper.from_file(
             Path(__file__).resolve().parents[1] / "config" / "labels.txt"
         ),
@@ -177,7 +436,8 @@ def test_inference_fetches_predicts_and_closes_one_source_at_a_time() -> None:
     outstanding = 0
     images = []
 
-    def fetch_url(url):
+    def fetch_url(url, *, deadline=None):
+        del deadline
         nonlocal outstanding
         assert outstanding == 0
         outstanding = 1
@@ -214,6 +474,33 @@ def test_inference_fetches_predicts_and_closes_one_source_at_a_time() -> None:
             image.getpixel((0, 0))
 
 
+def test_inference_passes_its_absolute_deadline_to_the_source_fetcher() -> None:
+    from app.species import SpeciesMapper
+
+    observed_deadlines = []
+
+    def fetch_url(url, *, deadline):
+        del url
+        observed_deadlines.append(deadline)
+        return png_bytes()
+
+    request = parse_inference_request(
+        {
+            "file_id": "image-deadline",
+            "media_type": "image",
+            "image_urls": ["https://example.com/image"],
+        },
+        max_source_urls=3,
+    )
+
+    deadline = time.monotonic() + 5
+    InferenceService(
+        MockInferenceBackend(), fetch_url, SpeciesMapper({}), max_detections=1000
+    ).infer(request, deadline=deadline)
+
+    assert observed_deadlines == [deadline]
+
+
 def test_inference_raises_when_monotonic_deadline_is_crossed(monkeypatch) -> None:
     from app import inference as inference_module
     from app.inference import InferenceTimeoutError
@@ -233,7 +520,7 @@ def test_inference_raises_when_monotonic_deadline_is_crossed(monkeypatch) -> Non
     with pytest.raises(InferenceTimeoutError):
         InferenceService(
             MockInferenceBackend(),
-            lambda _: png_bytes(),
+            lambda _, *, deadline=None: png_bytes(),
             SpeciesMapper({}),
             max_detections=1000,
         ).infer(request, deadline=11.0)
@@ -262,7 +549,7 @@ def test_inference_rejects_detection_1001_without_a_partial_result() -> None:
     with pytest.raises(InferenceResultLimitError):
         InferenceService(
             Backend(),
-            lambda _: png_bytes(),
+            lambda _, *, deadline=None: png_bytes(),
             SpeciesMapper({}),
             max_detections=1000,
         ).infer(request, deadline=time.monotonic() + 5)
@@ -273,7 +560,7 @@ def running_server(tmp_path: Path, service=None, config=None):
     server = InferenceServer(("127.0.0.1", 0), InferenceHandler)
     server.settings = config
     server.inference_service = service or InferenceService(
-        MockInferenceBackend(), lambda _: png_bytes()
+        MockInferenceBackend(), lambda _, *, deadline=None: png_bytes()
     )
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
@@ -289,6 +576,8 @@ def test_inference_server_waits_for_request_threads_to_finish() -> None:
     [
         ("InferenceResultLimitError", 422, "detection_limit_exceeded"),
         ("InferenceTimeoutError", 504, "inference_timeout"),
+        ("SourceUnavailableError", 503, "source_unavailable"),
+        ("SourceTimeoutError", 504, "source_timeout"),
     ],
 )
 def test_http_maps_bounded_inference_failures(

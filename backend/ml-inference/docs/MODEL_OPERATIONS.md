@@ -17,11 +17,10 @@ and `protobuf==7.36.0`; MegaDetector's legacy YOLOv5 package reports a
 metadata-only protobuf upper-bound warning, but the supplied detector and
 classifier were loaded and executed successfully.
 
-The C service loads `model.pt`. B remains responsible for object detection,
-cropping, and video frame extraction unless the team later changes the
-boundary. The default C production mode uses the supplied `mdv5a.pt` to detect
-animal boxes before classification. Set `ANIMAL_DETECTOR=full_image` only for
-controlled experiments where B already sends a single cropped animal image.
+The C service loads `model.pt` and uses `mdv5a.pt` for object detection and
+cropping. The B media service remains responsible for S3 access and video
+frame extraction. Set `ANIMAL_DETECTOR=full_image` only for controlled
+experiments with an already-cropped animal image.
 
 ## Model upgrade
 
@@ -35,9 +34,11 @@ To roll out a new model without changing B's source code:
 ## Security rules
 
 - Do not commit `.env`, OSS credentials, access keys, or signed URLs.
-- Use a short-lived signed URL when AWS sends source media.
-- Keep `INTERNAL_API_KEY` in an Alibaba Cloud environment secret and give the
-  matching value to B through the team's secret-delivery process.
+- Use a short-lived AWS S3 signed HTTPS URL when AWS sends source media.
+- Allowlist only the expected S3 hostnames through `ALLOWED_SOURCE_HOSTS`; the
+  service rejects redirects, embedded URL credentials, and non-standard ports.
+- Keep `INTERNAL_API_KEY` in an Alibaba Cloud environment secret; A configures
+  the matching value in the AWS media service through a private channel.
 - Restrict outbound access and request sizes where the Function Compute or
   container platform supports it.
 - Keep YOLOv5 and Matplotlib caches under `/tmp`; the service sets these paths

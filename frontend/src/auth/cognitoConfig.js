@@ -1,5 +1,9 @@
 const env = import.meta.env || {};
 
+export function normalizeApiBaseUrl(baseUrl) {
+  return baseUrl.replace(/\/+$/, "");
+}
+
 export const cognitoConfig = {
   region: env.VITE_COGNITO_REGION || "ap-southeast-2",
   userPoolId: env.VITE_COGNITO_USER_POOL_ID || "ap-southeast-2_1hGEJyYO7",
@@ -20,7 +24,8 @@ export const cognitoConfig = {
 };
 
 export const apiConfig = {
-  baseUrl:
+  baseUrl: normalizeApiBaseUrl(
     env.VITE_API_BASE_URL ||
-    "https://2dd2aqb32j.execute-api.ap-southeast-2.amazonaws.com",
+      "https://2dd2aqb32j.execute-api.ap-southeast-2.amazonaws.com/dev"
+  ),
 };

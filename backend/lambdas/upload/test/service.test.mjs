@@ -55,6 +55,24 @@ test('does not pre-sign when duplicate reservation fails', async () => {
   assert.equal(presigned, false);
 });
 
+test('re-signs the original object key when a pending reservation is reused', async () => {
+  let presignInput;
+  const service = createUploadService({
+    createFileId: () => 'new-file',
+    reserveUpload: async () => ({
+      file_id: 'existing-file',
+      object_key: 'originals/user-456/existing-file/wombat.jpg',
+    }),
+    presignUpload: async (input) => { presignInput = input; return 'https://upload.example'; },
+  });
+
+  const result = await service.createUpload({ userId: 'user-456', request });
+
+  assert.equal(result.file_id, 'existing-file');
+  assert.equal(result.object_key, 'originals/user-456/existing-file/wombat.jpg');
+  assert.equal(presignInput.objectKey, 'originals/user-456/existing-file/wombat.jpg');
+});
+
 test('threads separate image and video caps into upload validation', async () => {
   let reserved = false;
   const service = createUploadService({

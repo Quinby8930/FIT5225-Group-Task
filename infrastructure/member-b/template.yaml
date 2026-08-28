@@ -24,7 +24,8 @@ Parameters:
     MinLength: 1
   FfmpegLayerArn:
     Type: String
-    Default: ''
+    AllowedPattern: '^arn:(aws|aws-us-gov|aws-cn):lambda:[a-z0-9-]+:[0-9]{12}:layer:[A-Za-z0-9_-]+:[1-9][0-9]*$'
+    ConstraintDescription: Must be a versioned Lambda Layer ARN.
   MaxUploadBytes:
     Type: Number
     Default: 262144000
@@ -34,9 +35,6 @@ Parameters:
   InferenceHttpTimeoutSeconds:
     Type: Number
     Default: 70
-
-Conditions:
-  HasFfmpegLayer: !Not [!Equals [!Ref FfmpegLayerArn, '']]
 
 Resources:
   MediaBucket:
@@ -122,7 +120,7 @@ Resources:
       EphemeralStorage:
         Size: 4096
       Layers:
-        - !If [HasFfmpegLayer, !Ref FfmpegLayerArn, !Ref AWS::NoValue]
+        - !Ref FfmpegLayerArn
       Environment:
         Variables:
           MEDIA_BUCKET_NAME: !Sub pacificbioarchive-media-${AWS::AccountId}-${AWS::Region}
@@ -292,5 +290,7 @@ Outputs:
     Value: !GetAtt MediaProcessingFunction.Arn
   StorageDeleteFunctionArn:
     Value: !GetAtt StorageDeleteFunction.Arn
+  StorageDeleteFunctionName:
+    Value: !Ref StorageDeleteFunction
   AssetUrlsFunctionArn:
     Value: !GetAtt AssetUrlsFunction.Arn

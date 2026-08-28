@@ -32,11 +32,14 @@ python -m pytest tests/ -q
 
 ## 3. `reserve` 返回 `409`，但你认为应该是新文件
 
-**原因**：这是**去重逻辑在工作**。`(user_id, checksum)` 唯一，同一用户重复上传
-同一文件（相同 SHA-256）会被拦下，返回 `{"existing_file_id": "<uuid>"}`。
+**原因**：`processing` / `completed` 文件的 `(user_id, checksum)` 已被原子预约，
+此时返回 `{"existing_file_id": "<uuid>"}`。`pending_upload` / `failed` 不会 409：
+元数据一致时会返回旧 `file_id/object_key`，由上传 Lambda 重新生成 presigned URL。
 
 **解决**：如果确实是重复上传，前端应引导用户「该文件已存在」，而不是重新上传。
-如果是测试想强制新建，换一个 `checksum` 或 `user_id` 即可。
+如果返回 `409 METADATA_CONFLICT`，检查 filename、file_type、content_type、size_bytes
+是否和旧预约一致。如果确实要重新创建，可先通过受控删除端点删除旧文件（会清理
+reservation），或在测试中换 `checksum` / `user_id`。
 
 ---
 
@@ -55,25 +58,30 @@ reserve 必须先于 complete 调用（状态机是 `reserve → processing → 
 **原因**（按概率）：
 
 1. 没有通过最新 SAM 模板部署 QueryFunction 或模板生成的执行角色。
-2. 表名/区域不匹配 —— 环境变量 `DYNAMODB_TABLE` / `AWS_REGION` 没设对。
+2. 表名/区域不匹配 —— `DYNAMODB_TABLE` / `RESERVATIONS_TABLE` / `AWS_REGION` 没设对。
 3. 新表没部署 —— 订阅/通知依赖 `PacificBioArchiveSubscriptions` /
    `PacificBioArchiveNotifications` 两张表，旧模板没有。
 
 **解决**：
 
-1. 用**最新**的 `infrastructure/member-d/dynamodb.yaml` 重新 `sam build` +
-   `sam deploy`（会创建 3 张表、QueryFunction、策略和显式路由）。
+1. 由成员 A 用**最新**的 `infrastructure/member-d/dynamodb.yaml` 重新 `sam build` +
+   `sam deploy`（会创建 4 张表、SNS Topic、QueryFunction、策略和显式路由）。
 2. Lambda 环境变量补齐：
 
    | 变量 | 值 |
    |------|-----|
    | `REPO_BACKEND` | `dynamodb` |
    | `DYNAMODB_TABLE` | `PacificBioArchiveFiles` |
+   | `RESERVATIONS_TABLE` | `PacificBioArchiveUploadReservations` |
    | `SUBSCRIPTIONS_TABLE` | `PacificBioArchiveSubscriptions` |
    | `NOTIFICATIONS_TABLE` | `PacificBioArchiveNotifications` |
    | `AWS_REGION` | `ap-southeast-2` |
 
-3. IAM 角色确认授予了 `dynamodb:Query`（订阅/通知查询用），新模板已加。
+3. IAM 角色确认授予 `dynamodb:Query`、`dynamodb:TransactWriteItems`，并对模板 Topic
+   精确授予 `sns:Publish`；新模板已包含这些权限。
+
+所有上述 AWS 检查和环境变量修改均由成员 A 执行，B/D 不自行改 AWS。C 只处理阿里云
+推理部署；共享 `INTERNAL_API_KEY` 仅 A/C 安全配置，不得进入 Git、文档或群聊。
 
 ---
 
@@ -89,11 +97,31 @@ reserve 必须先于 complete 调用（状态机是 `reserve → processing → 
 3. 该物种在 `tags` 里数量为 0 —— 触发器只对 `count >= 1` 的物种发通知。
 
 **解决**：核对 `complete.json` 的 `tags` key 与订阅的 `species` 完全一致（简化名、
-小写）。通知只在新文件**首次** `complete` 时触发（幂等重放不会重复发）。
+小写）。如果 SNS 临时失败，inbox 仍存在且 delivery 保持 pending；重放同一 completed
+请求会重试 pending。正常成功标记 delivered 后，后续重放不会再次选择该记录。
+
+这里没有周期 worker 或 DLQ。若自动重试已结束，由成员 A 用原始相同 metadata 人工
+重放 `PUT /internal/files/{file_id}/complete`；completed 分支只 publish 已存在的
+pending inbox，不会读取当前订阅或给晚订阅者补发。SNS 是
+at-least-once；若消息已接受但 delivered
+更新失败，重放可能重复投递，消费者应按确定性 `notification_id` 去重。
 
 ---
 
-## 7. 存储删除时成员 B 返回 `403 FORBIDDEN_KEY`
+## 7. 新 ReservationsTable 部署后 verify 报缺 claim 或冲突
+
+**原因**：旧 FilesTable 行没有对应 claim，或旧数据已违反 `(user_id, checksum)`
+唯一性。运行时 fallback 不是正式迁移完成证明。
+
+**解决**：成员 A 暂停所有 Files/Reservations mutation（reserve、processing/complete/
+failed 回调和 delete），按
+`database-setup.md §3.1` 执行 verify、带
+`--confirm-uploads-paused` 的 backfill、再次 verify。多 file/错误 claim 必须人工核对并
+fail closed；禁止删 claim 后直接恢复流量。
+
+---
+
+## 8. 存储删除时成员 B 返回 `403 FORBIDDEN_KEY`
 
 **原因**：成员 B 的 guarded storage-delete Lambda 强制每个 key 必须在
 `originals/{user_id}/`、`thumbnails/{user_id}/`、`processing/{user_id}/` 前缀下。
@@ -105,7 +133,7 @@ keys —— 这一层已在 `delete_files` 端点里实现。
 
 ---
 
-## 8. 本地跑不起来：`ModuleNotFoundError: No module named 'app'` 或依赖缺失
+## 9. 本地跑不起来：`ModuleNotFoundError: No module named 'app'` 或依赖缺失
 
 **解决**：
 
@@ -121,7 +149,7 @@ SQLite 模式通常不会调用它。`requirements.txt` 仍包含 boto3，因为
 
 ---
 
-## 9. 通知/订阅在本地测试互相污染
+## 10. 通知/订阅在本地测试互相污染
 
 **原因**：订阅和通知写在同一个 SQLite 库文件的 `subscriptions` / `notifications`
 表里，和文件表的 `files` 表共存于 `data/pacific_bioarchive.db`。

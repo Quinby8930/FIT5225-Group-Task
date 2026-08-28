@@ -166,7 +166,9 @@ The repository cannot supply or validate the following values:
 - the shared internal API key or Secrets Manager delivery mechanism;
 - the live Alibaba Function Compute HTTPS endpoint, registry image, and model
   assets;
-- Member B's deployed media bucket, FFmpeg layer, and storage-delete Lambda ARN;
+- Member B's deployed media bucket, FFmpeg layer, and storage-delete Lambda
+  function name for Member D's deployment parameter; its ARN is retained only
+  for audit/IAM reference;
 - final API Gateway stage/routes and live authorizer attachment;
 - a public-media policy for cross-owner previews;
 - whether video query-by-file must be added through a new frame-extraction

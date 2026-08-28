@@ -17,6 +17,12 @@ VITE_COGNITO_REDIRECT_SIGN_IN=http://localhost:3000/callback
 VITE_COGNITO_REDIRECT_SIGN_OUT=http://localhost:3000/logout
 ```
 
+By default, the deployed frontend calls:
+
+```text
+https://2dd2aqb32j.execute-api.ap-southeast-2.amazonaws.com/dev
+```
+
 The S3 bucket remains private. Current-user S3 keys returned by Member D are
 deduplicated, split into batches of 100, and exchanged for 15-minute HTTPS URLs
 through Member B's authenticated `POST /asset-urls` endpoint. Displayed URLs

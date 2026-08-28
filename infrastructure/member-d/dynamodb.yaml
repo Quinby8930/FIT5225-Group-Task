@@ -26,10 +26,19 @@ Parameters:
     Type: String
     NoEcho: true
     MinLength: 1
+  NotificationEmailEndpoint:
+    Type: String
+    Default: ''
+    Description: Optional email address subscribed to the notification topic.
+
+Conditions:
+  HasNotificationEmailEndpoint: !Not [!Equals [!Ref NotificationEmailEndpoint, '']]
 
 Resources:
   FilesTable:
     Type: AWS::DynamoDB::Table
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
     Properties:
       TableName: PacificBioArchiveFiles
       BillingMode: PAY_PER_REQUEST
@@ -40,8 +49,24 @@ Resources:
         - AttributeName: file_id
           KeyType: HASH
 
+  ReservationsTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      TableName: PacificBioArchiveUploadReservations
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: reservation_key
+          AttributeType: S
+      KeySchema:
+        - AttributeName: reservation_key
+          KeyType: HASH
+
   SubscriptionsTable:
     Type: AWS::DynamoDB::Table
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
     Properties:
       TableName: PacificBioArchiveSubscriptions
       BillingMode: PAY_PER_REQUEST
@@ -58,6 +83,8 @@ Resources:
 
   NotificationsTable:
     Type: AWS::DynamoDB::Table
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
     Properties:
       TableName: PacificBioArchiveNotifications
       BillingMode: PAY_PER_REQUEST
@@ -72,6 +99,17 @@ Resources:
         - AttributeName: notification_id
           KeyType: RANGE
 
+  NotificationTopic:
+    Type: AWS::SNS::Topic
+
+  NotificationEmailSubscription:
+    Type: AWS::SNS::Subscription
+    Condition: HasNotificationEmailEndpoint
+    Properties:
+      Protocol: email
+      Endpoint: !Ref NotificationEmailEndpoint
+      TopicArn: !Ref NotificationTopic
+
   QueryFunction:
     Type: AWS::Serverless::Function
     Properties:
@@ -84,6 +122,7 @@ Resources:
         Variables:
           REPO_BACKEND: dynamodb
           DYNAMODB_TABLE: !Ref FilesTable
+          RESERVATIONS_TABLE: !Ref ReservationsTable
           SUBSCRIPTIONS_TABLE: !Ref SubscriptionsTable
           NOTIFICATIONS_TABLE: !Ref NotificationsTable
           STORAGE_BACKEND: lambda
@@ -92,6 +131,8 @@ Resources:
           QUERY_INPUT_BUCKET: !Ref QueryInputBucketName
           INFERENCE_API_URL: !Ref InferenceApiBaseUrl
           INTERNAL_API_KEY: !Ref InternalApiKey
+          NOTIFICATION_PUBLISHER: sns
+          SNS_TOPIC_ARN: !Ref NotificationTopic
           CORS_ORIGINS: !Ref AllowedOrigin
       Policies:
         - AWSLambdaBasicExecutionRole
@@ -104,8 +145,10 @@ Resources:
                 - dynamodb:Query
                 - dynamodb:UpdateItem
                 - dynamodb:DeleteItem
+                - dynamodb:TransactWriteItems
               Resource:
                 - !GetAtt FilesTable.Arn
+                - !GetAtt ReservationsTable.Arn
                 - !GetAtt SubscriptionsTable.Arn
                 - !GetAtt NotificationsTable.Arn
             - Effect: Allow
@@ -117,6 +160,9 @@ Resources:
             - Effect: Allow
               Action: lambda:InvokeFunction
               Resource: !Sub arn:${AWS::Partition}:lambda:${AWS::Region}:${AWS::AccountId}:function:${StorageDeleteFunctionName}
+            - Effect: Allow
+              Action: sns:Publish
+              Resource: !Ref NotificationTopic
 
   QueryIntegration:
     Type: AWS::ApiGatewayV2::Integration
@@ -272,9 +318,13 @@ Resources:
 Outputs:
   TableName:
     Value: !Ref FilesTable
+  ReservationsTableName:
+    Value: !Ref ReservationsTable
   SubscriptionsTableName:
     Value: !Ref SubscriptionsTable
   NotificationsTableName:
     Value: !Ref NotificationsTable
   QueryFunctionArn:
     Value: !GetAtt QueryFunction.Arn
+  NotificationTopicArn:
+    Value: !Ref NotificationTopic

@@ -5,7 +5,7 @@
 Member E needs only one runtime value from Member A:
 
 ```text
-VITE_API_BASE_URL=https://<final-api-gateway-host>
+VITE_API_BASE_URL=https://2dd2aqb32j.execute-api.ap-southeast-2.amazonaws.com/dev
 ```
 
 The same API must expose:

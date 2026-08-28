@@ -25,7 +25,19 @@ class DuplicateError(Exception):
         self.existing_file_id = existing_file_id
 
 
+class RepositoryIntegrityError(RuntimeError):
+    """Raised when persisted uniqueness metadata contradicts file records."""
+
+
 class FileRepository(ABC):
+    @abstractmethod
+    def reserve(self, record: FileRecord) -> tuple[FileRecord, bool]:
+        """Atomically claim checksum and file id; return ``(record, created)``."""
+
+    @abstractmethod
+    def reuse_upload(self, file_id: str) -> Optional[FileRecord]:
+        """Reset pending/failed upload state, or return ``None`` if no longer reusable."""
+
     @abstractmethod
     def add(self, record: FileRecord) -> None:
         """Insert a new file record. Raises :class:`DuplicateError` on collision."""
@@ -61,6 +73,16 @@ class FileRepository(ABC):
         self, file_id: str, sequencer: str, lease_expires_at: datetime
     ) -> None:
         """Set status to ``processing`` and record the lease/sequencer."""
+
+    @abstractmethod
+    def try_acquire_processing(
+        self,
+        file_id: str,
+        sequencer: str,
+        now: datetime,
+        lease_expires_at: datetime,
+    ) -> str:
+        """Atomically return ``acquired``, ``completed``, or ``lease_active``."""
 
     @abstractmethod
     def mark_completed(

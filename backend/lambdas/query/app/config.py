@@ -22,6 +22,9 @@ class Settings:
 
     # DynamoDB table names (used when backend == "dynamodb").
     dynamodb_table: str = os.getenv("DYNAMODB_TABLE", "PacificBioArchiveFiles")
+    reservations_table: str = os.getenv(
+        "RESERVATIONS_TABLE", "PacificBioArchiveUploadReservations"
+    )
     subscriptions_table: str = os.getenv(
         "SUBSCRIPTIONS_TABLE", "PacificBioArchiveSubscriptions"
     )

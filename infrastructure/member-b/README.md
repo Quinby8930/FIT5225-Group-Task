@@ -39,7 +39,7 @@ deployment remain manual steps.
 | `MetadataApiBaseUrl` | Yes | None | Member D HTTPS base URL used for reservation and processing status calls. |
 | `InferenceApiUrl` | Yes | None | Member C HTTPS base URL; the processing client appends `/infer`. |
 | `InternalApiKey` | Yes | None (`NoEcho`, minimum length 1) | Non-empty shared internal HTTP credential; provide it only through an approved deployment secret-handling process. |
-| `FfmpegLayerArn` | No | Empty | ARN of a compatible layer that exposes `/opt/bin/ffmpeg`; omitted when empty. |
+| `FfmpegLayerArn` | Yes | None | Versioned Lambda Layer ARN for a compatible layer that exposes `/opt/bin/ffmpeg`; the processing Lambda always attaches it. |
 | `MaxUploadBytes` | No | `262144000` | Maximum accepted upload size passed to the upload handler. |
 
 Member C and Member D remain behind the HTTP contracts. The template contains
@@ -52,7 +52,8 @@ no invented or environment-specific endpoint value.
 | `MediaBucketName` | Generated private S3 bucket name. |
 | `UploadFunctionArn` | Upload Lambda ARN. |
 | `MediaProcessingFunctionArn` | Processing Lambda ARN. |
-| `StorageDeleteFunctionArn` | Guarded storage-delete Lambda ARN for Member D integration. |
+| `StorageDeleteFunctionName` | Guarded storage-delete Lambda function name; Member A passes this value to Member D's `StorageDeleteFunctionName` deployment parameter. |
+| `StorageDeleteFunctionArn` | Guarded storage-delete Lambda ARN for audit/IAM reference only; do not pass it to Member D's function-name parameter. |
 | `AssetUrlsFunctionArn` | Authenticated private-asset URL Lambda ARN. |
 
 ## Package and tool dependencies

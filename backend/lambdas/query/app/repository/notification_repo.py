@@ -1,9 +1,8 @@
 """Subscription & notification repository.
 
-Member D owns the *data model* (``subscriptions`` and ``notifications`` tables)
-and the *trigger* that writes notifications when a completed file's tags match a
-subscription. The delivery channel (SNS/email/push) is Member E's concern — the
-trigger just writes a durable record and hands it to a ``NotificationPublisher``.
+Member D owns the data model, completion trigger, durable inbox, and SNS
+publisher. Member E consumes the public endpoints for the frontend and in-app
+notification experience.
 
 Two backends, one interface, mirroring :class:`FileRepository`:
 
@@ -52,6 +51,14 @@ class NotificationRepository(ABC):
         """Store one notification."""
 
     @abstractmethod
+    def pending_for_file(self, file_id: str) -> list[Notification]:
+        """Return notifications for a file whose external delivery is pending."""
+
+    @abstractmethod
+    def mark_delivered(self, notification: Notification) -> None:
+        """Mark one pending notification as externally delivered."""
+
+    @abstractmethod
     def notifications(self, user_id: str) -> list[Notification]:
         """Return a user's notifications, newest first."""
 
@@ -71,7 +78,8 @@ CREATE TABLE IF NOT EXISTS notifications (
     file_id         TEXT NOT NULL,
     species         TEXT NOT NULL,
     object_key      TEXT NOT NULL,
-    created_at      TEXT NOT NULL
+    created_at      TEXT NOT NULL,
+    delivery_status TEXT NOT NULL DEFAULT 'pending'
 );
 CREATE INDEX IF NOT EXISTS idx_notif_user    ON notifications(user_id);
 CREATE INDEX IF NOT EXISTS idx_sub_species   ON subscriptions(species);
@@ -86,6 +94,19 @@ class SQLiteNotificationRepository(NotificationRepository):
         self._conn = sqlite3.connect(db_path, check_same_thread=False)
         self._conn.row_factory = sqlite3.Row
         self._conn.executescript(_SQLITE_SCHEMA)
+        notification_columns = {
+            row["name"]
+            for row in self._conn.execute("PRAGMA table_info(notifications)").fetchall()
+        }
+        if "delivery_status" not in notification_columns:
+            self._conn.execute(
+                "ALTER TABLE notifications ADD COLUMN delivery_status "
+                "TEXT NOT NULL DEFAULT 'pending'"
+            )
+        self._conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_notif_delivery "
+            "ON notifications(file_id, delivery_status)"
+        )
         self._conn.commit()
 
     def subscribe(self, user_id: str, species: str) -> None:
@@ -118,7 +139,9 @@ class SQLiteNotificationRepository(NotificationRepository):
 
     def add_notification(self, notification: Notification) -> None:
         self._conn.execute(
-            "INSERT OR IGNORE INTO notifications VALUES (?,?,?,?,?,?)",
+            "INSERT OR IGNORE INTO notifications "
+            "(notification_id, user_id, file_id, species, object_key, created_at, "
+            "delivery_status) VALUES (?,?,?,?,?,?,'pending')",
             (
                 notification.notification_id,
                 notification.user_id,
@@ -130,22 +153,39 @@ class SQLiteNotificationRepository(NotificationRepository):
         )
         self._conn.commit()
 
+    @staticmethod
+    def _notification_from_row(row) -> Notification:
+        return Notification(
+            notification_id=row["notification_id"],
+            user_id=row["user_id"],
+            file_id=row["file_id"],
+            species=row["species"],
+            object_key=row["object_key"],
+            created_at=_dt(row["created_at"]),
+        )
+
+    def pending_for_file(self, file_id: str) -> list[Notification]:
+        rows = self._conn.execute(
+            "SELECT * FROM notifications "
+            "WHERE file_id=? AND delivery_status='pending' ORDER BY created_at",
+            (file_id,),
+        ).fetchall()
+        return [self._notification_from_row(row) for row in rows]
+
+    def mark_delivered(self, notification: Notification) -> None:
+        self._conn.execute(
+            "UPDATE notifications SET delivery_status='delivered' "
+            "WHERE notification_id=? AND delivery_status='pending'",
+            (notification.notification_id,),
+        )
+        self._conn.commit()
+
     def notifications(self, user_id: str) -> list[Notification]:
         rows = self._conn.execute(
             "SELECT * FROM notifications WHERE user_id=? ORDER BY created_at DESC",
             (user_id,),
         ).fetchall()
-        return [
-            Notification(
-                notification_id=r["notification_id"],
-                user_id=r["user_id"],
-                file_id=r["file_id"],
-                species=r["species"],
-                object_key=r["object_key"],
-                created_at=_dt(r["created_at"]),
-            )
-            for r in rows
-        ]
+        return [self._notification_from_row(row) for row in rows]
 
 
 # ---------------------------------------------------------------------------
@@ -187,20 +227,79 @@ class DynamoDBNotificationRepository(NotificationRepository):
             self._subscriptions,
             FilterExpression="species = :s",
             ExpressionAttributeValues={":s": species},
+            ConsistentRead=True,
         )
         return sorted(item["user_id"] for item in items)
 
     def add_notification(self, notification: Notification) -> None:
-        self._notifications.put_item(
-            Item={
-                "user_id": notification.user_id,
-                "notification_id": notification.notification_id,
-                "file_id": notification.file_id,
-                "species": notification.species,
-                "object_key": notification.object_key,
-                "created_at": notification.created_at.isoformat(),
-            }
+        import botocore.exceptions
+
+        try:
+            self._notifications.put_item(
+                Item={
+                    "user_id": notification.user_id,
+                    "notification_id": notification.notification_id,
+                    "file_id": notification.file_id,
+                    "species": notification.species,
+                    "object_key": notification.object_key,
+                    "created_at": notification.created_at.isoformat(),
+                    "delivery_status": "pending",
+                },
+                ConditionExpression="attribute_not_exists(notification_id)",
+            )
+        except botocore.exceptions.ClientError as exc:
+            if exc.response.get("Error", {}).get("Code") == "ConditionalCheckFailedException":
+                return
+            raise
+
+    @staticmethod
+    def _notification_from_item(item: dict) -> Notification:
+        return Notification(
+            notification_id=item["notification_id"],
+            user_id=item["user_id"],
+            file_id=item["file_id"],
+            species=item["species"],
+            object_key=item["object_key"],
+            created_at=_dt(item.get("created_at")),
         )
+
+    def pending_for_file(self, file_id: str) -> list[Notification]:
+        items = _scan_all(
+            self._notifications,
+            FilterExpression=(
+                "file_id = :f AND (attribute_not_exists(delivery_status) OR "
+                "delivery_status = :pending)"
+            ),
+            ExpressionAttributeValues={":f": file_id, ":pending": "pending"},
+            ConsistentRead=True,
+        )
+        result = [self._notification_from_item(item) for item in items]
+        result.sort(key=lambda notification: notification.created_at)
+        return result
+
+    def mark_delivered(self, notification: Notification) -> None:
+        import botocore.exceptions
+
+        try:
+            self._notifications.update_item(
+                Key={
+                    "user_id": notification.user_id,
+                    "notification_id": notification.notification_id,
+                },
+                UpdateExpression="SET delivery_status = :delivered",
+                ConditionExpression=(
+                    "attribute_not_exists(delivery_status) OR "
+                    "delivery_status = :pending"
+                ),
+                ExpressionAttributeValues={
+                    ":pending": "pending",
+                    ":delivered": "delivered",
+                },
+            )
+        except botocore.exceptions.ClientError as exc:
+            if exc.response.get("Error", {}).get("Code") == "ConditionalCheckFailedException":
+                return
+            raise
 
     def notifications(self, user_id: str) -> list[Notification]:
         items = _query_all(
@@ -208,16 +307,6 @@ class DynamoDBNotificationRepository(NotificationRepository):
             KeyConditionExpression="user_id = :u",
             ExpressionAttributeValues={":u": user_id},
         )
-        result = [
-            Notification(
-                notification_id=i["notification_id"],
-                user_id=i["user_id"],
-                file_id=i["file_id"],
-                species=i["species"],
-                object_key=i["object_key"],
-                created_at=_dt(i.get("created_at")),
-            )
-            for i in items
-        ]
+        result = [self._notification_from_item(item) for item in items]
         result.sort(key=lambda n: n.created_at, reverse=True)
         return result

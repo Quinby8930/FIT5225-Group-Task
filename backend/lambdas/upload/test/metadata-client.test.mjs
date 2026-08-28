@@ -26,6 +26,27 @@ test('POSTs the reservation contract, serializes JSON, and sends the optional in
   assert.equal(request.options.redirect, 'error');
 });
 
+test('returns the reusable upload identity from a successful reservation', async () => {
+  const fetchImpl = async () => new Response(
+    JSON.stringify({
+      file_id: 'existing-file',
+      object_key: 'originals/user-1/existing-file/wombat.jpg',
+      status: 'pending_upload',
+      reused: true,
+    }),
+    { status: 201, headers: { 'Content-Type': 'application/json' } },
+  );
+
+  const reservation = await createMetadataClient({
+    baseUrl: 'https://metadata.example', fetchImpl,
+  }).reserveUpload(record);
+
+  assert.deepEqual(reservation, {
+    file_id: 'existing-file',
+    object_key: 'originals/user-1/existing-file/wombat.jpg',
+  });
+});
+
 test('maps a metadata duplicate response to the existing file identifier', async () => {
   const fetchImpl = async () => new Response(
     JSON.stringify({ existing_file_id: 'existing-file' }),

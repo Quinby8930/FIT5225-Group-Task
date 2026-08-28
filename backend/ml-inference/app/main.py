@@ -1,15 +1,18 @@
 from __future__ import annotations
 
 import hmac
+import http.client
 import json
 import logging
 import os
+import socket
 import time
 import urllib.error
 import urllib.request
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
+from urllib.parse import urlparse
 
 from PIL import UnidentifiedImageError
 
@@ -21,11 +24,19 @@ from .inference import (
     InferenceResultLimitError,
     InferenceService,
     InferenceTimeoutError,
+    SourceTimeoutError,
+    SourceUnavailableError,
 )
 from .schemas import RequestValidationError, parse_inference_request
 from .species import SpeciesMapper
 
 LOGGER = logging.getLogger("pacific_bioarchive_ml")
+
+
+class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        del req, fp, code, msg, headers, newurl
+        return None
 
 
 def configure_logging() -> None:
@@ -55,24 +66,77 @@ def build_backend(settings: Settings):
 
 
 def build_fetcher(settings: Settings):
-    def fetch_url(url: str) -> bytes:
+    opener = urllib.request.build_opener(_NoRedirectHandler())
+
+    def validate_source_url(url: str) -> str:
+        parsed = urlparse(url)
+        try:
+            port = parsed.port
+        except ValueError as exc:
+            raise InferenceInputError("source URL is not permitted") from exc
+        hostname = (parsed.hostname or "").lower().rstrip(".")
+        allowed_host = any(
+            hostname == allowed or hostname.endswith(f".{allowed}")
+            for allowed in settings.allowed_source_hosts
+        )
+        if (
+            parsed.scheme != "https"
+            or not hostname
+            or parsed.username is not None
+            or parsed.password is not None
+            or port not in {None, 443}
+            or not allowed_host
+        ):
+            raise InferenceInputError("source URL is not permitted")
+        return url
+
+    def fetch_url(url: str, *, deadline: float | None = None) -> bytes:
         if not settings.allow_remote_urls:
             raise InferenceInputError("remote URL input is disabled")
+        url = validate_source_url(url)
+        network_timeout = float(settings.remote_url_timeout_seconds)
+        if deadline is not None:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise SourceTimeoutError("source URL download timed out")
+            network_timeout = min(network_timeout, remaining)
         request = urllib.request.Request(
             url,
             headers={"User-Agent": "PacificBioArchive-ML/1.0"},
             method="GET",
         )
         try:
-            with urllib.request.urlopen(
-                request, timeout=settings.remote_url_timeout_seconds
+            with opener.open(
+                request, timeout=network_timeout
             ) as response:
                 content_length = response.headers.get("Content-Length")
                 if content_length and int(content_length) > settings.max_image_bytes:
                     raise InferenceInputError("remote image exceeds the size limit")
                 data = response.read(settings.max_image_bytes + 1)
-        except (urllib.error.URLError, TimeoutError, ValueError) as exc:
-            raise InferenceInputError("unable to download source URL") from exc
+        except urllib.error.HTTPError as exc:
+            if (
+                300 <= exc.code < 400
+                or exc.code in {403, 408, 425, 429}
+                or exc.code >= 500
+            ):
+                raise SourceUnavailableError(
+                    "source URL is temporarily unavailable"
+                ) from exc
+            raise InferenceInputError("source URL could not be downloaded") from exc
+        except urllib.error.URLError as exc:
+            if isinstance(exc.reason, (TimeoutError, socket.timeout)):
+                raise SourceTimeoutError("source URL download timed out") from exc
+            raise SourceUnavailableError(
+                "source URL is temporarily unavailable"
+            ) from exc
+        except (TimeoutError, socket.timeout) as exc:
+            raise SourceTimeoutError("source URL download timed out") from exc
+        except (OSError, http.client.HTTPException) as exc:
+            raise SourceUnavailableError(
+                "source URL is temporarily unavailable"
+            ) from exc
+        except ValueError as exc:
+            raise InferenceInputError("source URL returned invalid metadata") from exc
         if len(data) > settings.max_image_bytes:
             raise InferenceInputError("remote image exceeds the size limit")
         return data
@@ -198,6 +262,12 @@ class InferenceHandler(BaseHTTPRequestHandler):
         except (InferenceInputError, UnidentifiedImageError) as exc:
             response = {"error": "invalid_source", "detail": str(exc)}
             status = HTTPStatus.UNPROCESSABLE_ENTITY
+        except SourceUnavailableError as exc:
+            response = {"error": "source_unavailable", "detail": str(exc)}
+            status = HTTPStatus.SERVICE_UNAVAILABLE
+        except SourceTimeoutError as exc:
+            response = {"error": "source_timeout", "detail": str(exc)}
+            status = HTTPStatus.GATEWAY_TIMEOUT
         except InferenceResultLimitError as exc:
             response = {"error": "detection_limit_exceeded", "detail": str(exc)}
             status = HTTPStatus.UNPROCESSABLE_ENTITY

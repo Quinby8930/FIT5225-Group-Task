@@ -85,7 +85,20 @@ export function createMetadataClient({
           signal: controller.signal,
           redirect: 'error',
         });
-        if (response.status === 201) return;
+        if (response.status === 201) {
+          if (!response.body?.getReader) return undefined;
+          const reservation = await readBoundedJson(response);
+          if (
+            typeof reservation?.file_id === 'string'
+            && typeof reservation?.object_key === 'string'
+          ) {
+            return {
+              file_id: reservation.file_id,
+              object_key: reservation.object_key,
+            };
+          }
+          throw new UploadError('DEPENDENCY_UNAVAILABLE');
+        }
         if (response.status === 409) {
           const duplicate = await readBoundedJson(response);
           if (typeof duplicate?.existing_file_id === 'string') {

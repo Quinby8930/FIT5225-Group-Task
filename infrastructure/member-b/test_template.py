@@ -75,7 +75,14 @@ def test_template_declares_required_parameters(template):
         "NoEcho": True,
         "MinLength": 1,
     }
-    assert parameters["FfmpegLayerArn"]["Default"] == ""
+    assert "Default" not in parameters["FfmpegLayerArn"]
+    assert parameters["FfmpegLayerArn"]["AllowedPattern"] == (
+        "^arn:(aws|aws-us-gov|aws-cn):lambda:[a-z0-9-]+:[0-9]{12}:"
+        "layer:[A-Za-z0-9_-]+:[1-9][0-9]*$"
+    )
+    assert "Lambda Layer ARN" in parameters["FfmpegLayerArn"][
+        "ConstraintDescription"
+    ]
     assert parameters["MaxUploadBytes"]["Default"] == 262144000
     assert parameters["MaxImageUploadBytes"]["Default"] == 12582912
     assert parameters["InferenceHttpTimeoutSeconds"]["Default"] == 70
@@ -134,13 +141,17 @@ def test_media_bucket_is_private_encrypted_and_recoverable(template):
 
 
 def test_s3_event_is_filtered_to_originals(template):
-    event = _properties(template, "MediaProcessingFunction")["Events"][
-        "OriginalUpload"
+    notification = _properties(template, "MediaBucket")["NotificationConfiguration"]
+    assert notification["LambdaConfigurations"] == [
+        {
+            "Event": "s3:ObjectCreated:*",
+            "Function": {"Fn::GetAtt": "MediaProcessingFunction.Arn"},
+            "Filter": {
+                "S3Key": {"Rules": [{"Name": "prefix", "Value": "originals/"}]}
+            },
+        }
     ]
-    assert event["Type"] == "S3"
-    assert event["Properties"]["Events"] == "s3:ObjectCreated:*"
-    assert event["Properties"]["Bucket"] == {"Ref": "MediaBucket"}
-    rules = event["Properties"]["Filter"]["S3Key"]["Rules"]
+    rules = notification["LambdaConfigurations"][0]["Filter"]["S3Key"]["Rules"]
     assert rules == [{"Name": "prefix", "Value": "originals/"}]
 
 
@@ -155,17 +166,9 @@ def test_function_runtime_and_handler_contracts(template):
     assert processing["CodeUri"] == "../../backend/lambdas/media-processing/"
     assert processing["Handler"] == "handler.handler"
     assert processing["Timeout"] == 900
-    assert processing["MemorySize"] == 4096
+    assert processing["MemorySize"] == 3008
     assert processing["EphemeralStorage"] == {"Size": 4096}
-    assert processing["Layers"] == [
-        {
-            "Fn::If": [
-                "HasFfmpegLayer",
-                {"Ref": "FfmpegLayerArn"},
-                {"Ref": "AWS::NoValue"},
-            ]
-        }
-    ]
+    assert processing["Layers"] == [{"Ref": "FfmpegLayerArn"}]
 
     storage_delete = _properties(template, "StorageDeleteFunction")
     assert storage_delete["Runtime"] == "nodejs20.x"
@@ -332,7 +335,12 @@ def test_s3_policies_are_limited_to_owned_bucket_prefixes(template):
             {
                 "Effect": "Allow",
                 "Action": "s3:PutObject",
-                "Resource": {"Fn::Sub": "${MediaBucket.Arn}/originals/*"},
+                "Resource": {
+                    "Fn::Sub": (
+                        "arn:${AWS::Partition}:s3:::pacificbioarchive-media-"
+                        "${AWS::AccountId}-${AWS::Region}/originals/*"
+                    )
+                },
             }
         ],
         "MediaProcessingFunction": [
@@ -340,22 +348,47 @@ def test_s3_policies_are_limited_to_owned_bucket_prefixes(template):
                 "Effect": "Allow",
                 "Action": "s3:GetObject",
                 "Resource": [
-                    {"Fn::Sub": "${MediaBucket.Arn}/originals/*"},
-                    {"Fn::Sub": "${MediaBucket.Arn}/processing/*"},
+                    {
+                        "Fn::Sub": (
+                            "arn:${AWS::Partition}:s3:::pacificbioarchive-media-"
+                            "${AWS::AccountId}-${AWS::Region}/originals/*"
+                        )
+                    },
+                    {
+                        "Fn::Sub": (
+                            "arn:${AWS::Partition}:s3:::pacificbioarchive-media-"
+                            "${AWS::AccountId}-${AWS::Region}/processing/*"
+                        )
+                    },
                 ],
             },
             {
                 "Effect": "Allow",
                 "Action": "s3:PutObject",
                 "Resource": [
-                    {"Fn::Sub": "${MediaBucket.Arn}/thumbnails/*"},
-                    {"Fn::Sub": "${MediaBucket.Arn}/processing/*"},
+                    {
+                        "Fn::Sub": (
+                            "arn:${AWS::Partition}:s3:::pacificbioarchive-media-"
+                            "${AWS::AccountId}-${AWS::Region}/thumbnails/*"
+                        )
+                    },
+                    {
+                        "Fn::Sub": (
+                            "arn:${AWS::Partition}:s3:::pacificbioarchive-media-"
+                            "${AWS::AccountId}-${AWS::Region}/processing/*"
+                        )
+                    },
                 ],
             },
             {
                 "Effect": "Allow",
                 "Action": "s3:DeleteObject",
-                "Resource": {"Fn::Sub": "${MediaBucket.Arn}/processing/*"},
+                "Resource": {
+                    "Fn::Sub": (
+                        "arn:${AWS::Partition}:s3:::pacificbioarchive-media-"
+                        "${AWS::AccountId}-${AWS::Region}/processing/*"
+                    )
+                },
             },
         ],
         "StorageDeleteFunction": [
@@ -363,9 +396,24 @@ def test_s3_policies_are_limited_to_owned_bucket_prefixes(template):
                 "Effect": "Allow",
                 "Action": "s3:DeleteObject",
                 "Resource": [
-                    {"Fn::Sub": "${MediaBucket.Arn}/originals/*"},
-                    {"Fn::Sub": "${MediaBucket.Arn}/thumbnails/*"},
-                    {"Fn::Sub": "${MediaBucket.Arn}/processing/*"},
+                    {
+                        "Fn::Sub": (
+                            "arn:${AWS::Partition}:s3:::pacificbioarchive-media-"
+                            "${AWS::AccountId}-${AWS::Region}/originals/*"
+                        )
+                    },
+                    {
+                        "Fn::Sub": (
+                            "arn:${AWS::Partition}:s3:::pacificbioarchive-media-"
+                            "${AWS::AccountId}-${AWS::Region}/thumbnails/*"
+                        )
+                    },
+                    {
+                        "Fn::Sub": (
+                            "arn:${AWS::Partition}:s3:::pacificbioarchive-media-"
+                            "${AWS::AccountId}-${AWS::Region}/processing/*"
+                        )
+                    },
                 ],
             }
         ],
@@ -374,8 +422,18 @@ def test_s3_policies_are_limited_to_owned_bucket_prefixes(template):
                 "Effect": "Allow",
                 "Action": "s3:GetObject",
                 "Resource": [
-                    {"Fn::Sub": "${MediaBucket.Arn}/originals/*"},
-                    {"Fn::Sub": "${MediaBucket.Arn}/thumbnails/*"},
+                    {
+                        "Fn::Sub": (
+                            "arn:${AWS::Partition}:s3:::pacificbioarchive-media-"
+                            "${AWS::AccountId}-${AWS::Region}/originals/*"
+                        )
+                    },
+                    {
+                        "Fn::Sub": (
+                            "arn:${AWS::Partition}:s3:::pacificbioarchive-media-"
+                            "${AWS::AccountId}-${AWS::Region}/thumbnails/*"
+                        )
+                    },
                 ],
             }
         ],
@@ -388,9 +446,13 @@ def test_s3_policies_are_limited_to_owned_bucket_prefixes(template):
         assert all(statement["Resource"] != "*" for statement in statements)
 
 
-def test_outputs_expose_bucket_and_function_arns(template):
+def test_outputs_expose_bucket_and_function_deployment_identifiers(template):
     assert template["Outputs"] == {
-        "MediaBucketName": {"Value": {"Ref": "MediaBucket"}},
+        "MediaBucketName": {
+            "Value": {
+                "Fn::Sub": "pacificbioarchive-media-${AWS::AccountId}-${AWS::Region}"
+            }
+        },
         "UploadFunctionArn": {"Value": {"Fn::GetAtt": "UploadFunction.Arn"}},
         "MediaProcessingFunctionArn": {
             "Value": {"Fn::GetAtt": "MediaProcessingFunction.Arn"}
@@ -398,6 +460,7 @@ def test_outputs_expose_bucket_and_function_arns(template):
         "StorageDeleteFunctionArn": {
             "Value": {"Fn::GetAtt": "StorageDeleteFunction.Arn"}
         },
+        "StorageDeleteFunctionName": {"Value": {"Ref": "StorageDeleteFunction"}},
         "AssetUrlsFunctionArn": {
             "Value": {"Fn::GetAtt": "AssetUrlsFunction.Arn"}
         },

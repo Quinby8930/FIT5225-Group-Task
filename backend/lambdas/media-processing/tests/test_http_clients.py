@@ -66,7 +66,7 @@ def test_metadata_client_serializes_all_contract_methods_and_real_false_lease(
 ):
     opener = RecordingUrlOpen(
         [
-            {"should_process": False},
+            {"should_process": False, "state": "completed"},
             {"ok": True},
             {"ok": True},
         ]
@@ -96,7 +96,7 @@ def test_metadata_client_serializes_all_contract_methods_and_real_false_lease(
     )
 
     requests = [_recorded_request(request) for request, _ in opener.calls]
-    assert should_process is False
+    assert should_process == {"should_process": False, "state": "completed"}
     assert [(request["method"], request["path"]) for request in requests] == [
         ("POST", "/internal/files/file-1/processing"),
         ("PUT", "/internal/files/file-1/complete"),
@@ -184,6 +184,50 @@ def test_metadata_timeout_default_remains_ten_seconds(monkeypatch):
     )
 
     assert opener.calls[0][1] == 10
+
+
+@pytest.mark.parametrize(
+    "response",
+    [
+        {"should_process": True, "state": "acquired"},
+        {"should_process": False, "state": "lease_active"},
+        {"should_process": True},
+    ],
+)
+def test_metadata_client_preserves_the_processing_state_contract(monkeypatch, response):
+    monkeypatch.setattr(
+        http_clients_module, "urlopen", RecordingUrlOpen([response])
+    )
+
+    result = MetadataClient("https://metadata.example").begin_processing(
+        "file-1", {"user_id": "user-1"}
+    )
+
+    assert result == response
+
+
+@pytest.mark.parametrize(
+    "response",
+    [
+        {"should_process": True, "state": "completed"},
+        {"should_process": False, "state": "acquired"},
+        {"should_process": False, "state": "unknown"},
+    ],
+)
+def test_metadata_client_rejects_invalid_processing_state_combinations(
+    monkeypatch, response
+):
+    monkeypatch.setattr(
+        http_clients_module, "urlopen", RecordingUrlOpen([response])
+    )
+
+    with pytest.raises(MediaPipelineError) as caught:
+        MetadataClient("https://metadata.example").begin_processing(
+            "file-1", {"user_id": "user-1"}
+        )
+
+    assert caught.value.code == "DEPENDENCY_UNAVAILABLE"
+    assert caught.value.retryable is True
 
 
 @pytest.mark.parametrize(

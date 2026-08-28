@@ -37,8 +37,8 @@ def _require_string(value: Any, field: str, max_length: int = 128) -> str:
 def _validate_url(value: Any, field: str) -> str:
     value = _require_string(value, field, max_length=4096)
     parsed = urlparse(value)
-    if parsed.scheme not in {"https", "http"} or not parsed.netloc:
-        raise RequestValidationError(f"{field} must be an HTTP(S) URL")
+    if parsed.scheme != "https" or not parsed.netloc:
+        raise RequestValidationError(f"{field} must be an HTTPS URL")
     return value
 
 

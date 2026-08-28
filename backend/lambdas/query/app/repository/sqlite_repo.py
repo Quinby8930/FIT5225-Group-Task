@@ -111,6 +111,28 @@ class SQLiteRepository(FileRepository):
         self._conn.commit()
 
     # -- writes -----------------------------------------------------------
+    def reserve(self, record: FileRecord) -> tuple[FileRecord, bool]:
+        try:
+            self.add(record)
+            return record, True
+        except DuplicateError:
+            existing = self.find_by_user_checksum(
+                record.user_id, record.checksum
+            ) or self.get(record.file_id)
+            if existing is None:
+                raise
+            return existing, False
+
+    def reuse_upload(self, file_id: str) -> Optional[FileRecord]:
+        cursor = self._conn.execute(
+            "UPDATE files SET status='pending_upload', error_code=NULL, message=NULL, "
+            "processing_sequencer=NULL, lease_expires_at=NULL "
+            "WHERE file_id=? AND status IN ('pending_upload', 'failed')",
+            (file_id,),
+        )
+        self._conn.commit()
+        return self.get(file_id) if cursor.rowcount == 1 else None
+
     def add(self, record: FileRecord) -> None:
         try:
             self._conn.execute(
@@ -141,6 +163,31 @@ class SQLiteRepository(FileRepository):
         )
         self._conn.commit()
 
+    def try_acquire_processing(
+        self,
+        file_id: str,
+        sequencer: str,
+        now: datetime,
+        lease_expires_at: datetime,
+    ) -> str:
+        cursor = self._conn.execute(
+            "UPDATE files SET status='processing', processing_sequencer=?, "
+            "lease_expires_at=?, error_code=NULL, message=NULL "
+            "WHERE file_id=? AND status <> 'completed' AND "
+            "(status <> 'processing' OR lease_expires_at IS NULL OR lease_expires_at <= ?)",
+            (
+                sequencer,
+                lease_expires_at.isoformat(),
+                file_id,
+                now.isoformat(),
+            ),
+        )
+        self._conn.commit()
+        if cursor.rowcount == 1:
+            return "acquired"
+        record = self.get(file_id)
+        return "completed" if record and record.status == "completed" else "lease_active"
+
     def mark_completed(
         self,
         file_id: str,
@@ -155,7 +202,7 @@ class SQLiteRepository(FileRepository):
             "UPDATE files SET status='completed', object_key=?, thumbnail_key=?, "
             "file_type=?, tags_json=?, detections_json=?, model_version=?, "
             "processing_sequencer=NULL, lease_expires_at=NULL, error_code=NULL, "
-            "message=NULL WHERE file_id=?",
+            "message=NULL WHERE file_id=? AND status <> 'completed'",
             (
                 original_key,
                 thumbnail_key,
@@ -171,7 +218,8 @@ class SQLiteRepository(FileRepository):
     def mark_failed(self, file_id: str, error_code: str, message: str) -> None:
         self._conn.execute(
             "UPDATE files SET status='failed', error_code=?, message=?, "
-            "processing_sequencer=NULL, lease_expires_at=NULL WHERE file_id=?",
+            "processing_sequencer=NULL, lease_expires_at=NULL "
+            "WHERE file_id=? AND status <> 'completed'",
             (error_code, message, file_id),
         )
         self._conn.commit()

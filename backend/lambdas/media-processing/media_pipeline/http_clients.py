@@ -148,7 +148,21 @@ class MetadataClient(_JsonHttpClient):
                 "Metadata response did not match its contract",
                 retryable=True,
             )
-        return result["should_process"]
+        if "state" in result and (
+            (result["state"] == "acquired" and result["should_process"] is True)
+            or (
+                result["state"] in {"completed", "lease_active"}
+                and result["should_process"] is False
+            )
+        ):
+            return result
+        if "state" not in result:
+            return result
+        raise MediaPipelineError(
+            "DEPENDENCY_UNAVAILABLE",
+            "Metadata response did not match its contract",
+            retryable=True,
+        )
 
     def complete(self, file_id, payload):
         self._metadata_request("PUT", file_id, "complete", payload)

@@ -7,7 +7,7 @@ repository so it is trivially unit-testable and identical on SQLite/DynamoDB.
 
 from __future__ import annotations
 
-from uuid import uuid4
+from uuid import NAMESPACE_URL, uuid5
 from typing import Callable
 
 from app.schemas import Notification
@@ -32,7 +32,12 @@ def build_notifications(
         for user_id in subscribers_for_species(species):
             notifications.append(
                 Notification(
-                    notification_id=str(uuid4()),
+                    notification_id=str(
+                        uuid5(
+                            NAMESPACE_URL,
+                            f"pacific-bioarchive\0{file_id}\0{user_id}\0{species}",
+                        )
+                    ),
                     user_id=user_id,
                     file_id=file_id,
                     species=species,

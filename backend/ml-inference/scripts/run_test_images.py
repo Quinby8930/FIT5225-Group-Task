@@ -59,7 +59,9 @@ def main() -> None:
                 max_source_urls=60,
             )
             item_started = time.perf_counter()
-            result = InferenceService(backend, lambda _: raw).infer(request)
+            result = InferenceService(
+                backend, lambda _, *, deadline=None: raw
+            ).infer(request)
             elapsed_ms = round((time.perf_counter() - item_started) * 1000, 2)
             predicted = next(iter(result.tags), None)
             expected = expected_label(image_name)

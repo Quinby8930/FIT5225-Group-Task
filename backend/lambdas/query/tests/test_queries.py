@@ -16,6 +16,7 @@ from app import main
 from app.notification_client import NotificationPublisher
 from app.repository import SQLiteNotificationRepository, SQLiteRepository
 from app.schemas import FileRecord, Notification
+from app.services.notification_service import build_notifications
 from app.services.query_service import (
     filter_by_min_counts,
     filter_by_species,
@@ -77,6 +78,12 @@ class TestPureLogic:
             _record("vid", "video", None, {"dingo": 1}, obj="originals/vid.mp4"),
         ]
         assert to_display_keys(records) == ["thumbnails/img.jpg", "originals/vid.mp4"]
+
+    def test_notification_identity_is_deterministic_per_file_user_species(self):
+        first = build_notifications("f1", "originals/f1", {"wombat": 1}, lambda _s: ["u2"])
+        replay = build_notifications("f1", "originals/f1", {"wombat": 1}, lambda _s: ["u2"])
+
+        assert first[0].notification_id == replay[0].notification_id
 
 
 # ---------------------------------------------------------------------------
@@ -199,6 +206,21 @@ class TestEndpoints:
                 "content": b"fake-image-bytes",
             }
         ]
+
+    def test_by_file_with_no_detected_tags_returns_no_archive_results(self, client):
+        class _EmptyDetector(TagDetector):
+            def detect(self, **_kwargs):
+                return {}
+
+        main.app.dependency_overrides[main.get_detector] = lambda: _EmptyDetector()
+
+        response = client.post(
+            "/query/by-file",
+            files={"file": ("query.jpg", b"image", "image/jpeg")},
+        )
+
+        assert response.status_code == 200
+        assert response.json() == {"results": [], "count": 0}
 
     @pytest.mark.parametrize(
         "content_type", ["image/jpeg", "image/png", "image/webp"]
@@ -489,25 +511,87 @@ def _reserve(client, fid, checksum=None, user="u1"):
 
 
 class TestMetadataEndpoints:
-    def test_reserve_201_then_409(self, client):
-        assert _reserve(client, "r1").status_code == 201
-        assert client.repo.get("r1").status == "pending_upload"
-        r2 = _reserve(client, "r1")
-        assert r2.status_code == 409
-        assert r2.json()["existing_file_id"] == "r1"
+    def test_pending_reservation_is_reused_with_original_upload_identity(self, client):
+        first = _reserve(client, "r1", checksum="sha256:shared")
+        second = _reserve(client, "r-new", checksum="sha256:shared")
 
-    def test_reserve_duplicate_checksum_other_id(self, client):
+        assert first.status_code == 201
+        assert second.status_code == 201
+        assert second.json() == {
+            "file_id": "r1",
+            "object_key": "originals/r1",
+            "status": "pending_upload",
+            "reused": True,
+        }
+        assert client.repo.get("r-new") is None
+
+    def test_completed_reservation_remains_duplicate(self, client):
         _reserve(client, "r2", checksum="sha256:shared")
+        client.repo.mark_completed("r2", "originals/r2", None, "image", {}, [], "v1")
         r = _reserve(client, "r3", checksum="sha256:shared")
         assert r.status_code == 409
         assert r.json()["existing_file_id"] == "r2"
+
+    def test_failed_reservation_is_reset_and_reused(self, client):
+        _reserve(client, "failed-old", checksum="sha256:retry")
+        client.repo.mark_failed("failed-old", "INVALID_MEDIA", "temporary")
+
+        response = _reserve(client, "failed-new", checksum="sha256:retry")
+
+        assert response.status_code == 201
+        assert response.json()["file_id"] == "failed-old"
+        assert response.json()["object_key"] == "originals/failed-old"
+        assert response.json()["reused"] is True
+        record = client.repo.get("failed-old")
+        assert record.status == "pending_upload"
+        assert record.error_code is None
+        assert record.message is None
+
+    def test_reuse_rejects_changed_immutable_upload_metadata(self, client):
+        _reserve(client, "metadata-old", checksum="sha256:metadata")
+
+        response = client.post(
+            "/internal/uploads/reserve",
+            headers={"X-Internal-Api-Key": INTERNAL_API_KEY},
+            json={
+                "file_id": "metadata-new",
+                "user_id": "u1",
+                "checksum": "sha256:metadata",
+                "filename": "changed.jpg",
+                "file_type": "image",
+                "content_type": "image/jpeg",
+                "size_bytes": 100,
+                "object_key": "originals/metadata-new",
+            },
+        )
+
+        assert response.status_code == 409
+        assert response.json()["detail"]["code"] == "METADATA_CONFLICT"
+
+    def test_delete_releases_checksum_for_a_new_upload(self, client):
+        _reserve(client, "delete-old", checksum="sha256:delete")
+        delete_response = client.post(
+            "/files/delete", json={"keys": ["originals/delete-old"]}
+        )
+
+        replacement = _reserve(client, "delete-new", checksum="sha256:delete")
+
+        assert delete_response.status_code == 200
+        assert replacement.status_code == 201
+        assert replacement.json()["file_id"] == "delete-new"
 
     def test_processing_lease_granted_then_denied(self, client):
         _reserve(client, "p1")
         body = {"user_id": "u1", "object_key": "originals/p1", "sequencer": "seq1"}
         headers = {"X-Internal-Api-Key": INTERNAL_API_KEY}
-        assert client.post("/internal/files/p1/processing", json=body, headers=headers).json()["should_process"] is True
-        assert client.post("/internal/files/p1/processing", json=body, headers=headers).json()["should_process"] is False
+        acquired = client.post(
+            "/internal/files/p1/processing", json=body, headers=headers
+        ).json()
+        active = client.post(
+            "/internal/files/p1/processing", json=body, headers=headers
+        ).json()
+        assert acquired == {"should_process": True, "state": "acquired"}
+        assert active == {"should_process": False, "state": "lease_active"}
 
     def test_processing_completed_returns_false(self, client):
         _reserve(client, "p2")
@@ -517,7 +601,7 @@ class TestMetadataEndpoints:
             headers={"X-Internal-Api-Key": INTERNAL_API_KEY},
             json={"user_id": "u1", "object_key": "originals/p2", "sequencer": "s"},
         )
-        assert r.json()["should_process"] is False
+        assert r.json() == {"should_process": False, "state": "completed"}
 
     def test_complete_idempotent(self, client):
         _reserve(client, "c1")
@@ -581,6 +665,42 @@ class TestMetadataEndpoints:
             json={"user_id": "u1", "error_code": "X", "message": "m", "status": "failed"},
         )
         assert client.repo.get("e2").status == "completed"
+
+    def test_sqlite_mark_failed_condition_blocks_stale_callback_downgrade(self, client):
+        _reserve(client, "e2-race")
+        client.repo.mark_completed(
+            "e2-race", "originals/e2-race", None, "image", {}, [], "v1"
+        )
+
+        client.repo.mark_failed("e2-race", "INFERENCE_FAILED", "late callback")
+
+        assert client.repo.get("e2-race").status == "completed"
+
+    def test_sqlite_first_complete_wins_concurrent_callback_race(self, client):
+        _reserve(client, "complete-race")
+        client.repo.mark_completed(
+            "complete-race",
+            "originals/complete-race",
+            None,
+            "image",
+            {"wombat": 1},
+            [],
+            "first",
+        )
+
+        client.repo.mark_completed(
+            "complete-race",
+            "originals/complete-race",
+            None,
+            "image",
+            {"fox": 9},
+            [],
+            "late",
+        )
+
+        record = client.repo.get("complete-race")
+        assert record.tags == {"wombat": 1}
+        assert record.model_version == "first"
 
     @pytest.mark.parametrize("route", ["reserve", "processing", "complete", "failed"])
     @pytest.mark.parametrize(
@@ -866,3 +986,85 @@ class TestSubscriptionAndNotification:
         self._complete(client, "n3", {"wombat": 1})
         self._complete(client, "n3", {"wombat": 1})  # idempotent replay
         assert len(client.notif_repo.notifications("u2")) == 1
+        assert len(client.publisher.published) == 1
+
+    def test_publish_failure_keeps_pending_inbox_and_completed_replay_retries(
+        self, client
+    ):
+        client.notif_repo.subscribe("u2", "wombat")
+        _reserve(client, "n-retry")
+        attempts = []
+
+        def fail_after_observing_pending(notification):
+            attempts.append(notification.notification_id)
+            assert [
+                item.notification_id
+                for item in client.notif_repo.pending_for_file("n-retry")
+            ] == [notification.notification_id]
+            raise RuntimeError("temporary SNS outage")
+
+        client.publisher.publish = fail_after_observing_pending
+
+        first = self._complete(client, "n-retry", {"wombat": 1})
+
+        assert first.status_code == 200
+        assert len(client.notif_repo.notifications("u2")) == 1
+        assert len(client.notif_repo.pending_for_file("n-retry")) == 1
+
+        client.publisher.publish = lambda notification: attempts.append(
+            notification.notification_id
+        )
+        replay = self._complete(client, "n-retry", {"wombat": 1})
+        delivered_replay = self._complete(client, "n-retry", {"wombat": 1})
+
+        assert replay.status_code == 200
+        assert delivered_replay.status_code == 200
+        assert attempts[0] == attempts[1]
+        assert len(attempts) == 2
+        assert client.notif_repo.pending_for_file("n-retry") == []
+
+    def test_inbox_is_ensured_before_mark_completed_and_retry_is_idempotent(
+        self, client
+    ):
+        client.notif_repo.subscribe("u2", "wombat")
+        _reserve(client, "n-mark-fails")
+        original_mark_completed = client.repo.mark_completed
+        client.repo.mark_completed = lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            RuntimeError("DynamoDB update failed")
+        )
+
+        with pytest.raises(RuntimeError, match="DynamoDB update failed"):
+            self._complete(client, "n-mark-fails", {"wombat": 1})
+
+        assert client.repo.get("n-mark-fails").status == "pending_upload"
+        assert len(client.notif_repo.pending_for_file("n-mark-fails")) == 1
+
+        client.repo.mark_completed = original_mark_completed
+        replay = self._complete(client, "n-mark-fails", {"wombat": 1})
+
+        assert replay.status_code == 200
+        assert len(client.notif_repo.notifications("u2")) == 1
+        assert len(client.publisher.published) == 1
+
+    def test_completed_replay_does_not_notify_late_subscribers(self, client):
+        _reserve(client, "n-late-subscriber")
+        self._complete(client, "n-late-subscriber", {"wombat": 1})
+        client.notif_repo.subscribe("u2", "wombat")
+
+        replay = self._complete(client, "n-late-subscriber", {})
+
+        assert replay.status_code == 200
+        assert client.notif_repo.notifications("u2") == []
+        assert client.publisher.published == []
+
+    def test_delivery_status_update_failure_does_not_fail_complete(self, client):
+        client.notif_repo.subscribe("u2", "wombat")
+        _reserve(client, "n-delivery-state")
+        client.notif_repo.mark_delivered = lambda _notification: (_ for _ in ()).throw(
+            RuntimeError("DynamoDB update failed")
+        )
+
+        response = self._complete(client, "n-delivery-state", {"wombat": 1})
+
+        assert response.status_code == 200
+        assert len(client.notif_repo.pending_for_file("n-delivery-state")) == 1

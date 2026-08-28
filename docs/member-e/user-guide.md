@@ -57,7 +57,7 @@ npm run dev
 Member E only needs the final API base URL from Member A:
 
 ```text
-VITE_API_BASE_URL=https://<api-id>.execute-api.ap-southeast-2.amazonaws.com
+VITE_API_BASE_URL=https://2dd2aqb32j.execute-api.ap-southeast-2.amazonaws.com/dev
 ```
 
 Do not set `VITE_ASSET_BASE_URL`. Query result previews and full-image/video

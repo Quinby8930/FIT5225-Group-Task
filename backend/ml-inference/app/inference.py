@@ -20,6 +20,14 @@ class InferenceInputError(ValueError):
     """Raised when a source cannot be decoded as a supported image."""
 
 
+class SourceUnavailableError(ConnectionError):
+    """Raised when a remote source cannot currently be downloaded."""
+
+
+class SourceTimeoutError(TimeoutError):
+    """Raised when downloading a remote source exceeds its time budget."""
+
+
 class InferenceTimeoutError(TimeoutError):
     """Raised when a request exceeds the configured inference budget."""
 
@@ -55,7 +63,7 @@ class InferenceService:
     def __init__(
         self,
         backend: InferenceBackend,
-        fetch_url: Callable[[str], bytes],
+        fetch_url: Callable[..., bytes],
         species_mapper: SpeciesMapper | None = None,
         *,
         max_detections: int = 1000,
@@ -83,7 +91,9 @@ class InferenceService:
         tags: Counter[str] = Counter()
         detections: list[dict[str, float | str]] = []
         for index, url in enumerate(request.image_urls):
-            raw = self._within_deadline(lambda: self.fetch_url(url), deadline)
+            raw = self._within_deadline(
+                lambda: self.fetch_url(url, deadline=deadline), deadline
+            )
             image = self._within_deadline(lambda: _open_image(raw), deadline)
             try:
                 predictions = self._within_deadline(
