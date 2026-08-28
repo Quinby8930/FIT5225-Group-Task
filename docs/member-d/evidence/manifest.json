@@ -1,0 +1,37 @@
+{
+  "generated_at": "2026-08-28T10:16:39.656417+00:00",
+  "commit": "ad5d082",
+  "database": "artifacts/member-d-evidence.db",
+  "html_pages": [
+    "html/01.html",
+    "html/02.html",
+    "html/03.html",
+    "html/04.html",
+    "html/05.html",
+    "html/06.html",
+    "html/07.html",
+    "html/08.html",
+    "html/09.html",
+    "html/10.html",
+    "html/11.html",
+    "html/12.html",
+    "html/13.html",
+    "html/14.html"
+  ],
+  "screenshots": [
+    "screenshots/Test suite 147 passing.png",
+    "screenshots/SQLite local backend.png",
+    "screenshots/Query by tags AND.png",
+    "screenshots/Query by species.png",
+    "screenshots/Thumbnail to original mapping.png",
+    "screenshots/Query by uploaded file.png",
+    "screenshots/Bulk tag edit.png",
+    "screenshots/Bulk delete with owner check.png",
+    "screenshots/Reserve returns 201.png",
+    "screenshots/Complete idempotent 200.png",
+    "screenshots/Internal auth fails closed.png",
+    "screenshots/Subscribe to species.png",
+    "screenshots/Notification triggered on complete.png",
+    "screenshots/List subscriptions.png"
+  ]
+}

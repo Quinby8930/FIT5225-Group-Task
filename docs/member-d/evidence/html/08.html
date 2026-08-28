@@ -1,0 +1,54 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width">
+<title>Bulk delete with owner check</title>
+<style>
+*{box-sizing:border-box} html,body{margin:0;width:100%;min-height:100%;background:#07111f;color:#e8eef7}
+body{font-family:Inter,Segoe UI,Arial,sans-serif;padding:34px 42px}
+.top{display:flex;justify-content:space-between;align-items:flex-start;border-bottom:1px solid #26374e;padding-bottom:20px;margin-bottom:24px}
+.eyebrow{color:#6dd6ff;font-size:14px;font-weight:700;letter-spacing:.12em;text-transform:uppercase}
+h1{font-size:31px;line-height:1.2;margin:8px 0 4px} .sub{color:#9fb0c7;font-size:14px}
+.badges{display:flex;gap:8px;flex-wrap:wrap;justify-content:flex-end;max-width:470px}
+.badge{border:1px solid #31506e;background:#10243a;border-radius:999px;padding:7px 11px;font:600 12px Consolas,monospace;color:#bde8ff}
+.grid{display:grid;grid-template-columns:1fr 1.08fr;gap:20px}
+.card{background:#0d1b2d;border:1px solid #263a52;border-radius:13px;overflow:hidden;box-shadow:0 10px 30px rgba(0,0,0,.22)}
+.wide{grid-column:1/-1} .label{padding:11px 15px;background:#12253b;border-bottom:1px solid #263a52;color:#9fb7d1;font:700 12px Consolas,monospace;text-transform:uppercase;letter-spacing:.08em}
+pre{margin:0;padding:17px 18px;font:15px/1.48 Consolas,'Cascadia Mono',monospace;white-space:pre-wrap;word-break:break-word;color:#edf5ff;max-height:420px;overflow:hidden}
+.status{display:inline-block;margin:16px 18px 0;padding:8px 13px;border-radius:7px;font:800 15px Consolas,monospace}
+.ok{background:#0d3d2c;color:#6cf0b3;border:1px solid #1f7657} .error{background:#402029;color:#ff9eae;border:1px solid #7b3545}
+ul{list-style:none;margin:0;padding:13px 18px 17px} li{padding:5px 0;color:#baf2d5;font:14px/1.35 Consolas,monospace}
+.footer{display:flex;justify-content:space-between;margin-top:22px;color:#7488a2;font:12px Consolas,monospace}
+.note{margin-top:14px;color:#9fb0c7;font-size:12px}
+</style></head><body>
+<div class="top"><div><div class="eyebrow">Pacific BioArchive · Member D · Local Evidence #08</div><h1>Bulk delete with owner check</h1><div class="sub">Real local execution against the current repository checkout.</div></div>
+<div class="badges"><span class="badge">COMMIT ad5d082</span><span class="badge">FASTAPI</span><span class="badge">SQLITE</span><span class="badge">LOCAL</span></div></div>
+<div class="grid">
+<section class="card wide"><div class="label">Command / endpoint</div><pre>POST /files/delete · owner enforcement</pre></section>
+<section class="card"><div class="label">Request</div><pre>OWNER · POST /files/delete
+{
+  &quot;keys&quot;: [
+    &quot;originals/u1/a2.jpg&quot;
+  ]
+}
+
+NON-OWNER · POST /files/delete
+{
+  &quot;keys&quot;: [
+    &quot;originals/u2/a3.jpg&quot;
+  ]
+}</pre></section>
+<section class="card"><div class="label">Response / output</div><div class="status ok">HTTP 200 + HTTP 403</div><pre>OWNER REQUEST
+{
+  &quot;deleted_db_records&quot;: 1,
+  &quot;storage_objects_removed&quot;: 2
+}
+
+NON-OWNER REQUEST
+{
+  &quot;detail&quot;: {
+    &quot;code&quot;: &quot;FORBIDDEN_OWNER&quot;,
+    &quot;message&quot;: &quot;media is not owned by the authenticated user&quot;
+  }
+}</pre></section>
+<section class="card wide"><div class="label">Verified assertions</div><ul><li>✓ Owner deletion removed 1 DB record and 2 storage keys</li><li>✓ Non-owner deletion returned 403 FORBIDDEN_OWNER</li><li>✓ Foreign record f4 remains in the database</li></ul></section>
+</div><div class="footer"><span>2026-08-28 18:16:38 中国标准时间</span><span>Generated from real repository execution · no cloud resources used</span></div>
+</body></html>
