@@ -16,7 +16,7 @@ export default function MediaCard({ item, assetStates, selected, onToggle, onOpe
   return <article className="media-card">
     <div className="media-preview">
       {url && item.file_type === "image" && <img src={url} alt={`Archive image ${shortId}`} loading="lazy" />}
-      {url && item.file_type === "video" && <video controls preload="none" src={url}><track kind="captions" /></video>}
+      {url && item.file_type === "video" && <video controls preload="none" src={url} aria-label={`Archive video ${shortId}`}>Your browser cannot play this video.</video>}
       {!url && <span>{previewMessage(state)}</span>}
     </div>
     <div className="media-card-body">

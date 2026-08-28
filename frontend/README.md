@@ -71,8 +71,8 @@ npm test
 npm run build
 ```
 
-The Node contract-flow test mocks `fetch` and checks request shapes for upload
+The Node mocked contract/integration flow test mocks `fetch` and checks request shapes for upload
 pre-signing, S3 PUT, asset URL signing, tag query, bulk tag edit, deletion, and
 identity-free subscription/inbox operations; it is not a real browser E2E test.
 Focused Node tests cover PKCE/callback replay, structured API failures, query
-normalization, selection-to-mutation mapping, and per-key URL state handling.
+normalization, thumbnail lookup's structured `item`, selection-to-mutation mapping, and per-key URL state handling. Browser viewport, focus, and keyboard checks at 390/768/1440 remain deployment-time manual verification.

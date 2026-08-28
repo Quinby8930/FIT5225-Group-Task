@@ -1,14 +1,12 @@
 import React from "react";
 import {
-  getCurrentUser,
   signIn,
   signInWithGoogle,
   signUp,
   signOut,
 } from "./cognitoAuth";
 
-export default function AuthControls() {
-  const user = getCurrentUser();
+export default function AuthControls({ user }) {
 
   if (!user) {
     return (

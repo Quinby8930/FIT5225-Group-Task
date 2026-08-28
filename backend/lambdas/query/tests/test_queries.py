@@ -295,6 +295,12 @@ class TestEndpoints:
         r = client.get("/query/by-thumbnail", params={"key": "thumbnails/f1.jpg"})
         assert r.status_code == 200
         assert r.json()["original_key"] == "originals/f1"
+        assert r.json()["item"] == {
+            "file_id": "f1", "file_type": "image",
+            "display_key": "thumbnails/f1.jpg", "original_key": "originals/f1",
+            "thumbnail_key": "thumbnails/f1.jpg", "can_preview": True,
+            "can_manage": True,
+        }
 
     def test_by_thumbnail_url_normalizes_to_key(self, client):
         response = client.get(
@@ -308,7 +314,9 @@ class TestEndpoints:
         )
 
         assert response.status_code == 200
-        assert response.json() == {"original_key": "originals/f1", "file_id": "f1"}
+        assert response.json()["original_key"] == "originals/f1"
+        assert response.json()["file_id"] == "f1"
+        assert response.json()["item"]["file_type"] == "image"
 
     def test_by_thumbnail_missing_404(self, client):
         r = client.get("/query/by-thumbnail", params={"key": "thumbnails/nope.jpg"})

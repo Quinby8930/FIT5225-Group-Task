@@ -4,6 +4,30 @@ const TOKEN_STORAGE_KEY = "pacificBioArchive.tokens";
 const PKCE_STORAGE_KEY = "pacificBioArchive.pkce";
 const callbackExchanges = new Map();
 
+function safeJson(value) {
+  if (typeof value !== "string") return null;
+  try { return JSON.parse(value); } catch { return null; }
+}
+
+export function decodeJwtSegment(segment) {
+  if (typeof segment !== "string" || !segment || !/^[A-Za-z0-9_-]+$/.test(segment)) return null;
+  try {
+    const normalized = segment.replace(/-/g, "+").replace(/_/g, "/");
+    const padded = normalized + "=".repeat((4 - (normalized.length % 4)) % 4);
+    const decoded = Uint8Array.from(atob(padded), (char) => char.charCodeAt(0));
+    const value = JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(decoded));
+    return value && typeof value === "object" && !Array.isArray(value) ? value : null;
+  } catch { return null; }
+}
+
+function emitAuthChange(reason) {
+  if (typeof globalThis.dispatchEvent !== "function") return;
+  const event = typeof CustomEvent === "function"
+    ? new CustomEvent("pacificBioArchive:auth", { detail: { reason } })
+    : Object.assign(new Event("pacificBioArchive:auth"), { detail: { reason } });
+  globalThis.dispatchEvent(event);
+}
+
 function base64UrlEncode(buffer) {
   const bytes = new Uint8Array(buffer);
   let binary = "";
@@ -119,7 +143,9 @@ export async function handleAuthCallback(
     return existingExchange.promise;
   }
 
-  const pkce = JSON.parse(sessionStorage.getItem(PKCE_STORAGE_KEY) || "{}");
+  const rawPkce = sessionStorage.getItem(PKCE_STORAGE_KEY);
+  const pkce = safeJson(rawPkce) || {};
+  if (rawPkce !== null && !safeJson(rawPkce)) sessionStorage.removeItem(PKCE_STORAGE_KEY);
   if (!pkce.codeVerifier || pkce.state !== returnedState) {
     throw new Error("Invalid Cognito callback state. Please sign in again.");
   }
@@ -161,15 +187,24 @@ export async function handleAuthCallback(
 
 export function saveTokens(tokens) {
   localStorage.setItem(TOKEN_STORAGE_KEY, JSON.stringify(tokens));
+  emitAuthChange("authenticated");
 }
 
 export function getTokens() {
-  return JSON.parse(localStorage.getItem(TOKEN_STORAGE_KEY) || "null");
+  const tokens = readStoredTokens();
+  if (!tokens || typeof tokens !== "object" || Array.isArray(tokens)) {
+    if (localStorage.getItem(TOKEN_STORAGE_KEY) !== null) clearTokens("invalid");
+    return null;
+  }
+  return tokens;
 }
 
-export function clearTokens() {
+export function readStoredTokens() { return safeJson(localStorage.getItem(TOKEN_STORAGE_KEY)); }
+
+export function clearTokens(reason = "signed_out") {
   localStorage.removeItem(TOKEN_STORAGE_KEY);
   sessionStorage.removeItem(PKCE_STORAGE_KEY);
+  emitAuthChange(reason);
 }
 
 export function getAuthorizationHeader() {
@@ -184,33 +219,34 @@ export function getAuthorizationHeader() {
 }
 
 export function parseJwt(token) {
-  const [, payload] = token.split(".");
-  if (!payload) {
-    return null;
-  }
+  if (typeof token !== "string") return null;
+  const parts = token.split(".");
+  if (parts.length !== 3 || !parts[2] || !/^[A-Za-z0-9_-]+$/.test(parts[2])) return null;
+  const header = decodeJwtSegment(parts[0]);
+  const payload = decodeJwtSegment(parts[1]);
+  return header && payload ? payload : null;
+}
 
-  const normalized = payload.replace(/-/g, "+").replace(/_/g, "/");
-  const decoded = atob(normalized);
-  return JSON.parse(
-    decodeURIComponent(
-      decoded
-        .split("")
-        .map((char) => `%${char.charCodeAt(0).toString(16).padStart(2, "0")}`)
-        .join("")
-    )
-  );
+export function inspectAuthSession(tokens, now = Date.now()) {
+  if (!tokens || typeof tokens !== "object" || Array.isArray(tokens) || typeof tokens.id_token !== "string") return { user: null, reason: "invalid", shouldClear: Boolean(tokens) };
+  const user = parseJwt(tokens.id_token);
+  if (!user) return { user: null, reason: "invalid", shouldClear: true };
+  if (!Number.isFinite(user.exp) || user.exp <= 0) return { user: null, reason: "invalid", shouldClear: true };
+  if (user.exp * 1000 <= now) return { user: null, reason: "expired", shouldClear: true };
+  return { user, reason: null, shouldClear: false };
+}
+
+export function inspectStoredAuthSession(now = Date.now()) {
+  const raw = localStorage.getItem(TOKEN_STORAGE_KEY);
+  if (raw === null) return { user: null, reason: null, shouldClear: false };
+  const tokens = safeJson(raw);
+  if (!tokens || typeof tokens !== "object" || Array.isArray(tokens)) return { user: null, reason: "invalid", shouldClear: true };
+  return inspectAuthSession(tokens, now);
 }
 
 export function getCurrentUser() {
   const tokens = getTokens();
-  if (!tokens?.id_token) {
-    return null;
-  }
-
-  const user = parseJwt(tokens.id_token);
-  if (!user?.exp || user.exp * 1000 <= Date.now()) {
-    clearTokens();
-    return null;
-  }
-  return user;
+  const inspected = inspectAuthSession(tokens);
+  if (inspected.shouldClear) clearTokens(inspected.reason);
+  return inspected.user;
 }

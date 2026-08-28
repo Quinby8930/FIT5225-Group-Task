@@ -56,7 +56,7 @@ export async function apiRequest(path, options = {}) {
 
   if (!response.ok) {
     if (response.status === 401) {
-      clearTokens();
+      clearTokens("expired");
     }
     throw new ApiError(errorMessage(data, response.status), {
       status: response.status,

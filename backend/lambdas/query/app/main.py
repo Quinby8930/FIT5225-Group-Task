@@ -458,7 +458,11 @@ def query_by_thumbnail(
                 "message": "thumbnail key not found",
             },
         )
-    return {"original_key": record.object_key, "file_id": record.file_id}
+    return {
+        "original_key": record.object_key,
+        "file_id": record.file_id,
+        "item": to_query_items([record], _user)[0].model_dump(),
+    }
 
 
 @app.post("/query/by-file", response_model=QueryResponse)

@@ -35,10 +35,10 @@ export function normalizeQueryResponse(data) {
       knownFileIds.add(item.file_id);
       return true;
     });
-  const displayKeys = new Set(structuredItems.map((item) => item.display_key));
+  const coveredKeys = new Set(structuredItems.flatMap((item) => [item.display_key, item.original_key, item.thumbnail_key]).filter(Boolean));
   const legacyItems = (Array.isArray(source.results) ? source.results : [])
     .flatMap((key, index) => {
-      if (!nonEmptyString(key) || displayKeys.has(key)) return [];
+      if (!nonEmptyString(key) || coveredKeys.has(key)) return [];
       return [{
         identity: `legacy:${index}:${key}`,
         file_id: null,

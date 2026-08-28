@@ -1,5 +1,5 @@
 import React, { useEffect, useRef, useState } from "react";
-import { handleAuthCallback, getCurrentUser } from "./cognitoAuth";
+import { handleAuthCallback, getCurrentUser, signIn } from "./cognitoAuth";
 
 export default function AuthCallback() {
   const [status, setStatus] = useState("Signing you in...");
@@ -31,7 +31,8 @@ export default function AuthCallback() {
 
   return (
     <main>
-      <h1>{status}</h1>
+      <h1 role="status" aria-live="polite">{status}</h1>
+      {!user && status !== "Signing you in..." && <button type="button" onClick={signIn}>Sign in again</button>}
       {user && (
         <dl>
           <dt>Email</dt>

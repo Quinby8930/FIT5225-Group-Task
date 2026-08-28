@@ -4,7 +4,15 @@ import test from "node:test";
 import {
   buildLoginUrl,
   buildSignUpUrl,
+  clearTokens,
+  decodeJwtSegment,
+  getCurrentUser,
+  getTokens,
   handleAuthCallback,
+  parseJwt,
+  inspectAuthSession,
+  inspectStoredAuthSession,
+  saveTokens,
 } from "./cognitoAuth.js";
 
 const PKCE_STORAGE_KEY = "pacificBioArchive.pkce";
@@ -30,6 +38,10 @@ function installBrowserStubs() {
   globalThis.localStorage = storage();
   globalThis.sessionStorage = storage();
   globalThis.btoa = (value) => Buffer.from(value, "binary").toString("base64");
+  const events = new EventTarget();
+  globalThis.addEventListener = events.addEventListener.bind(events);
+  globalThis.removeEventListener = events.removeEventListener.bind(events);
+  globalThis.dispatchEvent = events.dispatchEvent.bind(events);
   Object.defineProperty(globalThis, "crypto", {
     configurable: true,
     value: {
@@ -161,5 +173,70 @@ test("failed token exchange retains PKCE and can retry the same code", async () 
     { id_token: "retry-token" }
   );
   assert.equal(requests, 2);
+  assert.equal(sessionStorage.getItem(PKCE_STORAGE_KEY), null);
+});
+
+function tokenFor(payload) {
+  const encode = (value) => Buffer.from(JSON.stringify(value)).toString("base64url");
+  return `${encode({ alg: "none" })}.${encode(payload)}.signature`;
+}
+
+test("damaged token and PKCE storage are safe and expired identities clear tokens", () => {
+  installBrowserStubs();
+  localStorage.setItem("pacificBioArchive.tokens", "not-json");
+  sessionStorage.setItem(PKCE_STORAGE_KEY, "not-json");
+  assert.equal(getTokens(), null);
+  assert.equal(parseJwt("not-a-jwt"), null);
+  assert.equal(getCurrentUser(), null);
+  assert.equal(localStorage.getItem("pacificBioArchive.tokens"), null);
+
+  saveTokens({ id_token: tokenFor({ sub: "u1", exp: Math.floor(Date.now() / 1000) - 1 }) });
+  assert.equal(getCurrentUser(), null);
+  assert.equal(localStorage.getItem("pacificBioArchive.tokens"), null);
+});
+
+test("token lifecycle emits opaque same-page auth reasons", () => {
+  installBrowserStubs();
+  const reasons = [];
+  const listener = (event) => reasons.push(event.detail.reason);
+  globalThis.addEventListener?.("pacificBioArchive:auth", listener);
+  saveTokens({ id_token: tokenFor({ sub: "u1", exp: Math.floor(Date.now() / 1000) + 3600 }) });
+  clearTokens("expired");
+  globalThis.removeEventListener?.("pacificBioArchive:auth", listener);
+  assert.deepEqual(reasons, ["authenticated", "expired"]);
+});
+
+test("JWT parsing requires valid non-empty header payload and signature segments", () => {
+  installBrowserStubs();
+  const valid = tokenFor({ sub: "u1", exp: Math.floor(Date.now() / 1000) + 60 });
+  assert.ok(decodeJwtSegment(valid.split(".")[0]));
+  assert.equal(parseJwt(`.${valid.split(".")[1]}.sig`), null);
+  assert.equal(parseJwt(`${valid.split(".")[0]}.${valid.split(".")[1]}.`), null);
+  assert.equal(parseJwt(`bad!.${valid.split(".")[1]}.sig`), null);
+  assert.equal(parseJwt(`${valid.split(".")[0]}.${valid.split(".")[1]}.bad!`), null);
+});
+
+test("inspectAuthSession is read-only and identifies an expired token", () => {
+  installBrowserStubs();
+  const tokens = { id_token: tokenFor({ sub: "u1", exp: 1 }) };
+  const before = localStorage.getItem("pacificBioArchive.tokens");
+  assert.deepEqual(inspectAuthSession(tokens, 2_000), { user: null, reason: "expired", shouldClear: true });
+  assert.equal(localStorage.getItem("pacificBioArchive.tokens"), before);
+});
+
+test("inspectStoredAuthSession distinguishes no token from malformed stored JSON", () => {
+  installBrowserStubs();
+  assert.deepEqual(inspectStoredAuthSession(), { user: null, reason: null, shouldClear: false });
+  localStorage.setItem("pacificBioArchive.tokens", "not-json");
+  assert.deepEqual(inspectStoredAuthSession(), { user: null, reason: "invalid", shouldClear: true });
+});
+
+test("damaged PKCE storage is removed without an OAuth request", async () => {
+  installBrowserStubs();
+  sessionStorage.setItem(PKCE_STORAGE_KEY, "broken-json");
+  let requests = 0;
+  globalThis.fetch = async () => { requests += 1; return new Response("{}", { status: 200 }); };
+  await assert.rejects(handleAuthCallback(`${TEST_CONFIG.redirectSignIn}?code=broken&state=s`), /Invalid Cognito callback state/);
+  assert.equal(requests, 0);
   assert.equal(sessionStorage.getItem(PKCE_STORAGE_KEY), null);
 });

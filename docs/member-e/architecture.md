@@ -42,5 +42,5 @@ Member E implemented the React frontend console, Cognito Hosted UI entry points,
 authenticated API client, checksum-based upload workflow, private asset URL
 resolution, query views, thumbnail-to-original lookup, file-based query form,
 bulk tag editing, bulk deletion, subscription and notification inbox, signed
-asset URL refresh/retry handling, local E2E-style tests, CORS integration, and
+asset URL refresh/retry handling, local Node mocked contract/integration-flow tests (not browser E2E), CORS integration, and
 user/demo documentation.

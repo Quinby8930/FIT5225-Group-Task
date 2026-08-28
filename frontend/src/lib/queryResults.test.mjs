@@ -122,3 +122,10 @@ test("keeps only the first valid structured item for each file id", async () => 
   assert.deepEqual(result.structuredItems.map((item) => item.original_key), ["originals/u/same/first.jpg"]);
   assert.deepEqual(selectedMutationKeys(["same"], result.structuredItems), ["originals/u/same/first.jpg"]);
 });
+
+test("does not append a legacy original when a structured thumbnail lookup item covers it", async () => {
+  const { normalizeQueryResponse } = await loadQueryResults();
+  const result = normalizeQueryResponse({ results: ["originals/u/f/wombat.jpg"], items: [{ file_id: "f", file_type: "image", display_key: "thumbnails/u/f/thumbnail.jpg", original_key: "originals/u/f/wombat.jpg", thumbnail_key: "thumbnails/u/f/thumbnail.jpg", can_preview: true, can_manage: false }] });
+  assert.equal(result.structuredItems.length, 1);
+  assert.deepEqual(result.legacyItems, []);
+});

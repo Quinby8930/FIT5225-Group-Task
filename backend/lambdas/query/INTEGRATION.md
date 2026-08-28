@@ -226,8 +226,8 @@ GET /query/by-thumbnail?key=thumbnails%2Fu1%2Fa1.jpg
 
 `key` 也可为 `QUERY_INPUT_BUCKET` 的 trusted HTTPS/presigned URL；服务会只解析并
 规范化为 key，不会抓取或记录 URL。非法引用返回 `422 INVALID_MEDIA_REFERENCE`，未找到
-缩略图返回 `404 THUMBNAIL_NOT_FOUND`。成功响应：
-`{"original_key": "originals/u1/a1.jpg", "file_id": "f1"}`
+缩略图返回 `404 THUMBNAIL_NOT_FOUND`。成功响应保留 `original_key` 与 `file_id`，并新增完整的安全 `item`（字段同查询 `items`，供前端预览/管理）：
+`{"original_key":"originals/u1/a1.jpg","file_id":"f1","item":{"file_id":"f1","file_type":"image","display_key":"thumbnails/u1/a1.jpg","original_key":"originals/u1/a1.jpg","thumbnail_key":"thumbnails/u1/a1.jpg","can_preview":true,"can_manage":true}}`
 
 ### 5.4 按上传文件查询（不落库）
 

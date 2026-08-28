@@ -46,7 +46,7 @@ Public (Cognito-protected, called by the frontend):
 |--------|------|---------|
 | POST | `/query/by-tags` | Find completed files by tags with minimum counts (AND) |
 | POST | `/query/by-species` | Find completed files containing a species |
-| GET  | `/query/by-thumbnail?key=...` | Map thumbnail key or trusted S3 HTTPS URL -> full-size object key |
+| GET  | `/query/by-thumbnail?key=...` | Map thumbnail key or trusted S3 HTTPS URL -> full-size object key plus structured `item` metadata |
 | POST | `/query/by-file` | Detect tags on an uploaded file, return matches |
 | POST | `/tags/edit` | Bulk add/remove tags (`operation` 1=add, 0=remove) |
 | POST | `/files/delete` | Bulk delete (database + storage) |

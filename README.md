@@ -89,7 +89,7 @@ Member E has added the frontend and integration console:
 - Environment-based frontend configuration for local or cloud API endpoints and
   Cognito values, with private thumbnail/original previews obtained from B's
   authenticated temporary-URL endpoint.
-- Local E2E-style tests for the Member E browser workflow and form parsing,
+- Local Node mocked contract/integration-flow tests for the Member E request workflow and form parsing (not browser E2E),
   plus CORS wiring for local frontend-to-query-API integration.
 - Optional SNS notification publisher for email delivery, enabled by
   `NOTIFICATION_PUBLISHER=sns`.
