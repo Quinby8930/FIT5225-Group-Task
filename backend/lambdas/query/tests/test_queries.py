@@ -1307,6 +1307,7 @@ class TestMetadataEndpoints:
 
     def test_completed_reservation_remains_duplicate(self, client):
         _reserve(client, "r2", checksum="sha256:shared")
+        client.repo.mark_processing("r2", "test-setup", main.utcnow())
         client.repo.mark_completed("r2", "originals/r2", None, "image", {}, [], "v1")
         r = _reserve(client, "r3", checksum="sha256:shared")
         assert r.status_code == 409
@@ -1350,6 +1351,7 @@ class TestMetadataEndpoints:
 
     def test_delete_releases_checksum_for_a_new_upload(self, client):
         _reserve(client, "delete-old", checksum="sha256:delete")
+        client.repo.mark_processing("delete-old", "test-setup", main.utcnow())
         client.repo.mark_completed(
             "delete-old", "originals/delete-old", None, "image", {}, [], "v1"
         )
@@ -1516,6 +1518,63 @@ class TestMetadataEndpoints:
         assert response.status_code == 200
         assert client.repo.get(file_id).status == expected_status
 
+    @pytest.mark.parametrize("callback", ["complete", "failed"])
+    @pytest.mark.parametrize(
+        "status", ["pending_upload", "failed", "completed", "deleting"]
+    )
+    def test_legacy_tokenless_callbacks_never_mutate_non_processing_records(
+        self, client, callback, status
+    ):
+        file_id = f"legacy-{callback}-{status}"
+        client.repo.add(
+            FileRecord(
+                file_id=file_id,
+                user_id="u1",
+                file_type="image",
+                object_key=f"originals/{file_id}",
+                tags={"dingo": 1},
+                checksum=f"sha256:{file_id}",
+                status=status,
+                error_code="ORIGINAL",
+                message="original diagnostic",
+            )
+        )
+        main.app.dependency_overrides[main.get_settings] = lambda: SimpleNamespace(
+            internal_api_key=INTERNAL_API_KEY,
+            query_input_bucket="private-media",
+            allow_legacy_processing_callbacks=True,
+        )
+        client.notif_repo.subscribe("u2", "dingo")
+        payload = (
+            {
+                "user_id": "u1",
+                "file_type": "image",
+                "original_key": f"originals/{file_id}",
+                "tags": {"wombat": 99},
+                "model_version": "late-legacy-worker",
+            }
+            if callback == "complete"
+            else {
+                "user_id": "u1",
+                "error_code": "LATE_LEGACY_WORKER",
+                "message": "must not replace the original",
+            }
+        )
+
+        response = client.put(
+            f"/internal/files/{file_id}/{callback}",
+            headers={"X-Internal-Api-Key": INTERNAL_API_KEY},
+            json=payload,
+        )
+
+        record = client.repo.get(file_id)
+        assert response.status_code == 200
+        assert record.status == status
+        assert record.tags == {"dingo": 1}
+        assert record.error_code == "ORIGINAL"
+        assert record.message == "original diagnostic"
+        assert client.notif_repo.notifications("u2") == []
+
     def test_stale_failure_cannot_mutate_a_reacquired_processing_lease(self, client):
         _reserve(client, "stale-failure")
         stale_token, active_token = _reacquire_processing(client, "stale-failure")
@@ -1554,6 +1613,7 @@ class TestMetadataEndpoints:
 
     def test_processing_completed_returns_false(self, client):
         _reserve(client, "p2")
+        client.repo.mark_processing("p2", "test-setup", main.utcnow())
         client.repo.mark_completed("p2", "originals/p2", None, "image", {}, [], "v1")
         r = client.post(
             "/internal/files/p2/processing",
@@ -1621,6 +1681,7 @@ class TestMetadataEndpoints:
 
     def test_failed_does_not_downgrade_completed(self, client):
         _reserve(client, "e2")
+        client.repo.mark_processing("e2", "test-setup", main.utcnow())
         client.repo.mark_completed("e2", "originals/e2", None, "image", {}, [], "v1")
         client.put(
             "/internal/files/e2/failed",
@@ -1631,6 +1692,7 @@ class TestMetadataEndpoints:
 
     def test_sqlite_mark_failed_condition_blocks_stale_callback_downgrade(self, client):
         _reserve(client, "e2-race")
+        client.repo.mark_processing("e2-race", "test-setup", main.utcnow())
         client.repo.mark_completed(
             "e2-race", "originals/e2-race", None, "image", {}, [], "v1"
         )
@@ -1641,6 +1703,7 @@ class TestMetadataEndpoints:
 
     def test_sqlite_first_complete_wins_concurrent_callback_race(self, client):
         _reserve(client, "complete-race")
+        client.repo.mark_processing("complete-race", "test-setup", main.utcnow())
         client.repo.mark_completed(
             "complete-race",
             "originals/complete-race",
@@ -2012,6 +2075,141 @@ class TestSubscriptionAndNotification:
 
         assert replay.status_code == 200
         assert len(client.notif_repo.notifications("u2")) == 1
+        assert len(client.publisher.published) == 1
+
+    def test_next_delivery_recovers_inbox_after_completion_cas_wins(
+        self, client
+    ):
+        from pathlib import Path
+        import sys
+
+        media_processing_root = Path(__file__).resolve().parents[2] / "media-processing"
+        if str(media_processing_root) not in sys.path:
+            sys.path.insert(0, str(media_processing_root))
+        from media_pipeline.pipeline import MediaPipeline
+
+        file_id = "n-begin-recovers"
+        object_key = f"originals/u1/{file_id}/wombat.jpg"
+        client.notif_repo.subscribe("u2", "wombat")
+        reserve = client.post(
+            "/internal/uploads/reserve",
+            headers={"X-Internal-Api-Key": INTERNAL_API_KEY},
+            json={
+                "file_id": file_id,
+                "user_id": "u1",
+                "checksum": "sha256:n-begin-recovers",
+                "filename": "wombat.jpg",
+                "file_type": "image",
+                "content_type": "image/jpeg",
+                "size_bytes": 100,
+                "object_key": object_key,
+            },
+        )
+        assert reserve.status_code == 201
+        original_add_notification = client.notif_repo.add_notification
+        attempts = 0
+
+        def fail_first_inbox_write(notification):
+            nonlocal attempts
+            attempts += 1
+            if attempts == 1:
+                raise RuntimeError("notification store unavailable")
+            return original_add_notification(notification)
+
+        client.notif_repo.add_notification = fail_first_inbox_write
+
+        class _Metadata:
+            headers = {"X-Internal-Api-Key": INTERNAL_API_KEY}
+
+            def begin_processing(self, target_file_id, payload):
+                response = client.post(
+                    f"/internal/files/{target_file_id}/processing",
+                    headers=self.headers,
+                    json=payload,
+                )
+                assert response.status_code == 200
+                return response.json()
+
+            def complete(self, target_file_id, payload):
+                response = client.put(
+                    f"/internal/files/{target_file_id}/complete",
+                    headers=self.headers,
+                    json=payload,
+                )
+                assert response.status_code == 200
+
+            def fail(self, target_file_id, payload):
+                response = client.put(
+                    f"/internal/files/{target_file_id}/failed",
+                    headers=self.headers,
+                    json=payload,
+                )
+                assert response.status_code == 200
+
+        class _Storage:
+            def __init__(self):
+                self.content_type_calls = 0
+
+            def get_content_type(self, _bucket, _key):
+                self.content_type_calls += 1
+                return "image/jpeg"
+
+            def download(self, _bucket, _key, destination):
+                Path(destination).write_bytes(b"source")
+
+            def upload(self, _bucket, _key, _source, _content_type):
+                return None
+
+            def presign_get(self, _bucket, key):
+                return f"https://signed.example/{key}"
+
+        class _Inference:
+            def __init__(self):
+                self.calls = []
+
+            def infer(self, payload):
+                self.calls.append(payload)
+                return {
+                    "tags": {"wombat": 2},
+                    "detections": [],
+                    "model_version": "v1",
+                }
+
+        storage = _Storage()
+        inference = _Inference()
+        pipeline = MediaPipeline(
+            storage=storage,
+            metadata=_Metadata(),
+            inference=inference,
+            create_thumbnail=lambda _source, target: Path(target).write_bytes(
+                b"thumbnail"
+            ),
+        )
+        s3_event = {
+            "s3": {
+                "bucket": {"name": "private-media"},
+                "object": {"key": object_key, "sequencer": "first-delivery"},
+            }
+        }
+
+        with pytest.raises(RuntimeError, match="notification store unavailable"):
+            pipeline.process_record(s3_event)
+
+        completed = client.repo.get(file_id)
+        assert completed.status == "completed"
+        assert completed.tags == {"wombat": 2}
+        assert client.notif_repo.notifications("u2") == []
+
+        s3_event["s3"]["object"]["sequencer"] = "next-delivery"
+        next_delivery = pipeline.process_record(s3_event)
+
+        assert next_delivery == {"status": "skipped", "file_id": file_id}
+        assert storage.content_type_calls == 1
+        assert len(inference.calls) == 1
+        notifications = client.notif_repo.notifications("u2")
+        assert [(item.species, item.object_key) for item in notifications] == [
+            ("wombat", object_key)
+        ]
         assert len(client.publisher.published) == 1
 
     def test_stale_completion_cannot_write_notifications_after_lease_reacquisition(

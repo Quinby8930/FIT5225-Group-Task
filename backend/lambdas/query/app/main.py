@@ -740,6 +740,8 @@ def acquire_processing(
     file_id: str,
     body: ProcessingRequest,
     repo_: FileRepository = Depends(get_repo),
+    notif_repo_: NotificationRepository = Depends(get_notification_repo),
+    publisher_: NotificationPublisher = Depends(get_publisher),
     _internal_auth: None = Depends(require_internal_api_key),
 ) -> dict:
     record = repo_.get(file_id)
@@ -760,6 +762,16 @@ def acquire_processing(
     response = {"should_process": state == "acquired", "state": state}
     if state == "acquired":
         response["lease_token"] = lease_token
+    elif state == "completed":
+        completed = repo_.get(file_id)
+        if completed is not None and completed.status == "completed":
+            _ensure_notification_inbox(
+                file_id,
+                completed.object_key,
+                completed.tags,
+                notif_repo_,
+            )
+            _publish_pending_notifications(file_id, notif_repo_, publisher_)
     return response
 
 
@@ -793,17 +805,20 @@ def complete_processing(
         file_type=body.file_type,
     )
     if record.status == "completed":
-        _ensure_notification_inbox(
-            file_id,
-            record.object_key,
-            record.tags,
-            notif_repo_,
-        )
-        _publish_pending_notifications(file_id, notif_repo_, publisher_)
+        if body.lease_token is not None:
+            _ensure_notification_inbox(
+                file_id,
+                record.object_key,
+                record.tags,
+                notif_repo_,
+            )
+            _publish_pending_notifications(file_id, notif_repo_, publisher_)
         return {}
-    if body.lease_token is not None and (
-        record.status != "processing"
-        or record.processing_lease_token != body.lease_token
+    if record.status != "processing":
+        return {}
+    if (
+        body.lease_token is not None
+        and record.processing_lease_token != body.lease_token
     ):
         return {}
     tags = _normalise_tags(body.tags)
@@ -856,9 +871,11 @@ def fail_processing(
     _require_matching_metadata(record, user_id=body.user_id)
     if record.status == "completed":
         return {}  # never downgrade a completed file
-    if body.lease_token is not None and (
-        record.status != "processing"
-        or record.processing_lease_token != body.lease_token
+    if record.status != "processing":
+        return {}
+    if (
+        body.lease_token is not None
+        and record.processing_lease_token != body.lease_token
     ):
         return {}
     repo_.mark_failed(

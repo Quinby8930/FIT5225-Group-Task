@@ -221,7 +221,7 @@ class SQLiteRepository(FileRepository):
         model_version: str,
         lease_token: Optional[str] = None,
     ) -> bool:
-        condition = "status <> 'completed'"
+        condition = "status='processing'"
         params: list = [
             original_key,
             thumbnail_key,
@@ -232,7 +232,7 @@ class SQLiteRepository(FileRepository):
             file_id,
         ]
         if lease_token is not None:
-            condition = "status='processing' AND processing_lease_token=?"
+            condition += " AND processing_lease_token=?"
             params.append(lease_token)
         cursor = self._conn.execute(
             "UPDATE files SET status='completed', object_key=?, thumbnail_key=?, "
@@ -252,10 +252,10 @@ class SQLiteRepository(FileRepository):
         message: str,
         lease_token: Optional[str] = None,
     ) -> bool:
-        condition = "status <> 'completed'"
+        condition = "status='processing'"
         params: list = [error_code, message, file_id]
         if lease_token is not None:
-            condition = "status='processing' AND processing_lease_token=?"
+            condition += " AND processing_lease_token=?"
             params.append(lease_token)
         cursor = self._conn.execute(
             "UPDATE files SET status='failed', error_code=?, message=?, "

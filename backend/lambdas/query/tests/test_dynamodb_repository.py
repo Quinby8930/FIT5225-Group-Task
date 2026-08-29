@@ -939,9 +939,9 @@ def test_completion_with_thumbnail_builds_valid_set_and_remove_expression():
         "error_code, message"
     )
     assert table.updated["ConditionExpression"] == (
-        "attribute_exists(file_id) AND #s <> :completed"
+        "attribute_exists(file_id) AND #s = :processing"
     )
-    assert table.updated["ExpressionAttributeValues"][":completed"] == "completed"
+    assert table.updated["ExpressionAttributeValues"][":processing"] == "processing"
 
 
 def test_completion_is_conditioned_on_the_active_processing_lease_token():
@@ -969,6 +969,20 @@ def test_completion_is_conditioned_on_the_active_processing_lease_token():
     )
 
 
+def test_legacy_completion_without_token_still_requires_processing_status():
+    table = _PagedTable()
+    repository = _file_repo(table)
+
+    repository.mark_completed(
+        "f1", "originals/u1/f1.jpg", None, "image", {"wombat": 1}, [], "v1"
+    )
+
+    assert table.updated["ConditionExpression"] == (
+        "attribute_exists(file_id) AND #s = :processing"
+    )
+    assert table.updated["ExpressionAttributeValues"][":processing"] == "processing"
+
+
 def test_failure_is_conditioned_on_the_active_processing_lease_token():
     table = _PagedTable()
     repository = _file_repo(table)
@@ -988,6 +1002,18 @@ def test_failure_is_conditioned_on_the_active_processing_lease_token():
     assert table.updated["ExpressionAttributeValues"][":lease_token"] == (
         "active-lease-token"
     )
+
+
+def test_legacy_failure_without_token_still_requires_processing_status():
+    table = _PagedTable()
+    repository = _file_repo(table)
+
+    repository.mark_failed("f1", "INFERENCE_FAILED", "failure")
+
+    assert table.updated["ConditionExpression"] == (
+        "attribute_exists(file_id) AND #s = :processing"
+    )
+    assert table.updated["ExpressionAttributeValues"][":processing"] == "processing"
 
 
 def test_begin_delete_is_owner_scoped_and_accepts_only_completed_or_deleting():
@@ -1137,9 +1163,9 @@ def test_stale_failed_callback_cannot_downgrade_completed_dynamo_record():
     repository.mark_failed("f1", "INFERENCE_FAILED", "late callback")
 
     assert update_calls[0]["ConditionExpression"] == (
-        "attribute_exists(file_id) AND #s <> :completed"
+        "attribute_exists(file_id) AND #s = :processing"
     )
-    assert update_calls[0]["ExpressionAttributeValues"][":completed"] == "completed"
+    assert update_calls[0]["ExpressionAttributeValues"][":processing"] == "processing"
 
 
 def test_failed_callback_condition_error_is_rethrown_when_record_is_not_completed():

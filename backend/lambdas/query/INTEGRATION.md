@@ -169,8 +169,9 @@ storage 或 metadata 删除失败时，重试会安装新的随机 attempt token
 
 接口：`app/notification_client.py`，方法 `publish(notification) -> None`。
 
-作用：新文件 `complete` 时，Member D 先用 `(file_id,user_id,species)` 确定性 ID
-幂等 ensure pending inbox，再标记 file completed，最后调用 publisher。SAM 已将生产
+作用：新文件 `complete` 时，Member D 先用 lease token 条件更新 file 为 completed，
+成功后才用 `(file_id,user_id,species)` 确定性 ID 和已存储 metadata 幂等 ensure pending
+inbox，最后调用 publisher。SAM 已将生产
 publisher 接到单一 SNS Topic；成员 E 在此之上负责前端/站内通知体验。
 
 通知数据模型见 §3.1，订阅/通知端点见 §5.8。
@@ -381,11 +382,11 @@ GET /notifications
 
 **触发时机**：当成员 B 对某个文件调用 `complete`（§5.7③）且该文件的 `tags` 里有
 数量 ≥1 的物种时，Member D 会为**每个订阅了该物种的用户**写一条通知并调
-`NotificationPublisher.publish` 投递（§4.4）。inbox 在 completed 前 ensure，故
-mark_completed 失败时允许短暂 pre-completion pending；重试使用确定性 ID。completed
-重放只 publish 已存在的 pending inbox，不重新读取当前订阅，也不给晚订阅者补发历史
-通知。没有周期 worker/DLQ，恢复依赖自动/人工重放；投递为 at-least-once，SNS 成功但
-delivered 更新失败时可能重复。
+`NotificationPublisher.publish` 投递（§4.4）。只有 completion CAS 成功后才 ensure inbox，
+所以 stale worker 不会留下 pre-completion side effect。completed callback 重放和下一次
+begin-processing 观察到 completed 时，都会从已存储 metadata（不信任 callback body）幂等
+补齐 inbox 并 publish pending；后者让 B 在不重新下载/推理的情况下恢复。没有周期
+worker/DLQ；投递为 at-least-once，SNS 成功但 delivered 更新失败时可能重复。
 订阅/取消订阅的 `species` 也会在持久化前统一映射为团队短名。
 
 ---

@@ -223,7 +223,11 @@ discriminator, and a fresh unguessable token when the lease is acquired:
 The three valid states are `acquired` with `should_process:true` and a token,
 `completed`
 with `should_process:false`, and `lease_active` with `should_process:false`.
-`completed` is a successful no-op before S3 download. `lease_active` is a
+Before returning `completed`, Member D freshly reads the stored completed
+metadata and idempotently ensures/publishes its notification inbox. This lets a
+new S3 delivery recover an inbox write that failed after the completion CAS;
+Member B still treats the response as a successful no-op before S3 download or
+inference. `lease_active` is a
 retryable processing error, so a concurrent S3 delivery is retried after the
 current lease expires or clears. A failed or lease-expired interrupted attempt must be
 re-acquirable with the same sequencer; an active attempt must not be granted
@@ -301,8 +305,11 @@ deployment. Member D rejects omission by default. The only safe rollout is:
 3. redeploy Member D with `AllowLegacyProcessingCallbacks=false` (the default).
 
 Do not leave compatibility enabled in steady state. While enabled, tokenless
-callbacks use the legacy unfenced repository transition and therefore exist only
-as a temporary bridge for old Member B invocations already in flight.
+callbacks may transition only a record whose current status is `processing`;
+they can never mutate `pending_upload`, `failed`, `completed`, or `deleting`.
+The temporary window still omits lease-token equality, so a stale legacy worker
+can race a newer worker while both generations observe `processing`. This
+residual same-status generation risk is why the flag is only a rollout bridge.
 
 ## Member C inference contract
 

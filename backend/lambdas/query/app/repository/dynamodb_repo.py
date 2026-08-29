@@ -474,16 +474,14 @@ class DynamoDBRepository(FileRepository):
             ":d": _float_to_decimal(detections),
             ":m": model_version,
         }
-        condition = "attribute_exists(file_id) AND #s <> :completed"
+        condition = "attribute_exists(file_id) AND #s = :processing"
+        values[":processing"] = "processing"
         if lease_token is not None:
             condition = (
                 "attribute_exists(file_id) AND #s = :processing AND "
                 "processing_lease_token = :lease_token"
             )
-            values[":processing"] = "processing"
             values[":lease_token"] = lease_token
-        else:
-            values[":completed"] = "completed"
         set_parts = [
             "#s = :s",
             "object_key = :o",
@@ -529,21 +527,19 @@ class DynamoDBRepository(FileRepository):
     ) -> bool:
         import botocore.exceptions
 
-        condition = "attribute_exists(file_id) AND #s <> :completed"
+        condition = "attribute_exists(file_id) AND #s = :processing"
         values = {
             ":s": "failed",
             ":e": error_code,
             ":m": message,
+            ":processing": "processing",
         }
         if lease_token is not None:
             condition = (
                 "attribute_exists(file_id) AND #s = :processing AND "
                 "processing_lease_token = :lease_token"
             )
-            values[":processing"] = "processing"
             values[":lease_token"] = lease_token
-        else:
-            values[":completed"] = "completed"
         try:
             self._table.update_item(
                 Key={"file_id": file_id},

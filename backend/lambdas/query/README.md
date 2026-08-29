@@ -79,7 +79,9 @@ species the file detected (count ≥1) gets a notification record + a
 created only after the lease-token-fenced completed transition wins. Failed
 publish/state updates are logged; completed replay idempotently ensures inbox
 rows from stored completed metadata (never the retry body) and republishes rows
-that remain pending.
+that remain pending. A later processing-acquisition request that observes
+`completed` performs the same recovery before telling Member B to skip media
+download and inference.
 There is no periodic worker/DLQ: recovery uses automatic/manual complete replay,
 with at-least-once delivery if SNS succeeded before state persistence failed.
 

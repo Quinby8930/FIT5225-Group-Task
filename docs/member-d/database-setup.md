@@ -78,8 +78,10 @@ processing 返回的 32–256 字符 `lease_token`。若线上仍有旧 Member B
 2. 再部署会保存并转发 lease token 的 Member B，确认新回调均带 token；
 3. 最后重新部署 Member D，设置 `AllowLegacyProcessingCallbacks=false`。
 
-不能交换第 1、2 步，也不能把兼容开关留在稳定态。兼容开启时，无 token 回调仅使用旧的
-无 fencing repository transition，目的是接住升级期间已在途的旧 B invocation。
+不能交换第 1、2 步，也不能把兼容开关留在稳定态。兼容开启时，无 token 回调仍必须满足
+`status=processing`，绝不能修改 pending/failed/completed/deleting；但它暂时不比较 lease
+token，因此旧 worker 和新 worker 同处 processing 状态时仍缺少 generation fencing。
+这个 residual risk 是该开关只能短期开启的原因。
 
 ### 3.2 从旧 FilesTable 受控切换 reservation claims
 
@@ -155,7 +157,9 @@ invoke permission。没有 `ANY /{proxy+}` 或 `$default`。API Gateway 对 inte
 - **SNS 临时失败**：只有 processing lease token 的条件更新成功后，才从已存储的 completed
   metadata 幂等创建确定性 notification inbox；过期 worker 不会留下 inbox side effect。
   publish 或 delivery-state 更新失败只写日志。completed replay 从已存储 metadata（不信任
-  retry body）补齐 inbox 并重试 pending；成功后标 `delivered`。本课程实现没有周期 worker/DLQ，
+  retry body）补齐 inbox 并重试 pending。若第一次 inbox 写入在 completion CAS 后失败，下一次
+  S3 delivery 的 begin-processing `completed` 路径会先完成同样的 stored-metadata recovery，
+  B 不会再次下载或推理；成功后标 `delivered`。本课程实现没有周期 worker/DLQ，
   恢复依赖自动重放或 A 人工重放同一 complete PUT。投递是 at-least-once：SNS 已接受
   但状态更新失败时可能重复，消费者应按确定性 `notification_id` 去重。
 - **排错**：报错先看 `docs/member-d/troubleshooting.md`，绝大多数问题（旧 schema、
