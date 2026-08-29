@@ -18,7 +18,9 @@ def utcnow() -> datetime:
     return datetime.now(timezone.utc)
 
 
-FileStatus = Literal["pending_upload", "processing", "completed", "failed"]
+FileStatus = Literal[
+    "pending_upload", "processing", "completed", "failed", "deleting"
+]
 
 
 class FileRecord(BaseModel):
@@ -48,6 +50,7 @@ class FileRecord(BaseModel):
     error_code: Optional[str] = None
     message: Optional[str] = None
     processing_sequencer: Optional[str] = None
+    processing_lease_token: Optional[str] = None
     lease_expires_at: Optional[datetime] = None
     upload_time: datetime = Field(default_factory=utcnow)
 
@@ -201,6 +204,7 @@ class CompleteRequest(BaseModel):
     tags: dict[str, int] = Field(default_factory=dict)
     detections: list[dict] = Field(default_factory=list)
     model_version: str = ""
+    lease_token: StrictStr = Field(min_length=32, max_length=256)
     status: Literal["completed"] = "completed"
 
 
@@ -210,4 +214,5 @@ class FailedRequest(BaseModel):
     user_id: str
     error_code: str
     message: str = ""
+    lease_token: StrictStr = Field(min_length=32, max_length=256)
     status: Literal["failed"] = "failed"

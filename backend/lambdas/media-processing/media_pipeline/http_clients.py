@@ -149,7 +149,12 @@ class MetadataClient(_JsonHttpClient):
                 retryable=True,
             )
         if "state" in result and (
-            (result["state"] == "acquired" and result["should_process"] is True)
+            (
+                result["state"] == "acquired"
+                and result["should_process"] is True
+                and isinstance(result.get("lease_token"), str)
+                and len(result["lease_token"]) >= 32
+            )
             or (
                 result["state"] in {"completed", "lease_active"}
                 and result["should_process"] is False

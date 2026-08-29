@@ -69,9 +69,9 @@ Internal metadata state machine (called by Member B, see
 | Method | Path | Purpose |
 |--------|------|---------|
 | POST | `/internal/uploads/reserve` | Atomically reserve or reuse `(user_id, checksum)` (`201`/`409`) |
-| POST | `/internal/files/{id}/processing` | Atomically acquire lease (`should_process` + `state`) |
-| PUT  | `/internal/files/{id}/complete` | Record a completed run (idempotent) |
-| PUT  | `/internal/files/{id}/failed` | Record a bounded failure (idempotent, message ≤240 chars) |
+| POST | `/internal/files/{id}/processing` | Atomically acquire lease (`should_process` + `state` + opaque token) |
+| PUT  | `/internal/files/{id}/complete` | Record a token-fenced completed run (idempotent) |
+| PUT  | `/internal/files/{id}/failed` | Record a token-fenced bounded failure (idempotent, message ≤240 chars) |
 
 `complete` also fires the **notification trigger**: every user subscribed to a
 species the file detected (count ≥1) gets a notification record + a
@@ -95,7 +95,9 @@ python -m pytest tests/ -v
 
 The SAM template sets `REPO_BACKEND=dynamodb`, `STORAGE_BACKEND=lambda`, and
 `TAG_DETECTOR_BACKEND=remote`. Storage deletion synchronously invokes Member B's
-guarded-delete Lambda before metadata is removed. File queries accept only
+guarded-delete Lambda after metadata is marked `deleting` and before metadata
+is removed. Storage failure restores `completed`; metadata failure remains
+hidden and is safely retryable. File queries accept only
 JPEG/PNG/WebP up to 4,194,304 bytes, stage the image privately under
 `query-inputs/`, give Member C a 120-second HTTPS GET URL, and call C with a
 25-second no-redirect HTTP timeout inside a 30-second Lambda. Cleanup is

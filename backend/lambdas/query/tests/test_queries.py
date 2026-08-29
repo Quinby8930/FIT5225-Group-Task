@@ -7,6 +7,7 @@ real FastAPI app against a fresh SQLite database via dependency overrides.
 from __future__ import annotations
 
 import json
+import sqlite3
 from types import SimpleNamespace
 
 import pytest
@@ -51,6 +52,76 @@ def _record(fid, ftype, thumb, tags, obj=None):
 # Pure query logic
 # ---------------------------------------------------------------------------
 class TestPureLogic:
+    def test_sqlite_repository_migrates_existing_processing_schema(self, tmp_path):
+        database = tmp_path / "legacy.db"
+        connection = sqlite3.connect(database)
+        connection.execute(
+            """
+            CREATE TABLE files (
+                file_id TEXT PRIMARY KEY, user_id TEXT NOT NULL,
+                file_type TEXT NOT NULL, object_key TEXT NOT NULL,
+                thumbnail_key TEXT, filename TEXT NOT NULL DEFAULT '',
+                content_type TEXT NOT NULL DEFAULT '',
+                size_bytes INTEGER NOT NULL DEFAULT 0,
+                tags_json TEXT NOT NULL DEFAULT '{}',
+                detections_json TEXT NOT NULL DEFAULT '[]',
+                model_version TEXT NOT NULL DEFAULT '', checksum TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'completed', error_code TEXT,
+                message TEXT, processing_sequencer TEXT, lease_expires_at TEXT,
+                upload_time TEXT NOT NULL
+            )
+            """
+        )
+        connection.execute(
+            "INSERT INTO files VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (
+                "legacy",
+                "u1",
+                "image",
+                "originals/u1/legacy.jpg",
+                None,
+                "legacy.jpg",
+                "image/jpeg",
+                1,
+                "{}",
+                "[]",
+                "",
+                "sha256:legacy",
+                "processing",
+                None,
+                None,
+                "seq-1",
+                "2026-08-29T00:15:00+00:00",
+                "2026-08-29T00:00:00+00:00",
+            ),
+        )
+        connection.commit()
+        connection.close()
+
+        repository = SQLiteRepository(str(database))
+
+        record = repository.get("legacy")
+        assert record.status == "processing"
+        assert record.processing_lease_token is None
+        assert "processing_lease_token" in {
+            row[1] for row in repository._conn.execute("PRAGMA table_info(files)")
+        }
+        repository.add(
+            FileRecord(
+                file_id="after-migration",
+                user_id="u1",
+                file_type="image",
+                object_key="originals/u1/after-migration.jpg",
+                checksum="sha256:after-migration",
+                status="processing",
+                processing_sequencer="seq-2",
+                processing_lease_token="m" * 43,
+            )
+        )
+        migrated_insert = repository.get("after-migration")
+        assert migrated_insert.processing_sequencer == "seq-2"
+        assert migrated_insert.processing_lease_token == "m" * 43
+
     def test_and_logic_not_or(self):
         records = [
             _record("a", "image", None, {"dingo": 2, "wombat": 1}),
@@ -952,7 +1023,95 @@ class TestEndpoints:
         with pytest.raises(RuntimeError, match="storage unavailable"):
             client.post("/files/delete", json={"keys": ["originals/f1"]})
 
-        assert client.repo.get("f1") is not None
+        assert client.repo.get("f1").status == "completed"
+
+    def test_delete_marks_metadata_deleting_before_storage_and_removes_it_on_success(
+        self, client
+    ):
+        observed_statuses = []
+        original_delete = client.storage.delete
+
+        def observe_deleting(user_id, keys):
+            observed_statuses.append(client.repo.get("f1").status)
+            original_delete(user_id, keys)
+
+        client.storage.delete = observe_deleting
+
+        response = client.post("/files/delete", json={"keys": ["originals/f1"]})
+
+        assert response.status_code == 200
+        assert observed_statuses == ["deleting"]
+        assert client.repo.get("f1") is None
+
+    def test_metadata_delete_failure_stays_hidden_and_retry_converges(self, client):
+        client.repo.add(
+            FileRecord(
+                file_id="delete-retry",
+                user_id="u1",
+                file_type="image",
+                object_key="originals/u1/delete-retry.jpg",
+                thumbnail_key="thumbnails/u1/delete-retry.jpg",
+                tags={"wombat": 1},
+                checksum="sha256:delete-retry",
+                status="completed",
+            )
+        )
+        original_delete_by_ids = client.repo.delete_by_ids
+        attempts = 0
+
+        def fail_first_metadata_delete(file_ids):
+            nonlocal attempts
+            attempts += 1
+            if attempts == 1:
+                raise RuntimeError("metadata delete failed")
+            return original_delete_by_ids(file_ids)
+
+        client.repo.delete_by_ids = fail_first_metadata_delete
+
+        with pytest.raises(RuntimeError, match="metadata delete failed"):
+            client.post(
+                "/files/delete", json={"keys": ["originals/u1/delete-retry.jpg"]}
+            )
+
+        assert client.repo.get("delete-retry").status == "deleting"
+        reacquire = client.post(
+            "/internal/files/delete-retry/processing",
+            headers={"X-Internal-Api-Key": INTERNAL_API_KEY},
+            json={
+                "user_id": "u1",
+                "object_key": "originals/u1/delete-retry.jpg",
+                "sequencer": "late-s3-event",
+            },
+        )
+        assert reacquire.json() == {
+            "should_process": False,
+            "state": "lease_active",
+        }
+        assert client.repo.get("delete-retry").status == "deleting"
+        query = client.post("/query/by-species", json={"species": "wombat"})
+        assert "thumbnails/u1/delete-retry.jpg" not in query.json()["results"]
+        authorization = client.post(
+            "/internal/assets/authorize",
+            headers={"X-Internal-Api-Key": INTERNAL_API_KEY},
+            json={"keys": ["originals/u1/delete-retry.jpg"]},
+        )
+        assert authorization.json()["decisions"] == [
+            {
+                "key": "originals/u1/delete-retry.jpg",
+                "allowed": False,
+                "code": "NOT_COMPLETED",
+            }
+        ]
+
+        retry = client.post(
+            "/files/delete", json={"keys": ["originals/u1/delete-retry.jpg"]}
+        )
+
+        assert retry.status_code == 200
+        assert retry.json()["deleted_db_records"] == 1
+        assert client.repo.get("delete-retry") is None
+        assert client.storage.deleted.count("originals/u1/delete-retry.jpg") == 2
+        assert client.storage.deleted.count("thumbnails/u1/delete-retry.jpg") == 2
 
     def test_delete_returns_503_and_keeps_metadata_when_storage_config_is_missing(
         self, client
@@ -1037,6 +1196,46 @@ def _reserve(client, fid, checksum=None, user="u1"):
     )
 
 
+def _reacquire_processing(client, file_id):
+    headers = {"X-Internal-Api-Key": INTERNAL_API_KEY}
+    body = {
+        "user_id": "u1",
+        "object_key": f"originals/{file_id}",
+        "sequencer": "seq-1",
+    }
+    first = client.post(
+        f"/internal/files/{file_id}/processing", json=body, headers=headers
+    ).json()
+    client.repo._conn.execute(
+        "UPDATE files SET lease_expires_at=? WHERE file_id=?",
+        ("2000-01-01T00:00:00+00:00", file_id),
+    )
+    client.repo._conn.commit()
+    body["sequencer"] = "seq-2"
+    second = client.post(
+        f"/internal/files/{file_id}/processing", json=body, headers=headers
+    ).json()
+    return first["lease_token"], second["lease_token"]
+
+
+def _active_lease_token(client, file_id):
+    record = client.repo.get(file_id)
+    if record.status == "processing":
+        return record.processing_lease_token
+    if record.status == "completed":
+        return "completed-replay-token".ljust(32, "x")
+    response = client.post(
+        f"/internal/files/{file_id}/processing",
+        headers={"X-Internal-Api-Key": INTERNAL_API_KEY},
+        json={
+            "user_id": record.user_id,
+            "object_key": record.object_key,
+            "sequencer": "test-sequencer",
+        },
+    )
+    return response.json()["lease_token"]
+
+
 class TestMetadataEndpoints:
     def test_pending_reservation_is_reused_with_original_upload_identity(self, client):
         first = _reserve(client, "r1", checksum="sha256:shared")
@@ -1097,6 +1296,9 @@ class TestMetadataEndpoints:
 
     def test_delete_releases_checksum_for_a_new_upload(self, client):
         _reserve(client, "delete-old", checksum="sha256:delete")
+        client.repo.mark_completed(
+            "delete-old", "originals/delete-old", None, "image", {}, [], "v1"
+        )
         delete_response = client.post(
             "/files/delete", json={"keys": ["originals/delete-old"]}
         )
@@ -1117,8 +1319,119 @@ class TestMetadataEndpoints:
         active = client.post(
             "/internal/files/p1/processing", json=body, headers=headers
         ).json()
-        assert acquired == {"should_process": True, "state": "acquired"}
+        assert acquired["should_process"] is True
+        assert acquired["state"] == "acquired"
+        assert len(acquired["lease_token"]) >= 32
         assert active == {"should_process": False, "state": "lease_active"}
+
+    def test_processing_reacquisition_returns_a_new_unguessable_lease_token(
+        self, client
+    ):
+        _reserve(client, "lease-token")
+        body = {
+            "user_id": "u1",
+            "object_key": "originals/lease-token",
+            "sequencer": "seq-1",
+        }
+        headers = {"X-Internal-Api-Key": INTERNAL_API_KEY}
+
+        first = client.post(
+            "/internal/files/lease-token/processing", json=body, headers=headers
+        ).json()
+        client.repo._conn.execute(
+            "UPDATE files SET lease_expires_at=? WHERE file_id=?",
+            ("2000-01-01T00:00:00+00:00", "lease-token"),
+        )
+        client.repo._conn.commit()
+        body["sequencer"] = "seq-2"
+        second = client.post(
+            "/internal/files/lease-token/processing", json=body, headers=headers
+        ).json()
+
+        assert first["state"] == second["state"] == "acquired"
+        assert len(first["lease_token"]) >= 32
+        assert len(second["lease_token"]) >= 32
+        assert first["lease_token"] != second["lease_token"]
+        assert client.repo.get("lease-token").processing_lease_token == second["lease_token"]
+
+    def test_stale_completion_cannot_mutate_a_reacquired_processing_lease(self, client):
+        client.notif_repo.subscribe("u2", "wombat")
+        _reserve(client, "stale-complete")
+        stale_token, active_token = _reacquire_processing(client, "stale-complete")
+        headers = {"X-Internal-Api-Key": INTERNAL_API_KEY}
+        stale_payload = {
+            "user_id": "u1",
+            "file_type": "image",
+            "original_key": "originals/stale-complete",
+            "tags": {"wombat": 9},
+            "model_version": "stale",
+            "lease_token": stale_token,
+        }
+
+        response = client.put(
+            "/internal/files/stale-complete/complete",
+            json=stale_payload,
+            headers=headers,
+        )
+
+        assert response.status_code == 200
+        record = client.repo.get("stale-complete")
+        assert record.status == "processing"
+        assert record.processing_lease_token == active_token
+        assert record.tags == {}
+        assert client.notif_repo.notifications("u2") == []
+
+        fresh_payload = {
+            **stale_payload,
+            "tags": {"dingo": 1},
+            "model_version": "fresh",
+            "lease_token": active_token,
+        }
+        assert client.put(
+            "/internal/files/stale-complete/complete",
+            json=fresh_payload,
+            headers=headers,
+        ).status_code == 200
+        completed = client.repo.get("stale-complete")
+        assert completed.status == "completed"
+        assert completed.tags == {"dingo": 1}
+        assert completed.model_version == "fresh"
+
+    def test_stale_failure_cannot_mutate_a_reacquired_processing_lease(self, client):
+        _reserve(client, "stale-failure")
+        stale_token, active_token = _reacquire_processing(client, "stale-failure")
+        headers = {"X-Internal-Api-Key": INTERNAL_API_KEY}
+
+        response = client.put(
+            "/internal/files/stale-failure/failed",
+            headers=headers,
+            json={
+                "user_id": "u1",
+                "error_code": "STALE",
+                "message": "late worker",
+                "lease_token": stale_token,
+            },
+        )
+
+        assert response.status_code == 200
+        record = client.repo.get("stale-failure")
+        assert record.status == "processing"
+        assert record.processing_lease_token == active_token
+        assert record.error_code is None
+
+        assert client.put(
+            "/internal/files/stale-failure/failed",
+            headers=headers,
+            json={
+                "user_id": "u1",
+                "error_code": "FRESH",
+                "message": "active worker",
+                "lease_token": active_token,
+            },
+        ).status_code == 200
+        failed = client.repo.get("stale-failure")
+        assert failed.status == "failed"
+        assert failed.error_code == "FRESH"
 
     def test_processing_completed_returns_false(self, client):
         _reserve(client, "p2")
@@ -1142,6 +1455,7 @@ class TestMetadataEndpoints:
             "model_version": "v1",
             "status": "completed",
         }
+        payload["lease_token"] = _active_lease_token(client, "c1")
         headers = {"X-Internal-Api-Key": INTERNAL_API_KEY}
         assert client.put("/internal/files/c1/complete", json=payload, headers=headers).status_code == 200
         rec = client.repo.get("c1")
@@ -1151,6 +1465,7 @@ class TestMetadataEndpoints:
     def test_complete_normalizes_tags_and_detection_species_before_writing(self, client):
         client.notif_repo.subscribe("u2", "wombat")
         _reserve(client, "normalize")
+        lease_token = _active_lease_token(client, "normalize")
 
         response = client.put(
             "/internal/files/normalize/complete",
@@ -1164,6 +1479,7 @@ class TestMetadataEndpoints:
                     {"species": "Vombatus_ursinus", "confidence": 0.94}
                 ],
                 "model_version": "v1",
+                "lease_token": lease_token,
             },
         )
 
@@ -1175,12 +1491,13 @@ class TestMetadataEndpoints:
 
     def test_failed_truncates_and_idempotent(self, client):
         _reserve(client, "e1")
-        payload = {"user_id": "u1", "error_code": "INVALID_MEDIA", "message": "x" * 500, "status": "failed"}
+        lease_token = _active_lease_token(client, "e1")
+        payload = {"user_id": "u1", "error_code": "INVALID_MEDIA", "message": "x" * 500, "status": "failed", "lease_token": lease_token}
         headers = {"X-Internal-Api-Key": INTERNAL_API_KEY}
         assert client.put("/internal/files/e1/failed", json=payload, headers=headers).status_code == 200
         rec = client.repo.get("e1")
         assert rec.status == "failed" and len(rec.message) == 240
-        payload2 = {"user_id": "u1", "error_code": "INVALID_MEDIA", "message": "again", "status": "failed"}
+        payload2 = {"user_id": "u1", "error_code": "INVALID_MEDIA", "message": "again", "status": "failed", "lease_token": lease_token}
         assert client.put("/internal/files/e1/failed", json=payload2, headers=headers).status_code == 200
 
     def test_failed_does_not_downgrade_completed(self, client):
@@ -1189,7 +1506,7 @@ class TestMetadataEndpoints:
         client.put(
             "/internal/files/e2/failed",
             headers={"X-Internal-Api-Key": INTERNAL_API_KEY},
-            json={"user_id": "u1", "error_code": "X", "message": "m", "status": "failed"},
+            json={"user_id": "u1", "error_code": "X", "message": "m", "status": "failed", "lease_token": "completed-token".ljust(32, "x")},
         )
         assert client.repo.get("e2").status == "completed"
 
@@ -1298,13 +1615,14 @@ class TestMetadataEndpoints:
                         "tags": {},
                         "detections": [],
                         "model_version": "v1",
+                        "lease_token": "auth-complete-token".ljust(32, "x"),
                     },
                 )
             else:
                 response = client.put(
                     "/internal/files/auth-failed/failed",
                     headers=headers,
-                    json={"user_id": "u1", "error_code": "INVALID_MEDIA"},
+                    json={"user_id": "u1", "error_code": "INVALID_MEDIA", "lease_token": "auth-failed-token".ljust(32, "x")},
                 )
             success_status = 200
 
@@ -1372,6 +1690,8 @@ class TestMetadataEndpoints:
     def test_internal_transition_rejects_reserved_metadata_conflicts(
         self, client, route, payload
     ):
+        if route in {"complete", "failed"}:
+            payload = {**payload, "lease_token": "conflict-token".ljust(32, "x")}
         client.repo.add(
             FileRecord(
                 file_id="conflict",
@@ -1475,6 +1795,7 @@ class TestSubscriptionAndNotification:
         ]
 
     def _complete(self, client, file_id, tags):
+        lease_token = _active_lease_token(client, file_id)
         return client.put(
             f"/internal/files/{file_id}/complete",
             headers={"X-Internal-Api-Key": INTERNAL_API_KEY},
@@ -1487,6 +1808,7 @@ class TestSubscriptionAndNotification:
                 "detections": [],
                 "model_version": "v1",
                 "status": "completed",
+                "lease_token": lease_token,
             },
         )
 
@@ -1550,7 +1872,7 @@ class TestSubscriptionAndNotification:
         assert len(attempts) == 2
         assert client.notif_repo.pending_for_file("n-retry") == []
 
-    def test_inbox_is_ensured_before_mark_completed_and_retry_is_idempotent(
+    def test_inbox_is_ensured_before_fenced_completion_and_retry_is_idempotent(
         self, client
     ):
         client.notif_repo.subscribe("u2", "wombat")
@@ -1563,7 +1885,7 @@ class TestSubscriptionAndNotification:
         with pytest.raises(RuntimeError, match="DynamoDB update failed"):
             self._complete(client, "n-mark-fails", {"wombat": 1})
 
-        assert client.repo.get("n-mark-fails").status == "pending_upload"
+        assert client.repo.get("n-mark-fails").status == "processing"
         assert len(client.notif_repo.pending_for_file("n-mark-fails")) == 1
 
         client.repo.mark_completed = original_mark_completed

@@ -36,6 +36,7 @@ CREATE TABLE IF NOT EXISTS files (
     error_code           TEXT,
     message              TEXT,
     processing_sequencer TEXT,
+    processing_lease_token TEXT,
     lease_expires_at     TEXT,
     upload_time          TEXT NOT NULL
 );
@@ -48,7 +49,7 @@ _COLUMNS = (
     "file_id", "user_id", "file_type", "object_key", "thumbnail_key",
     "filename", "content_type", "size_bytes", "tags_json", "detections_json",
     "model_version", "checksum", "status", "error_code", "message",
-    "processing_sequencer", "lease_expires_at", "upload_time",
+    "processing_sequencer", "processing_lease_token", "lease_expires_at", "upload_time",
 )
 
 
@@ -74,6 +75,7 @@ def _serialise(record: FileRecord) -> tuple:
         record.error_code,
         record.message,
         record.processing_sequencer,
+        record.processing_lease_token,
         record.lease_expires_at.isoformat() if record.lease_expires_at else None,
         record.upload_time.isoformat(),
     )
@@ -97,6 +99,7 @@ def _deserialise(row: sqlite3.Row) -> FileRecord:
         error_code=row["error_code"],
         message=row["message"],
         processing_sequencer=row["processing_sequencer"],
+        processing_lease_token=row["processing_lease_token"],
         lease_expires_at=_dt(row["lease_expires_at"]),
         upload_time=_dt(row["upload_time"]),
     )
@@ -108,6 +111,13 @@ class SQLiteRepository(FileRepository):
         self._conn = sqlite3.connect(db_path, check_same_thread=False)
         self._conn.row_factory = sqlite3.Row
         self._conn.executescript(_SCHEMA)
+        columns = {
+            row["name"] for row in self._conn.execute("PRAGMA table_info(files)")
+        }
+        if "processing_lease_token" not in columns:
+            self._conn.execute(
+                "ALTER TABLE files ADD COLUMN processing_lease_token TEXT"
+            )
         self._conn.commit()
 
     # -- writes -----------------------------------------------------------
@@ -126,7 +136,8 @@ class SQLiteRepository(FileRepository):
     def reuse_upload(self, file_id: str) -> Optional[FileRecord]:
         cursor = self._conn.execute(
             "UPDATE files SET status='pending_upload', error_code=NULL, message=NULL, "
-            "processing_sequencer=NULL, lease_expires_at=NULL "
+            "processing_sequencer=NULL, processing_lease_token=NULL, "
+            "lease_expires_at=NULL "
             "WHERE file_id=? AND status IN ('pending_upload', 'failed')",
             (file_id,),
         )
@@ -136,7 +147,8 @@ class SQLiteRepository(FileRepository):
     def add(self, record: FileRecord) -> None:
         try:
             self._conn.execute(
-                "INSERT INTO files VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                f"INSERT INTO files ({','.join(_COLUMNS)}) "
+                f"VALUES ({','.join('?' * len(_COLUMNS))})",
                 _serialise(record),
             )
             self._conn.commit()
@@ -169,14 +181,16 @@ class SQLiteRepository(FileRepository):
         sequencer: str,
         now: datetime,
         lease_expires_at: datetime,
+        lease_token: str,
     ) -> str:
         cursor = self._conn.execute(
             "UPDATE files SET status='processing', processing_sequencer=?, "
-            "lease_expires_at=?, error_code=NULL, message=NULL "
-            "WHERE file_id=? AND status <> 'completed' AND "
+            "processing_lease_token=?, lease_expires_at=?, error_code=NULL, message=NULL "
+            "WHERE file_id=? AND status NOT IN ('completed', 'deleting') AND "
             "(status <> 'processing' OR lease_expires_at IS NULL OR lease_expires_at <= ?)",
             (
                 sequencer,
+                lease_token,
                 lease_expires_at.isoformat(),
                 file_id,
                 now.isoformat(),
@@ -197,32 +211,72 @@ class SQLiteRepository(FileRepository):
         tags: dict[str, int],
         detections: list[dict],
         model_version: str,
-    ) -> None:
-        self._conn.execute(
+        lease_token: Optional[str] = None,
+    ) -> bool:
+        condition = "status <> 'completed'"
+        params: list = [
+            original_key,
+            thumbnail_key,
+            file_type,
+            json.dumps(tags, sort_keys=True),
+            json.dumps(detections),
+            model_version,
+            file_id,
+        ]
+        if lease_token is not None:
+            condition = "status='processing' AND processing_lease_token=?"
+            params.append(lease_token)
+        cursor = self._conn.execute(
             "UPDATE files SET status='completed', object_key=?, thumbnail_key=?, "
             "file_type=?, tags_json=?, detections_json=?, model_version=?, "
-            "processing_sequencer=NULL, lease_expires_at=NULL, error_code=NULL, "
-            "message=NULL WHERE file_id=? AND status <> 'completed'",
-            (
-                original_key,
-                thumbnail_key,
-                file_type,
-                json.dumps(tags, sort_keys=True),
-                json.dumps(detections),
-                model_version,
-                file_id,
-            ),
+            "processing_sequencer=NULL, processing_lease_token=NULL, "
+            "lease_expires_at=NULL, error_code=NULL, message=NULL "
+            f"WHERE file_id=? AND {condition}",
+            params,
         )
         self._conn.commit()
+        return cursor.rowcount == 1 or self.get(file_id) is not None and self.get(file_id).status == "completed"
 
-    def mark_failed(self, file_id: str, error_code: str, message: str) -> None:
-        self._conn.execute(
+    def mark_failed(
+        self,
+        file_id: str,
+        error_code: str,
+        message: str,
+        lease_token: Optional[str] = None,
+    ) -> bool:
+        condition = "status <> 'completed'"
+        params: list = [error_code, message, file_id]
+        if lease_token is not None:
+            condition = "status='processing' AND processing_lease_token=?"
+            params.append(lease_token)
+        cursor = self._conn.execute(
             "UPDATE files SET status='failed', error_code=?, message=?, "
-            "processing_sequencer=NULL, lease_expires_at=NULL "
-            "WHERE file_id=? AND status <> 'completed'",
-            (error_code, message, file_id),
+            "processing_sequencer=NULL, processing_lease_token=NULL, "
+            "lease_expires_at=NULL "
+            f"WHERE file_id=? AND {condition}",
+            params,
         )
         self._conn.commit()
+        record = self.get(file_id)
+        return cursor.rowcount == 1 or record is not None and record.status == "completed"
+
+    def begin_delete(self, file_id: str, user_id: str) -> bool:
+        cursor = self._conn.execute(
+            "UPDATE files SET status='deleting' "
+            "WHERE file_id=? AND user_id=? AND status IN ('completed', 'deleting')",
+            (file_id, user_id),
+        )
+        self._conn.commit()
+        return cursor.rowcount == 1
+
+    def restore_completed(self, file_id: str, user_id: str) -> bool:
+        cursor = self._conn.execute(
+            "UPDATE files SET status='completed' "
+            "WHERE file_id=? AND user_id=? AND status='deleting'",
+            (file_id, user_id),
+        )
+        self._conn.commit()
+        return cursor.rowcount == 1
 
     def delete_by_ids(self, file_ids: list[str]) -> int:
         if not file_ids:

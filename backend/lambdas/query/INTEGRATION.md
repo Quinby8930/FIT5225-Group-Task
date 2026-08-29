@@ -71,9 +71,9 @@ mapper.common_name("Canis_familiaris")   # -> "dingo"
 | `detections` | list | | `[{"species": "wombat", "confidence": 0.94}]` |
 | `model_version` | string | | 模型版本，如 `speciesnet-v1` |
 | `checksum` | string | ✅ | SHA-256（Base64），`(user_id, checksum)` 唯一去重 |
-| `status` | enum | ✅ | `pending_upload` / `processing` / `completed` / `failed` |
+| `status` | enum | ✅ | `pending_upload` / `processing` / `completed` / `failed` / `deleting` |
 | `error_code` / `message` | string | | 失败诊断，`message` 截断到 240 字符 |
-| `processing_sequencer` / `lease_expires_at` | | | 处理租约，见 §5.7 |
+| `processing_sequencer` / `processing_lease_token` / `lease_expires_at` | | | 处理租约，见 §5.7 |
 | `upload_time` | string | ✅ | ISO-8601 时间戳 |
 
 **成员 B 不要直接调 `repo.add` 写 completed 记录**，而是走 HTTP 状态机（§5.7）：
@@ -123,13 +123,16 @@ key 必须是 §2 的**简化名**。B/C 普通链路仍使用 12,582,912 bytes 
 
 接口：`app/storage_client.py`，方法 `delete(user_id: str, keys: list[str]) -> None`。
 
-作用：删文件时成员 D 先调 `storage.delete(user_id, keys)` 删除原图+缩略图，成功后
-再删 DB 记录（对应成员 B 的 guarded storage-delete Lambda，入参
+作用：删文件时成员 D 先把 owned completed 记录标为 `deleting`，再调
+`storage.delete(user_id, keys)` 删除原图+缩略图，成功后删 DB 记录（对应成员 B 的
+guarded storage-delete Lambda，入参
 `{"user_id": ..., "keys": [...]}`）。公开删除只允许 Cognito `sub` 与记录 owner
 一致；请求中只要有一条外部 owner 记录，整批返回 `403 FORBIDDEN_OWNER` 且不产生副作用。
 生产环境设置 `STORAGE_BACKEND=lambda` 和非空 `STORAGE_DELETE_FUNCTION_NAME`；D
 同步调用 Lambda 并验证外层调用状态、FunctionError、1 MiB 响应边界和内层状态。
-adapter 失败返回稳定的 502 且保留 metadata；未配置返回 503。stub 只可在本地/测试中显式选择。
+adapter 失败返回稳定的 502 并把 metadata 恢复为 `completed`；未配置返回 503。
+metadata 删除失败则保留 `deleting`，公开查询和资源授权都不可见，重试会幂等删除
+storage 后继续删 metadata。stub 只可在本地/测试中显式选择。
 
 ### 4.3 成员 A — `get_current_user`
 
@@ -262,7 +265,8 @@ POST /files/delete
 响应：`{"deleted_db_records": 1, "storage_objects_removed": 2}`
 
 记录 owner 必须等于当前 Cognito `sub`；外部 owner 或混合 owner 请求整批返回 `403`。
-storage 删除发生在 metadata 删除之前，因此 storage 失败时 DB 记录仍保留。
+记录先标为 `deleting` 并立即从查询和资源授权隐藏。storage 失败恢复为 `completed`；
+storage 成功但 metadata 删除失败时保留 `deleting`，同一请求可安全重试直至收敛。
 
 ### 5.7 内部元数据状态机（成员 B 上传/处理 Lambda 调用）
 
@@ -298,10 +302,11 @@ POST /internal/files/{file_id}/processing
 {"user_id": "<sub>", "object_key": "originals/.../wombat.jpg", "sequencer": "<S3事件序列号>"}
 ```
 
-- `200 {"should_process": true, "state": "acquired"}` → 原子取得租约。
+- `200 {"should_process": true, "state": "acquired", "lease_token": "<opaque>"}` → 原子取得租约。
 - `200 {"should_process": false, "state": "completed"}` → 已完成。
 - `200 {"should_process": false, "state": "lease_active"}` → 已有活跃租约。
 - 租约窗口 900 秒（对应成员 B 处理 Lambda 的 900s 超时）。
+- 每次取得/重新取得租约都会生成不同的不可猜 token；`deleting` 不能重新取得处理租约。
 - `user_id` 或 `object_key` 与 reserve 记录不一致 → `409 METADATA_CONFLICT`，状态不变。
 
 **③ 完成处理（complete，幂等 PUT）**
@@ -313,25 +318,29 @@ PUT /internal/files/{file_id}/complete
  "thumbnail_key": "thumbnails/.../thumbnail.jpg",     // 视频为 null
  "tags": {"wombat": 2},
  "detections": [{"species": "wombat", "confidence": 0.94}],
- "model_version": "speciesnet-v1", "status": "completed"}
+ "model_version": "speciesnet-v1", "lease_token": "<processing 返回值>",
+ "status": "completed"}
 ```
 
 - `200 {}` → 已标记 `completed`。重复调用幂等，不重复生效。
 - `user_id`、`original_key` 或 `file_type` 与 reserve 记录不一致 →
   `409 METADATA_CONFLICT`，状态不变。
 - `tags` key 和每条 detection 的 `species` 在写库/通知前统一映射为团队短名。
+- terminal write 只有 token 仍为当前活跃租约时才生效；旧 worker 回调为幂等 no-op。
 
 **④ 记录失败（failed，幂等 PUT）**
 
 ```
 PUT /internal/files/{file_id}/failed
 {"user_id": "<sub>", "error_code": "FRAME_EXTRACTION_FAILED",
- "message": "<诊断信息，自动截断到 240 字符>", "status": "failed"}
+ "message": "<诊断信息，自动截断到 240 字符>",
+ "lease_token": "<processing 返回值>", "status": "failed"}
 ```
 
 - `200 {}` → 已标记 `failed`。`error_code` 取值：`INVALID_MEDIA` /
   `FRAME_EXTRACTION_FAILED` / `INFERENCE_FAILED`。已 `completed` 的文件不会被降级为 `failed`。
 - `user_id` 与 reserve 记录不一致 → `409 METADATA_CONFLICT`，状态不变。
+- terminal write 只有 token 仍为当前活跃租约时才生效；旧 worker 不能清掉新租约。
 
 ### 5.8 订阅 & 通知（成员 E 前端调用）
 

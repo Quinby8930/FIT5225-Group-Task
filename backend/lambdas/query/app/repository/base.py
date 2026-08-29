@@ -81,6 +81,7 @@ class FileRepository(ABC):
         sequencer: str,
         now: datetime,
         lease_expires_at: datetime,
+        lease_token: str,
     ) -> str:
         """Atomically return ``acquired``, ``completed``, or ``lease_active``."""
 
@@ -94,12 +95,27 @@ class FileRepository(ABC):
         tags: dict[str, int],
         detections: list[dict],
         model_version: str,
-    ) -> None:
+        lease_token: Optional[str] = None,
+    ) -> bool:
         """Set status to ``completed`` and store the processed result (idempotent)."""
 
     @abstractmethod
-    def mark_failed(self, file_id: str, error_code: str, message: str) -> None:
+    def mark_failed(
+        self,
+        file_id: str,
+        error_code: str,
+        message: str,
+        lease_token: Optional[str] = None,
+    ) -> bool:
         """Set status to ``failed`` with a bounded diagnostic (idempotent)."""
+
+    @abstractmethod
+    def begin_delete(self, file_id: str, user_id: str) -> bool:
+        """Atomically mark an owned completed/deleting record as deleting."""
+
+    @abstractmethod
+    def restore_completed(self, file_id: str, user_id: str) -> bool:
+        """Restore an owned deleting record after storage deletion fails."""
 
     @abstractmethod
     def delete_by_ids(self, file_ids: list[str]) -> int:

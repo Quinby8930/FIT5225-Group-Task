@@ -90,7 +90,7 @@ class DynamoDBRepository(FileRepository):
         self._table = resource.Table(table_name)
         self._reservations = resource.Table(reservations_table)
         self._reservations_table_name = reservations_table
-        self._client = resource.meta.client
+        self._client = boto3.client("dynamodb", region_name=region)
 
     @staticmethod
     def _reservation_key(user_id: str, checksum: str) -> str:
@@ -137,6 +137,7 @@ class DynamoDBRepository(FileRepository):
             "error_code": record.error_code,
             "message": record.message,
             "processing_sequencer": record.processing_sequencer,
+            "processing_lease_token": record.processing_lease_token,
             "lease_expires_at": (
                 record.lease_expires_at.isoformat() if record.lease_expires_at else None
             ),
@@ -163,6 +164,7 @@ class DynamoDBRepository(FileRepository):
             error_code=item.get("error_code"),
             message=item.get("message"),
             processing_sequencer=item.get("processing_sequencer"),
+            processing_lease_token=item.get("processing_lease_token"),
             lease_expires_at=_dt(item.get("lease_expires_at")),
             upload_time=_dt(item["upload_time"]),
         )
@@ -234,7 +236,7 @@ class DynamoDBRepository(FileRepository):
                 Key={"file_id": file_id},
                 UpdateExpression=(
                     "SET #s = :pending REMOVE error_code, message, "
-                    "processing_sequencer, lease_expires_at"
+                    "processing_sequencer, processing_lease_token, lease_expires_at"
                 ),
                 ConditionExpression="#s IN (:pending, :failed)",
                 ExpressionAttributeNames={"#s": "status"},
@@ -410,6 +412,7 @@ class DynamoDBRepository(FileRepository):
         sequencer: str,
         now: datetime,
         lease_expires_at: datetime,
+        lease_token: str,
     ) -> str:
         import botocore.exceptions
 
@@ -418,10 +421,12 @@ class DynamoDBRepository(FileRepository):
                 Key={"file_id": file_id},
                 UpdateExpression=(
                     "SET #s = :processing, processing_sequencer = :q, "
-                    "lease_expires_at = :lease REMOVE error_code, message"
+                    "processing_lease_token = :token, lease_expires_at = :lease "
+                    "REMOVE error_code, message"
                 ),
                 ConditionExpression=(
                     "attribute_exists(file_id) AND #s <> :completed AND "
+                    "#s <> :deleting AND "
                     "(#s <> :processing OR attribute_not_exists(lease_expires_at) OR "
                     "lease_expires_at <= :now)"
                 ),
@@ -429,7 +434,9 @@ class DynamoDBRepository(FileRepository):
                 ExpressionAttributeValues={
                     ":processing": "processing",
                     ":completed": "completed",
+                    ":deleting": "deleting",
                     ":q": sequencer,
+                    ":token": lease_token,
                     ":lease": lease_expires_at.isoformat(),
                     ":now": now.isoformat(),
                 },
@@ -451,7 +458,8 @@ class DynamoDBRepository(FileRepository):
         tags: dict[str, int],
         detections: list[dict],
         model_version: str,
-    ) -> None:
+        lease_token: Optional[str] = None,
+    ) -> bool:
         values: dict = {
             ":s": "completed",
             ":o": original_key,
@@ -459,8 +467,17 @@ class DynamoDBRepository(FileRepository):
             ":t": tags,
             ":d": _float_to_decimal(detections),
             ":m": model_version,
-            ":completed": "completed",
         }
+        condition = "attribute_exists(file_id) AND #s <> :completed"
+        if lease_token is not None:
+            condition = (
+                "attribute_exists(file_id) AND #s = :processing AND "
+                "processing_lease_token = :lease_token"
+            )
+            values[":processing"] = "processing"
+            values[":lease_token"] = lease_token
+        else:
+            values[":completed"] = "completed"
         set_parts = [
             "#s = :s",
             "object_key = :o",
@@ -479,49 +496,116 @@ class DynamoDBRepository(FileRepository):
                 Key={"file_id": file_id},
                 UpdateExpression=(
                     f"SET {', '.join(set_parts)} "
-                    "REMOVE processing_sequencer, lease_expires_at, error_code, message"
+                    "REMOVE processing_sequencer, processing_lease_token, "
+                    "lease_expires_at, error_code, message"
                 ),
-                ConditionExpression=(
-                    "attribute_exists(file_id) AND #s <> :completed"
-                ),
+                ConditionExpression=condition,
                 ExpressionAttributeNames={"#s": "status", "#tags": "tags"},
                 ExpressionAttributeValues=values,
             )
+            return True
         except botocore.exceptions.ClientError as exc:
             if exc.response.get("Error", {}).get("Code") != "ConditionalCheckFailedException":
                 raise
             current = self.get(file_id)
             if current is not None and current.status == "completed":
-                return
+                return True
+            if lease_token is not None:
+                return False
             raise
 
-    def mark_failed(self, file_id: str, error_code: str, message: str) -> None:
+    def mark_failed(
+        self,
+        file_id: str,
+        error_code: str,
+        message: str,
+        lease_token: Optional[str] = None,
+    ) -> bool:
         import botocore.exceptions
 
+        condition = "attribute_exists(file_id) AND #s <> :completed"
+        values = {
+            ":s": "failed",
+            ":e": error_code,
+            ":m": message,
+        }
+        if lease_token is not None:
+            condition = (
+                "attribute_exists(file_id) AND #s = :processing AND "
+                "processing_lease_token = :lease_token"
+            )
+            values[":processing"] = "processing"
+            values[":lease_token"] = lease_token
+        else:
+            values[":completed"] = "completed"
         try:
             self._table.update_item(
                 Key={"file_id": file_id},
                 UpdateExpression=(
                     "SET #s = :s, error_code = :e, message = :m "
-                    "REMOVE processing_sequencer, lease_expires_at"
+                    "REMOVE processing_sequencer, processing_lease_token, lease_expires_at"
                 ),
-                ConditionExpression=(
-                    "attribute_exists(file_id) AND #s <> :completed"
-                ),
+                ConditionExpression=condition,
                 ExpressionAttributeNames={"#s": "status"},
-                ExpressionAttributeValues={
-                    ":s": "failed",
-                    ":e": error_code,
-                    ":m": message,
-                    ":completed": "completed",
-                },
+                ExpressionAttributeValues=values,
             )
+            return True
         except botocore.exceptions.ClientError as exc:
             if exc.response.get("Error", {}).get("Code") != "ConditionalCheckFailedException":
                 raise
             current = self.get(file_id)
             if current is None or current.status == "completed":
-                return
+                return current is not None
+            if lease_token is not None:
+                return False
+            raise
+
+    def begin_delete(self, file_id: str, user_id: str) -> bool:
+        import botocore.exceptions
+
+        try:
+            self._table.update_item(
+                Key={"file_id": file_id},
+                UpdateExpression="SET #s = :deleting",
+                ConditionExpression=(
+                    "attribute_exists(file_id) AND user_id = :user_id AND "
+                    "#s IN (:completed, :deleting)"
+                ),
+                ExpressionAttributeNames={"#s": "status"},
+                ExpressionAttributeValues={
+                    ":user_id": user_id,
+                    ":completed": "completed",
+                    ":deleting": "deleting",
+                },
+            )
+            return True
+        except botocore.exceptions.ClientError as exc:
+            if exc.response.get("Error", {}).get("Code") == "ConditionalCheckFailedException":
+                return False
+            raise
+
+    def restore_completed(self, file_id: str, user_id: str) -> bool:
+        import botocore.exceptions
+
+        try:
+            self._table.update_item(
+                Key={"file_id": file_id},
+                UpdateExpression="SET #s = :completed",
+                ConditionExpression=(
+                    "attribute_exists(file_id) AND user_id = :user_id AND "
+                    "#s = :deleting"
+                ),
+                ExpressionAttributeNames={"#s": "status"},
+                ExpressionAttributeValues={
+                    ":user_id": user_id,
+                    ":completed": "completed",
+                    ":deleting": "deleting",
+                },
+            )
+            return True
+        except botocore.exceptions.ClientError as exc:
+            if exc.response.get("Error", {}).get("Code") == "ConditionalCheckFailedException":
+                return False
             raise
 
     def delete_by_ids(self, file_ids: list[str]) -> int:

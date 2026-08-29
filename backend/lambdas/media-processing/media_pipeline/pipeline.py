@@ -69,9 +69,10 @@ class MediaPipeline:
             "object_key": record.key,
             "sequencer": record.sequencer,
         }
-        if self._skip_or_retry_processing_lease(
+        lease_token = self._processing_lease_token(
             self.metadata.begin_processing(record.file_id, lease_payload)
-        ):
+        )
+        if lease_token is None:
             return {"status": "skipped", "file_id": record.file_id}
 
         try:
@@ -105,6 +106,8 @@ class MediaPipeline:
                     "model_version": inference_result["model_version"],
                     "status": "completed",
                 }
+                if lease_token:
+                    completion["lease_token"] = lease_token
                 self.metadata.complete(record.file_id, completion)
             return {"status": "completed", "file_id": record.file_id}
         except Exception as error:
@@ -118,15 +121,15 @@ class MediaPipeline:
                 retryable = True
             failure_recorded = False
             try:
-                self.metadata.fail(
-                    record.file_id,
-                    {
-                        "user_id": record.user_id,
-                        "error_code": error_code,
-                        "message": message,
-                        "status": "failed",
-                    },
-                )
+                failure = {
+                    "user_id": record.user_id,
+                    "error_code": error_code,
+                    "message": message,
+                    "status": "failed",
+                }
+                if lease_token:
+                    failure["lease_token"] = lease_token
+                self.metadata.fail(record.file_id, failure)
                 failure_recorded = True
             except Exception:
                 pass
@@ -143,9 +146,9 @@ class MediaPipeline:
             raise
 
     @staticmethod
-    def _skip_or_retry_processing_lease(lease_response):
+    def _processing_lease_token(lease_response):
         if type(lease_response) is bool:
-            return not lease_response
+            return "" if lease_response else None
         if not isinstance(lease_response, dict):
             raise MediaPipelineError(
                 "DEPENDENCY_UNAVAILABLE",
@@ -162,9 +165,9 @@ class MediaPipeline:
                 retryable=True,
             )
         if state is None:
-            return not should_process
+            return "" if should_process else None
         if state == "completed" and not should_process:
-            return True
+            return None
         if state == "lease_active" and not should_process:
             raise MediaPipelineError(
                 "PROCESSING_LEASE_ACTIVE",
@@ -172,7 +175,14 @@ class MediaPipeline:
                 retryable=True,
             )
         if state == "acquired" and should_process:
-            return False
+            lease_token = lease_response.get("lease_token")
+            if isinstance(lease_token, str) and len(lease_token) >= 32:
+                return lease_token
+            raise MediaPipelineError(
+                "DEPENDENCY_UNAVAILABLE",
+                "Metadata response did not match its contract",
+                retryable=True,
+            )
         raise MediaPipelineError(
             "DEPENDENCY_UNAVAILABLE",
             "Metadata response did not match its contract",

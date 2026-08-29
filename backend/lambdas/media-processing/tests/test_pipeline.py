@@ -338,6 +338,39 @@ def test_image_pipeline_stores_deterministic_thumbnail_and_serializes_completion
     assert all(not path.exists() for path in storage.local_paths)
 
 
+def test_completion_includes_the_acquired_processing_lease_token():
+    lease_token = "a" * 43
+    pipeline, _, metadata, _, _ = make_pipeline(
+        should_process={
+            "should_process": True,
+            "state": "acquired",
+            "lease_token": lease_token,
+        }
+    )
+
+    pipeline.process_record(s3_record())
+
+    assert metadata.completed[0][1]["lease_token"] == lease_token
+
+
+def test_failure_includes_the_acquired_processing_lease_token():
+    lease_token = "b" * 43
+    pipeline, _, metadata, inference, _ = make_pipeline(
+        should_process={
+            "should_process": True,
+            "state": "acquired",
+            "lease_token": lease_token,
+        }
+    )
+    inference.error = MediaPipelineError(
+        "INFERENCE_FAILED", "terminal failure", retryable=False
+    )
+
+    pipeline.process_record(s3_record())
+
+    assert metadata.failed[0][1]["lease_token"] == lease_token
+
+
 def test_video_pipeline_uploads_signed_frames_once_and_cleans_them_after_success():
     pipeline, storage, metadata, inference, _ = make_pipeline(content_type="video/mp4")
 

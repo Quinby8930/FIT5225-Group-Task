@@ -189,7 +189,11 @@ def test_metadata_timeout_default_remains_ten_seconds(monkeypatch):
 @pytest.mark.parametrize(
     "response",
     [
-        {"should_process": True, "state": "acquired"},
+        {
+            "should_process": True,
+            "state": "acquired",
+            "lease_token": "a" * 43,
+        },
         {"should_process": False, "state": "lease_active"},
         {"should_process": True},
     ],
@@ -215,6 +219,30 @@ def test_metadata_client_preserves_the_processing_state_contract(monkeypatch, re
     ],
 )
 def test_metadata_client_rejects_invalid_processing_state_combinations(
+    monkeypatch, response
+):
+    monkeypatch.setattr(
+        http_clients_module, "urlopen", RecordingUrlOpen([response])
+    )
+
+    with pytest.raises(MediaPipelineError) as caught:
+        MetadataClient("https://metadata.example").begin_processing(
+            "file-1", {"user_id": "user-1"}
+        )
+
+    assert caught.value.code == "DEPENDENCY_UNAVAILABLE"
+    assert caught.value.retryable is True
+
+
+@pytest.mark.parametrize(
+    "response",
+    [
+        {"should_process": True, "state": "acquired"},
+        {"should_process": True, "state": "acquired", "lease_token": "short"},
+        {"should_process": True, "state": "acquired", "lease_token": 123},
+    ],
+)
+def test_metadata_client_rejects_acquired_lease_without_a_valid_token(
     monkeypatch, response
 ):
     monkeypatch.setattr(

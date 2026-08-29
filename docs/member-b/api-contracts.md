@@ -213,22 +213,22 @@ POST {METADATA_API_BASE_URL}/internal/files/{file_id}/processing
 }
 ```
 
-`200` returns a JSON object containing a Boolean lease decision and, on current
-Member D deployments, a state discriminator:
+`200` returns a JSON object containing a Boolean lease decision, a state
+discriminator, and a fresh unguessable token when the lease is acquired:
 
 ```json
-{"should_process": true, "state": "acquired"}
+{"should_process": true, "state": "acquired", "lease_token": "<opaque-token>"}
 ```
 
-The three valid states are `acquired` with `should_process:true`, `completed`
+The three valid states are `acquired` with `should_process:true` and a token,
+`completed`
 with `should_process:false`, and `lease_active` with `should_process:false`.
 `completed` is a successful no-op before S3 download. `lease_active` is a
 retryable processing error, so a concurrent S3 delivery is retried after the
-current lease expires or clears. For backwards compatibility, B also accepts
-the legacy object with only `should_process`: `true` proceeds and `false` is a
-successful no-op. A failed or lease-expired interrupted attempt must be
+current lease expires or clears. A failed or lease-expired interrupted attempt must be
 re-acquirable with the same sequencer; an active attempt must not be granted
-twice. Transport, non-success, invalid UTF-8/JSON, oversized JSON, and
+twice. Every acquisition receives a different token. Transport, non-success,
+invalid UTF-8/JSON, oversized JSON, and
 malformed responses are retryable dependency failures.
 
 ### Complete processing
@@ -248,13 +248,15 @@ Image payload:
   "tags": {"wombat": 2},
   "detections": [{"species": "wombat", "confidence": 0.94}],
   "model_version": "speciesnet-v1",
+  "lease_token": "<token returned by processing>",
   "status": "completed"
 }
 ```
 
 For videos, `file_type` is `video` and `thumbnail_key` is `null`. Member D must
 return a successful status with a JSON object, for example `200 {}`. Completion
-is idempotent for metadata and deterministic inbox identity. A completed replay
+is fenced by the active acquisition token, idempotent for metadata, and uses a
+deterministic inbox identity. A stale worker cannot overwrite a newer lease. A completed replay
 publishes only already-persisted pending inbox entries; it does not re-read
 current subscriptions or create historical notifications for late subscribers.
 Delivery is at-least-once, so consumers should dedupe by
@@ -271,6 +273,7 @@ PUT {METADATA_API_BASE_URL}/internal/files/{file_id}/failed
   "user_id": "cognito-sub",
   "error_code": "FRAME_EXTRACTION_FAILED",
   "message": "bounded diagnostic message",
+  "lease_token": "<token returned by processing>",
   "status": "failed"
 }
 ```
@@ -283,8 +286,9 @@ first; an error from that best-effort reporting call never replaces the original
 processing error. A non-retryable media error then returns a stable failed
 result so Lambda does not retry a terminal 401/4xx/contract rejection forever.
 A retryable error rethrows after the failed transition is attempted, permitting
-the same S3 event to acquire processing again. The failure PUT is idempotent
-for a replayed attempt.
+the same S3 event to acquire processing again. The failure PUT is fenced by the
+active acquisition token and is idempotent for a replayed attempt; a stale
+worker cannot clear a newer lease.
 
 ## Member C inference contract
 

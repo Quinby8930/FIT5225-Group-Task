@@ -34,6 +34,7 @@ from __future__ import annotations
 
 import hmac
 import logging
+import secrets
 from datetime import timedelta
 
 from fastapi import Depends, FastAPI, Header, HTTPException, UploadFile
@@ -562,25 +563,42 @@ def delete_files(
     )
     if any(record.user_id != _user for record in records):
         raise HTTPException(status_code=403, detail=FORBIDDEN_OWNER_DETAIL)
+    if any(record.status not in {"completed", "deleting"} for record in records):
+        raise HTTPException(status_code=409, detail="media is not ready for deletion")
+    marked_records: list[FileRecord] = []
+    for record in records:
+        if not repo_.begin_delete(record.file_id, _user):
+            for marked in marked_records:
+                repo_.restore_completed(marked.file_id, _user)
+            raise HTTPException(status_code=409, detail="media deletion state changed")
+        marked_records.append(record)
     keys_to_delete: list[str] = []
     for record in records:
         keys = [record.object_key] + (
             [record.thumbnail_key] if record.thumbnail_key else []
         )
         keys_to_delete.extend(keys)
-    # Delete storage first so a storage failure cannot leave orphaned objects
-    # after their metadata has already disappeared.
     if keys_to_delete:
         try:
             storage_.delete(_user, keys_to_delete)
-        except StorageClientUnavailable as exc:
-            raise HTTPException(
-                status_code=503, detail="storage deletion unavailable"
-            ) from exc
-        except StorageClientError as exc:
-            raise HTTPException(
-                status_code=502, detail="storage deletion failed"
-            ) from exc
+        except Exception as exc:
+            for record in marked_records:
+                try:
+                    repo_.restore_completed(record.file_id, _user)
+                except Exception:
+                    logger.exception(
+                        "delete state rollback failed after storage deletion error",
+                        extra={"file_id": record.file_id},
+                    )
+            if isinstance(exc, StorageClientUnavailable):
+                raise HTTPException(
+                    status_code=503, detail="storage deletion unavailable"
+                ) from exc
+            if isinstance(exc, StorageClientError):
+                raise HTTPException(
+                    status_code=502, detail="storage deletion failed"
+                ) from exc
+            raise
     removed_db = repo_.delete_by_ids([record.file_id for record in records])
     return {
         "deleted_db_records": removed_db,
@@ -736,13 +754,18 @@ def acquire_processing(
         record, user_id=body.user_id, object_key=body.object_key
     )
     now = utcnow()
+    lease_token = secrets.token_urlsafe(32)
     state = repo_.try_acquire_processing(
         file_id,
         body.sequencer,
         now,
         now + timedelta(seconds=LEASE_SECONDS),
+        lease_token,
     )
-    return {"should_process": state == "acquired", "state": state}
+    response = {"should_process": state == "acquired", "state": state}
+    if state == "acquired":
+        response["lease_token"] = lease_token
+    return response
 
 
 @app.put("/internal/files/{file_id}/complete")
@@ -766,12 +789,15 @@ def complete_processing(
     if record.status == "completed":
         _publish_pending_notifications(file_id, notif_repo_, publisher_)
         return {}
+    if (
+        record.status != "processing"
+        or record.processing_lease_token != body.lease_token
+    ):
+        return {}
     tags = _normalise_tags(body.tags)
     detections = _normalise_detections(body.detections)
-    # Ensure the durable inbox before the completed transition. If completion
-    # persistence fails, a retry rebuilds the same deterministic notification IDs.
     _ensure_notification_inbox(file_id, body.original_key, tags, notif_repo_)
-    repo_.mark_completed(
+    changed = repo_.mark_completed(
         file_id,
         body.original_key,
         body.thumbnail_key,
@@ -779,7 +805,10 @@ def complete_processing(
         tags,
         detections,
         body.model_version,
+        body.lease_token,
     )
+    if not changed:
+        return {}
     _publish_pending_notifications(file_id, notif_repo_, publisher_)
     return {}
 
@@ -797,5 +826,15 @@ def fail_processing(
     _require_matching_metadata(record, user_id=body.user_id)
     if record.status == "completed":
         return {}  # never downgrade a completed file
-    repo_.mark_failed(file_id, body.error_code, body.message[:FAILED_MESSAGE_MAX_CHARS])
+    if (
+        record.status != "processing"
+        or record.processing_lease_token != body.lease_token
+    ):
+        return {}
+    repo_.mark_failed(
+        file_id,
+        body.error_code,
+        body.message[:FAILED_MESSAGE_MAX_CHARS],
+        body.lease_token,
+    )
     return {}

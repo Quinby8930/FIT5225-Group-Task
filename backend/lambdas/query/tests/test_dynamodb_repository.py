@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 from decimal import Decimal
+import sys
+from types import SimpleNamespace
 
 import pytest
 from botocore.exceptions import ClientError
@@ -85,6 +87,35 @@ def _file_repo(table: _PagedTable) -> DynamoDBRepository:
     repository = object.__new__(DynamoDBRepository)
     repository._table = table
     return repository
+
+
+def test_repository_uses_low_level_client_for_serialized_transactions(monkeypatch):
+    resource_client = object()
+    low_level_client = object()
+    files = _PagedTable()
+    files.name = "files"
+    reservations = _PagedTable()
+    reservations.name = "reservations"
+    resource = SimpleNamespace(
+        Table=lambda name: files if name == "files" else reservations,
+        meta=SimpleNamespace(client=resource_client),
+    )
+    client_calls = []
+
+    monkeypatch.setitem(
+        sys.modules,
+        "boto3",
+        SimpleNamespace(
+            resource=lambda *_args, **_kwargs: resource,
+            client=lambda service, **kwargs: client_calls.append((service, kwargs))
+            or low_level_client,
+        ),
+    )
+
+    repository = DynamoDBRepository("files", reservations_table="reservations")
+
+    assert repository._client is low_level_client
+    assert client_calls == [("dynamodb", {"region_name": "ap-southeast-2"})]
 
 
 def test_reserve_uses_one_transaction_for_checksum_claim_and_file_record():
@@ -493,11 +524,14 @@ def test_processing_lease_acquisition_is_one_conditional_update():
     now = datetime(2026, 8, 26, tzinfo=timezone.utc)
     expires = datetime(2026, 8, 26, 0, 15, tzinfo=timezone.utc)
 
-    state = repository.try_acquire_processing("f1", "seq-1", now, expires)
+    state = repository.try_acquire_processing(
+        "f1", "seq-1", now, expires, "lease-token"
+    )
 
     assert state == "acquired"
     assert table.updated["ConditionExpression"] == (
         "attribute_exists(file_id) AND #s <> :completed AND "
+        "#s <> :deleting AND "
         "(#s <> :processing OR attribute_not_exists(lease_expires_at) OR "
         "lease_expires_at <= :now)"
     )
@@ -809,12 +843,89 @@ def test_completion_with_thumbnail_builds_valid_set_and_remove_expression():
     assert table.updated["UpdateExpression"] == (
         "SET #s = :s, object_key = :o, file_type = :ft, #tags = :t, "
         "detections = :d, model_version = :m, thumbnail_key = :th "
-        "REMOVE processing_sequencer, lease_expires_at, error_code, message"
+        "REMOVE processing_sequencer, processing_lease_token, lease_expires_at, "
+        "error_code, message"
     )
     assert table.updated["ConditionExpression"] == (
         "attribute_exists(file_id) AND #s <> :completed"
     )
     assert table.updated["ExpressionAttributeValues"][":completed"] == "completed"
+
+
+def test_completion_is_conditioned_on_the_active_processing_lease_token():
+    table = _PagedTable()
+    repository = _file_repo(table)
+
+    changed = repository.mark_completed(
+        "f1",
+        "originals/u1/f1.jpg",
+        None,
+        "image",
+        {"wombat": 1},
+        [],
+        "v1",
+        lease_token="active-lease-token",
+    )
+
+    assert changed is True
+    assert table.updated["ConditionExpression"] == (
+        "attribute_exists(file_id) AND #s = :processing AND "
+        "processing_lease_token = :lease_token"
+    )
+    assert table.updated["ExpressionAttributeValues"][":lease_token"] == (
+        "active-lease-token"
+    )
+
+
+def test_failure_is_conditioned_on_the_active_processing_lease_token():
+    table = _PagedTable()
+    repository = _file_repo(table)
+
+    changed = repository.mark_failed(
+        "f1",
+        "INFERENCE_FAILED",
+        "failure",
+        lease_token="active-lease-token",
+    )
+
+    assert changed is True
+    assert table.updated["ConditionExpression"] == (
+        "attribute_exists(file_id) AND #s = :processing AND "
+        "processing_lease_token = :lease_token"
+    )
+    assert table.updated["ExpressionAttributeValues"][":lease_token"] == (
+        "active-lease-token"
+    )
+
+
+def test_begin_delete_is_owner_scoped_and_accepts_only_completed_or_deleting():
+    table = _PagedTable()
+    repository = _file_repo(table)
+
+    changed = repository.begin_delete("f1", "u1")
+
+    assert changed is True
+    assert table.updated["ConditionExpression"] == (
+        "attribute_exists(file_id) AND user_id = :user_id AND "
+        "#s IN (:completed, :deleting)"
+    )
+    assert table.updated["ExpressionAttributeValues"] == {
+        ":user_id": "u1",
+        ":completed": "completed",
+        ":deleting": "deleting",
+    }
+
+
+def test_restore_completed_is_owner_scoped_and_only_rolls_back_deleting():
+    table = _PagedTable()
+    repository = _file_repo(table)
+
+    changed = repository.restore_completed("f1", "u1")
+
+    assert changed is True
+    assert table.updated["ConditionExpression"] == (
+        "attribute_exists(file_id) AND user_id = :user_id AND #s = :deleting"
+    )
 
 
 def test_concurrent_completed_winner_is_preserved_as_idempotent_noop():
