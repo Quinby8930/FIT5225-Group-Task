@@ -138,11 +138,12 @@ class MediaPipeline:
                 self.metadata.complete(record.file_id, completion)
             return {"status": "completed", "file_id": record.file_id}
         except Exception as error:
+            thumbnail_cleanup_error = None
             if thumbnail_uploaded and not completion_attempted:
                 try:
                     self.storage.delete(record.bucket, [thumbnail_key])
-                except Exception:
-                    pass
+                except Exception as cleanup_error:
+                    thumbnail_cleanup_error = cleanup_error
             if isinstance(error, MediaPipelineError):
                 error_code = error.code
                 message = error.message[:240]
@@ -165,6 +166,21 @@ class MediaPipeline:
                 failure_recorded = True
             except Exception:
                 pass
+            if (
+                thumbnail_cleanup_error is not None
+                and failure_recorded
+                and not retryable
+            ):
+                if (
+                    isinstance(thumbnail_cleanup_error, MediaPipelineError)
+                    and thumbnail_cleanup_error.retryable
+                ):
+                    raise thumbnail_cleanup_error from error
+                raise MediaPipelineError(
+                    "STORAGE_DELETE_FAILED",
+                    "Thumbnail cleanup failed",
+                    retryable=True,
+                ) from thumbnail_cleanup_error
             if (
                 isinstance(error, MediaPipelineError)
                 and not retryable

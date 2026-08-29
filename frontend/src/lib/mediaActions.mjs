@@ -15,6 +15,12 @@ export function canOpenFullImage(item) {
     && item.original_key.length > 0;
 }
 
+export function previewStatusSemantics(state) {
+  return state?.status === "retry_exhausted"
+    ? { role: "status", "aria-live": "polite" }
+    : {};
+}
+
 export function openDetachedWindow(openWindow) {
   if (typeof openWindow !== "function") return null;
   const popup = openWindow("about:blank", "_blank");

@@ -8,7 +8,9 @@ deployment approval.
 ## Already implemented and locally verifiable
 
 - Protected upload handler behavior and checksum-bound S3 pre-signing.
-- Protected, current-user-only temporary GET URLs for originals and thumbnails.
+- Protected temporary GET URLs for metadata-authorized completed originals and
+  thumbnails; any authenticated user may preview them, while mutations remain
+  owner-only.
 - Per-user duplicate reservation through Member D's HTTP contract.
 - S3 event parsing, 40 MP-bounded image thumbnails, one-frame-per-second video
   sampling with a 600-second/900-frame bound, 1,024-pixel scaling, a 2 GiB
@@ -131,9 +133,10 @@ token. From the authenticated UI:
    the same user returns `409` after Member D integration is active.
 4. Verify the browser origin works and an unapproved origin is not granted CORS
    access.
-5. Request `POST /asset-urls` for the uploaded original and generated thumbnail,
-   open the returned HTTPS URLs, and verify a different user's key returns
-   `403` without exposing the key in the response.
+5. Request `POST /asset-urls` for the uploaded original and generated thumbnail
+   and open the returned HTTPS URLs. With a second authenticated user, verify
+   completed media can also be previewed, while tag edits and deletion remain
+   owner-only and denied responses do not expose raw keys.
 
 ### 7. Collect CloudWatch and S3 evidence
 

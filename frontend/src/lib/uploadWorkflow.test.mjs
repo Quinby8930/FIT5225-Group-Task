@@ -49,3 +49,54 @@ test("pauses a local preview only when the Upload view becomes inactive", async 
   assert.deepEqual(calls, ["pause"]);
   assert.doesNotThrow(() => pauseInactivePreview(false, null));
 });
+
+test("accepts exact upload limits and rejects the next byte for each supported media family", async () => {
+  const { validateUploadFile } = await import("../api/mediaApi.js");
+  const cases = [
+    ["image/jpeg", 12_582_912, "Images must be 12 MiB or smaller."],
+    ["image/png", 12_582_912, "Images must be 12 MiB or smaller."],
+    ["image/webp", 12_582_912, "Images must be 12 MiB or smaller."],
+    ["video/mp4", 262_144_000, "Videos must be 250 MiB or smaller."],
+    ["video/quicktime", 262_144_000, "Videos must be 250 MiB or smaller."],
+  ];
+
+  for (const [type, limit, message] of cases) {
+    assert.doesNotThrow(() => validateUploadFile({ type, size: limit }));
+    assert.throws(() => validateUploadFile({ type, size: limit + 1 }), { message });
+  }
+});
+
+test("rejects invalid upload MIME and size before hashing, status, or network work", async () => {
+  const { uploadMedia } = await import("../api/mediaApi.js");
+  const originalFetch = globalThis.fetch;
+  let arrayBufferCalls = 0;
+  let fetchCalls = 0;
+  const stages = [];
+  globalThis.fetch = async () => {
+    fetchCalls += 1;
+    throw new Error("fetch must not run");
+  };
+
+  try {
+    for (const file of [
+      { name: "too-large.jpg", type: "image/jpeg", size: 12_582_913 },
+      { name: "too-large.mov", type: "video/quicktime", size: 262_144_001 },
+      { name: "looks-like-an-image.jpg", type: "", size: 100 },
+      { name: "unknown.jpg", type: "application/octet-stream", size: 100 },
+    ]) {
+      file.arrayBuffer = async () => {
+        arrayBufferCalls += 1;
+        return new ArrayBuffer(0);
+      };
+      await assert.rejects(
+        uploadMedia(file, { onStage: (stage) => stages.push(stage) }),
+      );
+    }
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+
+  assert.equal(arrayBufferCalls, 0);
+  assert.equal(fetchCalls, 0);
+  assert.deepEqual(stages, []);
+});

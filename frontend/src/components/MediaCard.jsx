@@ -1,5 +1,6 @@
-import { canOpenFullImage, canOpenPreview, canRenderInlinePreview } from "../lib/mediaActions.mjs";
+import { canOpenFullImage, canOpenPreview, canRenderInlinePreview, previewStatusSemantics } from "../lib/mediaActions.mjs";
 import { usableAssetUrl } from "../lib/assetUrls.mjs";
+import { canRenderRawMediaKey } from "../lib/queryResults.mjs";
 
 function previewMessage(state) {
   const messages = {
@@ -10,6 +11,7 @@ function previewMessage(state) {
     not_completed: "Processing is not complete",
     expired: "Refreshing preview…",
     unavailable: "Preview temporarily unavailable",
+    retry_exhausted: "Preview retries exhausted. Refresh previews to try again.",
   };
   return messages[state?.status] || "Preview unavailable";
 }
@@ -45,7 +47,7 @@ export default function MediaCard({ item, assetStates, selected, onToggle, onOpe
             Your browser cannot play this video.
           </video>
         )}
-        {!url && <span>{previewMessage(state)}</span>}
+        {!url && <span {...previewStatusSemantics(state)}>{previewMessage(state)}</span>}
       </div>
       <div className="media-card-body">
         <div className="media-card-heading">
@@ -84,10 +86,12 @@ export default function MediaCard({ item, assetStates, selected, onToggle, onOpe
             </button>
           )}
         </div>
-        <details>
-          <summary>Technical details</summary>
-          <code>{item.display_key}</code>
-        </details>
+        {canRenderRawMediaKey(item) && (
+          <details>
+            <summary>Technical details</summary>
+            <code>{item.display_key}</code>
+          </details>
+        )}
       </div>
     </article>
   );

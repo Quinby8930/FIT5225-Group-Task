@@ -1,12 +1,15 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { requestAssetUrls } from "../api/mediaApi";
 import {
-  assetExpiryDelay, expiredAssetKeys, markAssetKeysLoading, mergeAssetUrlStates, nextAssetRefreshDelay,
-  nextAssetRetryDelay, pruneAssetUrlStates, requestAssetUrlBatches, retryableAssetKeys,
+  assetExpiryDelay, assetRefreshSchedule, assetRetrySchedule, markAssetKeysLoading, mergeAssetUrlStates,
+  requestAssetUrlBatches, retryableAssetKeys, transitionExpiredAssetStates,
 } from "../lib/assetUrls.mjs";
-import { assetDatasetIdentity, beginAssetDataset, beginAssetRequest, filterLatestAssetResponse } from "../lib/assetRequestCoordinator.mjs";
+import {
+  assetDatasetIdentity, beginAssetDataset, beginAssetRequest, createLatestAssetStateCoordinator,
+  filterLatestAssetResponse,
+} from "../lib/assetRequestCoordinator.mjs";
 import { canOpenFullImage, canRenderInlinePreview, withDetachedWindow } from "../lib/mediaActions.mjs";
-import { clearRetryEpisodes, recordRetryDispatch, retryDelayForKey } from "../lib/retryEpisodes.mjs";
+import { clearRetryEpisodes, recordRetryDispatch } from "../lib/retryEpisodes.mjs";
 
 function previewKey(item) {
   if (!canRenderInlinePreview(item)) return null;
@@ -19,6 +22,10 @@ function uniquePreviewKeys(items) {
 
 export default function useSignedAssetUrls(items, sessionKey, onStatus) {
   const [assetStates, setAssetStates] = useState({});
+  const latestAssetStates = useRef(null);
+  if (latestAssetStates.current === null) {
+    latestAssetStates.current = createLatestAssetStateCoordinator({});
+  }
   const coordinator = useRef({ datasetEpoch: 0, nextToken: 0, keyTokens: {} });
   const retryEpisodes = useRef({});
   const timers = useRef(new Set());
@@ -33,16 +40,28 @@ export default function useSignedAssetUrls(items, sessionKey, onStatus) {
     timers.current.add(timer);
   }, []);
 
-  const loadKeys = useCallback(async (keys, datasetEpoch, { resetRetries = false } = {}) => {
+  const replaceAssetStates = useCallback((nextStates) => {
+    const next = latestAssetStates.current.replace(nextStates);
+    setAssetStates(next);
+    return next;
+  }, []);
+
+  const transitionAssetStates = useCallback((updater) => {
+    const next = latestAssetStates.current.transition(updater);
+    setAssetStates(next);
+    return next;
+  }, []);
+
+  const loadKeys = useCallback(async (keys, datasetEpoch, { resetRetries = false, autoRetryCounts = {} } = {}) => {
     if (!keys.length || coordinator.current.datasetEpoch !== datasetEpoch) return;
     const started = beginAssetRequest(coordinator.current, keys);
     coordinator.current = started.state;
     if (resetRetries) retryEpisodes.current = clearRetryEpisodes(retryEpisodes.current, keys);
-    setAssetStates((current) => markAssetKeysLoading(keys, current));
+    transitionAssetStates((current) => markAssetKeysLoading(keys, current));
     const outcomes = await requestAssetUrlBatches(keys, requestAssetUrls);
     if (coordinator.current.datasetEpoch !== datasetEpoch) return;
 
-    setAssetStates((current) => outcomes.reduce((next, outcome) => {
+    transitionAssetStates((current) => outcomes.reduce((next, outcome) => {
       const rawResponse = outcome.status === "fulfilled"
         ? outcome.response
         : { errors: outcome.keys.map((key) => ({ key, code: "UNAVAILABLE" })) };
@@ -54,27 +73,27 @@ export default function useSignedAssetUrls(items, sessionKey, onStatus) {
           .map((error) => error.key),
       ];
       if (clearedKeys.length) retryEpisodes.current = clearRetryEpisodes(retryEpisodes.current, clearedKeys);
-      return mergeAssetUrlStates(next, response, outcome.signedAt);
+      return mergeAssetUrlStates(next, response, outcome.signedAt, Date.now(), autoRetryCounts);
     }, current));
-  }, []);
+  }, [transitionAssetStates]);
 
   const keys = uniquePreviewKeys(items);
   const itemIdentity = assetDatasetIdentity(items);
   const keyIdentity = keys.join("|");
-  const stateIdentity = Object.entries(assetStates).map(([key, state]) => `${key}:${state?.status}:${state?.expiresAt || ""}:${state?.retryable === true}`).sort().join("|");
+  const stateIdentity = Object.entries(assetStates).map(([key, state]) => `${key}:${state?.status}:${state?.expiresAt || ""}:${state?.retryable === true}:${state?.retryExhausted === true}:${state?.requestInFlight === true}`).sort().join("|");
 
   useEffect(() => {
     coordinator.current = beginAssetDataset(coordinator.current);
     const datasetEpoch = coordinator.current.datasetEpoch;
     retryEpisodes.current = {};
     clearTimers();
-    setAssetStates({});
+    replaceAssetStates({});
     if (keys.length) loadKeys(keys, datasetEpoch).catch(() => {});
     return () => {
       coordinator.current = beginAssetDataset(coordinator.current);
       clearTimers();
     };
-  }, [clearTimers, itemIdentity, loadKeys, sessionKey]);
+  }, [clearTimers, itemIdentity, loadKeys, replaceAssetStates, sessionKey]);
 
   useEffect(() => {
     const datasetEpoch = coordinator.current.datasetEpoch;
@@ -83,23 +102,40 @@ export default function useSignedAssetUrls(items, sessionKey, onStatus) {
     const expiryDelay = assetExpiryDelay(assetStates);
     if (expiryDelay !== null) schedule(() => {
       if (coordinator.current.datasetEpoch !== datasetEpoch) return;
-      setAssetStates((current) => pruneAssetUrlStates(current));
-      loadKeys(keys, datasetEpoch).catch(() => {});
+      let transition;
+      transitionAssetStates((current) => {
+        transition = transitionExpiredAssetStates(current, keys);
+        return transition.states;
+      });
+      if (transition.requestKeys.length) loadKeys(transition.requestKeys, datasetEpoch).catch(() => {});
     }, Math.max(0, expiryDelay));
-    const refreshDelay = nextAssetRefreshDelay(assetStates);
-    if (refreshDelay !== null) schedule(() => loadKeys(keys, datasetEpoch).catch(() => {}), refreshDelay);
-    for (const key of retryableAssetKeys(assetStates)) {
-      const state = assetStates[key];
-      const delay = state?.status === "ready"
-        ? nextAssetRetryDelay({ [key]: state }, retryEpisodes.current[key] || 0)
-        : retryDelayForKey(retryEpisodes.current, key);
-      if (delay !== null) schedule(() => {
+    const refreshPlan = assetRefreshSchedule(assetStates, keys);
+    if (refreshPlan) {
+      schedule(
+        () => {
+          if (coordinator.current.datasetEpoch !== datasetEpoch) return;
+          const latestPlan = assetRefreshSchedule(latestAssetStates.current.current(), refreshPlan.keys);
+          if (!latestPlan || latestPlan.delay > 1_000) return;
+          loadKeys(latestPlan.keys, datasetEpoch).catch(() => {});
+        },
+        refreshPlan.delay,
+      );
+    }
+    for (const { key, delay } of assetRetrySchedule(assetStates, retryEpisodes.current)) {
+      const scheduledAttempt = retryEpisodes.current[key] || 0;
+      schedule(() => {
+        if (coordinator.current.datasetEpoch !== datasetEpoch) return;
+        if ((retryEpisodes.current[key] || 0) !== scheduledAttempt) return;
+        const stillRetryable = retryableAssetKeys(latestAssetStates.current.current()).includes(key);
+        if (!stillRetryable) return;
         retryEpisodes.current = recordRetryDispatch(retryEpisodes.current, key);
-        loadKeys([key], datasetEpoch).catch(() => {});
+        loadKeys([key], datasetEpoch, {
+          autoRetryCounts: { [key]: retryEpisodes.current[key] },
+        }).catch(() => {});
       }, delay);
     }
     return clearTimers;
-  }, [clearTimers, keyIdentity, loadKeys, schedule, stateIdentity]);
+  }, [clearTimers, keyIdentity, loadKeys, schedule, stateIdentity, transitionAssetStates]);
 
   useEffect(() => () => { coordinator.current = beginAssetDataset(coordinator.current); clearTimers(); }, [clearTimers]);
 
@@ -107,9 +143,12 @@ export default function useSignedAssetUrls(items, sessionKey, onStatus) {
     const pruneExpired = () => {
       if (document.visibilityState === "hidden") return;
       const datasetEpoch = coordinator.current.datasetEpoch;
-      const expiredKeys = expiredAssetKeys(assetStates, keys);
-      setAssetStates((current) => pruneAssetUrlStates(current));
-      if (expiredKeys.length) loadKeys(expiredKeys, datasetEpoch).catch(() => {});
+      let transition;
+      transitionAssetStates((current) => {
+        transition = transitionExpiredAssetStates(current, keys);
+        return transition.states;
+      });
+      if (transition.requestKeys.length) loadKeys(transition.requestKeys, datasetEpoch).catch(() => {});
     };
     window.addEventListener("focus", pruneExpired);
     document.addEventListener("visibilitychange", pruneExpired);
@@ -117,7 +156,7 @@ export default function useSignedAssetUrls(items, sessionKey, onStatus) {
       window.removeEventListener("focus", pruneExpired);
       document.removeEventListener("visibilitychange", pruneExpired);
     };
-  }, [keyIdentity, loadKeys, stateIdentity]);
+  }, [keyIdentity, loadKeys, transitionAssetStates]);
 
   const refresh = useCallback(() => {
     const datasetEpoch = coordinator.current.datasetEpoch;

@@ -36,8 +36,9 @@ Member B has added a locally verified media-ingestion boundary:
 - Authenticated S3 upload pre-signing bound to declared length, content type,
   and checksum, with per-user duplicate reservation through Member D's metadata
   contract.
-- Authenticated, ownership-checked S3 download pre-signing for private originals
-  and thumbnails, returned in batches of at most 100 keys.
+- Authenticated S3 download pre-signing for completed originals and thumbnails,
+  including cross-owner previews; edit and delete operations remain owner-only.
+  Asset responses are returned in batches of at most 100 keys.
 - Private S3 object layout and `originals/`-only event processing.
 - Aspect-ratio-preserving image thumbnails with a 40 MP decode ceiling and
   bounded video extraction at exactly one frame per second (600-second maximum,

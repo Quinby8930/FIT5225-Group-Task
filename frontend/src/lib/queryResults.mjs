@@ -25,6 +25,14 @@ function structuredItem(value) {
   };
 }
 
+export function canRenderRawMediaKey(item) {
+  return item?.can_manage === true;
+}
+
+export function legacyReferenceLabel(index) {
+  return `Legacy reference ${index + 1}`;
+}
+
 export function normalizeQueryResponse(data) {
   const source = data && typeof data === "object" ? data : {};
   const knownFileIds = new Set();

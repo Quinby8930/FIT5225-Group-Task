@@ -46,6 +46,7 @@ def _properties(template, resource):
 
 
 PUBLIC_ROUTES = {
+    "GET /auth-test",
     "POST /query/by-tags",
     "POST /query/by-species",
     "GET /query/by-thumbnail",
@@ -65,6 +66,7 @@ INTERNAL_ROUTES = {
     "POST /internal/assets/authorize",
 }
 OPTIONS_ROUTES = {
+    "OPTIONS /auth-test",
     "OPTIONS /query/by-tags",
     "OPTIONS /query/by-species",
     "OPTIONS /query/by-thumbnail",
@@ -111,6 +113,29 @@ def test_template_is_sam_and_requires_external_deployment_values(template):
             "processing callbacks. Disable after Member B is token-aware."
         ),
     }
+
+
+def test_inference_url_constraint_rejects_decoded_infer_segments_only(template):
+    parameter = template["Parameters"]["InferenceApiBaseUrl"]
+    pattern = re.compile(parameter["AllowedPattern"])
+    valid_urls = [
+        "https://inference.example",
+        "https://inference.example/inference",
+        "https://inference.example/api/inferential",
+    ]
+    rejected_urls = [
+        "https://inference.example/infer",
+        "https://inference.example/infer/",
+        "https://inference.example/api/infer",
+        "https://inference.example/%69nfer",
+        "https://inference.example/InFeR",
+        "https://inference.example/api/%49nF%65r/",
+    ]
+
+    assert all(pattern.fullmatch(value) for value in valid_urls)
+    assert all(not pattern.fullmatch(value) for value in rejected_urls)
+    assert "must not contain" in parameter["ConstraintDescription"].lower()
+    assert "infer" in parameter["ConstraintDescription"].lower()
 
 
 def test_iam_arn_parameters_reject_wildcards_and_accept_resource_names(template):

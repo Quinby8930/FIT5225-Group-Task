@@ -52,8 +52,8 @@ Public (Cognito-protected, called by the frontend):
 | POST | `/files/delete` | Bulk delete (database + storage) |
 | POST | `/notifications/subscribe` | Subscribe a user to a species tag |
 | DELETE | `/notifications/subscribe` | Unsubscribe a user from a species tag |
-| GET  | `/notifications/subscriptions?user_id=...` | List a user's subscriptions |
-| GET  | `/notifications?user_id=...` | List a user's notifications |
+| GET  | `/notifications/subscriptions` | List the authenticated user's subscriptions |
+| GET  | `/notifications` | List the authenticated user's notifications |
 
 Query responses retain the legacy `results` and `count` fields and add `items`.
 Each item contains only `file_id`, `file_type`, `display_key`, `original_key`,

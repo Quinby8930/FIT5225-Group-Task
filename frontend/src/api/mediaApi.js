@@ -1,5 +1,13 @@
 import { apiRequest } from "./apiClient.js";
 
+const UPLOAD_RULES = new Map([
+  ["image/jpeg", { kind: "image", maxBytes: 12_582_912, error: "Images must be 12 MiB or smaller." }],
+  ["image/png", { kind: "image", maxBytes: 12_582_912, error: "Images must be 12 MiB or smaller." }],
+  ["image/webp", { kind: "image", maxBytes: 12_582_912, error: "Images must be 12 MiB or smaller." }],
+  ["video/mp4", { kind: "video", maxBytes: 262_144_000, error: "Videos must be 250 MiB or smaller." }],
+  ["video/quicktime", { kind: "video", maxBytes: 262_144_000, error: "Videos must be 250 MiB or smaller." }],
+]);
+
 function base64FromBuffer(buffer) {
   const bytes = new Uint8Array(buffer);
   let binary = "";
@@ -16,6 +24,18 @@ export async function computeSha256Base64(file) {
 
 export function mediaKind(contentType) {
   return contentType.startsWith("video/") ? "video" : "image";
+}
+
+export function validateUploadFile(file) {
+  const rule = UPLOAD_RULES.get(file?.type);
+  if (!rule) {
+    throw new Error("Choose a JPEG, PNG, WebP, MP4, or QuickTime file.");
+  }
+  if (!Number.isSafeInteger(file?.size) || file.size < 0) {
+    throw new Error("The selected file size is invalid.");
+  }
+  if (file.size > rule.maxBytes) throw new Error(rule.error);
+  return { kind: rule.kind, maxBytes: rule.maxBytes };
 }
 
 export async function requestUploadUrl(file, checksumSha256) {
@@ -42,6 +62,7 @@ export async function putUpload(uploadUrl, file, requiredHeaders = {}) {
 }
 
 export async function uploadMedia(file, { onStage } = {}) {
+  validateUploadFile(file);
   const reportStage = (stage) => {
     if (typeof onStage === "function") onStage(stage);
   };

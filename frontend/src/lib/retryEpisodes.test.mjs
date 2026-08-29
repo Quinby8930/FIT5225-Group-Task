@@ -26,3 +26,18 @@ test("keeps retry accounting separate for independent keys", async () => {
   assert.equal(retryDelayForKey(episodes, "asset-a"), 2_000);
   assert.equal(retryDelayForKey(episodes, "asset-b"), 1_000);
 });
+
+test("manual refresh clears an exhausted key and resumes its automatic retry budget", async () => {
+  const { clearRetryEpisodes, retryDelayForKey } = await loadRetries();
+  const { markAssetKeysLoading, mergeAssetUrlStates } = await import("./assetUrls.mjs");
+  const key = "preview";
+  const episodes = clearRetryEpisodes({ [key]: 4 }, [key]);
+  const loading = markAssetKeysLoading([key], { [key]: { status: "retry_exhausted" } });
+  const failedManualRefresh = mergeAssetUrlStates(loading, {
+    errors: [{ key, code: "SIGNING_FAILED" }],
+  });
+
+  assert.deepEqual(episodes, {});
+  assert.deepEqual(failedManualRefresh, { [key]: { status: "signing_failed" } });
+  assert.equal(retryDelayForKey(episodes, key), 1_000);
+});

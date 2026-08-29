@@ -17,7 +17,7 @@ import re
 from abc import ABC, abstractmethod
 from pathlib import Path
 from urllib.error import HTTPError, URLError
-from urllib.parse import urlsplit
+from urllib.parse import unquote, urlsplit
 from urllib.request import HTTPRedirectHandler, Request, build_opener
 from uuid import uuid4
 
@@ -141,6 +141,11 @@ class RemoteTagDetector(TagDetector):
             s3_client = boto3.client("s3")
         self._bucket = bucket_name
         self._inference_api_url = _validated_https_url(inference_api_url)
+        decoded_path = unquote(urlsplit(self._inference_api_url).path)
+        if any(segment.casefold() == "infer" for segment in decoded_path.split("/")):
+            raise ValueError(
+                "inference API base URL must not contain an infer path segment"
+            )
         self._internal_api_key = internal_api_key
         self._s3 = s3_client
         self._http_open = http_open or _open_without_redirect

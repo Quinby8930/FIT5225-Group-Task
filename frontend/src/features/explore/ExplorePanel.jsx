@@ -6,7 +6,7 @@ import QueryChips from "../../components/QueryChips";
 import SpeciesSpotlights from "../../components/SpeciesSpotlights";
 import useSignedAssetUrls from "../../hooks/useSignedAssetUrls";
 import { hasTagCounts, parseTagCounts } from "../../lib/forms";
-import { normalizeQueryResponse } from "../../lib/queryResults.mjs";
+import { legacyReferenceLabel, normalizeQueryResponse } from "../../lib/queryResults.mjs";
 import { useRef, useState } from "react";
 import { beginQuery, settleQuery, shouldShowResultsHeader } from "../../lib/queryLifecycle.mjs";
 import {
@@ -213,7 +213,7 @@ export default function ExplorePanel({
                 <h3>Legacy references</h3>
                 <p>Preview and management are unavailable because this response did not provide trusted media metadata.</p>
                 <ul>
-                  {legacyItems.map((item) => <li key={item.identity}><code>{item.display_key}</code></li>)}
+                  {legacyItems.map((item, index) => <li key={item.identity}>{legacyReferenceLabel(index)}</li>)}
                 </ul>
               </section>
             )}

@@ -9,7 +9,31 @@ export function canStartMutation(state = {}) { return !state.pending; }
 export function mutationCount(response, selectedCount, field) {
   return Number.isInteger(response?.[field]) && response[field] >= 0 ? response[field] : selectedCount;
 }
+export function canCommitManageEffect(activeSession, sourceSession) {
+  return typeof sourceSession === "string"
+    && sourceSession.trim().length > 0
+    && activeSession === sourceSession;
+}
 export function removeManagedItems(items, fileIds) {
   const removed = new Set(fileIds || []);
   return (items || []).filter((item) => !removed.has(item.file_id));
+}
+export function removeManagedQueryItems(query = {}, fileIds) {
+  const items = removeManagedItems(query.items, fileIds);
+  const structuredItems = items.filter((item) => !item.legacy);
+  const legacyItems = items.filter((item) => item.legacy);
+  return { items, structuredItems, legacyItems, count: items.length };
+}
+export function removeManagedQueryItemsForSession(query, fileIds, activeSession, sourceSession) {
+  return canCommitManageEffect(activeSession, sourceSession)
+    ? removeManagedQueryItems(query, fileIds)
+    : query;
+}
+export function removeManagedSelectionForSession(selection, fileIds, activeSession, sourceSession) {
+  if (!canCommitManageEffect(activeSession, sourceSession)) return selection;
+  const removed = new Set(fileIds || []);
+  return (selection || []).filter((fileId) => !removed.has(fileId));
+}
+export function finishMutationForSession(state, activeSession, sourceSession) {
+  return canCommitManageEffect(activeSession, sourceSession) ? finishMutation(state) : state;
 }

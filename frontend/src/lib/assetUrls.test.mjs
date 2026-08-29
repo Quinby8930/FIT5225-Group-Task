@@ -250,8 +250,13 @@ test("keeps an unexpired ready URL visible while its replacement request is load
     current: { status: "ready", url: "https://signed.example/current", expiresAt: 2_000 },
     expired: { status: "ready", url: "https://signed.example/expired", expiresAt: 1_000 },
   }, 1_000), {
-    current: { status: "ready", url: "https://signed.example/current", expiresAt: 2_000 },
-    expired: { status: "loading" },
+    current: {
+      status: "ready",
+      url: "https://signed.example/current",
+      expiresAt: 2_000,
+      requestInFlight: true,
+    },
+    expired: { status: "loading", requestInFlight: true },
   });
 });
 
@@ -271,6 +276,7 @@ test("clears the retry marker while retrying with an unexpired ready URL", async
       status: "ready",
       url: "https://signed.example/current",
       expiresAt: 2_000,
+      requestInFlight: true,
     },
   });
 });
@@ -392,4 +398,137 @@ test("backs off only bounded automatic signing retries", async () => {
   assert.equal(nextSigningRetryDelay(0), 1_000);
   assert.equal(nextSigningRetryDelay(3), 8_000);
   assert.equal(nextSigningRetryDelay(4), null);
+});
+
+test("terminalizes only the failure of the fourth dispatched automatic retry", async () => {
+  const { mergeAssetUrlStates, retryableAssetKeys } = await loadAssetUrlModule();
+  const failure = { assets: [], errors: [{ key: "preview", code: "SIGNING_FAILED" }] };
+
+  assert.deepEqual(mergeAssetUrlStates({}, failure, 1_000, 1_000), {
+    preview: { status: "signing_failed" },
+  });
+  assert.deepEqual(mergeAssetUrlStates({}, failure, 1_000, 1_000, { preview: 3 }), {
+    preview: { status: "signing_failed" },
+  });
+  const exhausted = mergeAssetUrlStates({}, failure, 1_000, 1_000, { preview: 4 });
+  assert.deepEqual(exhausted, { preview: { status: "retry_exhausted" } });
+  assert.deepEqual(retryableAssetKeys(exhausted), []);
+});
+
+test("does not terminalize a valid near-expiry URL when its fourth refresh retry fails", async () => {
+  const { mergeAssetUrlStates } = await loadAssetUrlModule();
+  const current = {
+    preview: { status: "ready", url: "https://signed.example/current", expiresAt: 1_001 },
+  };
+
+  assert.deepEqual(mergeAssetUrlStates(current, {
+    assets: [],
+    errors: [{ key: "preview", code: "UNAVAILABLE" }],
+  }, 1_000, 1_000, { preview: 4 }), {
+    preview: {
+      status: "ready",
+      url: "https://signed.example/current",
+      expiresAt: 1_001,
+      retryExhausted: true,
+    },
+  });
+});
+
+test("preserves a valid ready URL for both transient signing error codes", async () => {
+  const { mergeAssetUrlStates } = await loadAssetUrlModule();
+  const current = {
+    preview: { status: "ready", url: "https://signed.example/current", expiresAt: 10_000 },
+  };
+
+  for (const code of ["SIGNING_FAILED", "UNAVAILABLE"]) {
+    assert.deepEqual(mergeAssetUrlStates(current, {
+      errors: [{ key: "preview", code }],
+    }, 1_000, 1_000), {
+      preview: {
+        status: "ready",
+        url: "https://signed.example/current",
+        expiresAt: 10_000,
+        retryable: true,
+      },
+    });
+  }
+});
+
+test("drives retry one through four, local expiry, and manual reset without a fifth request", async () => {
+  const {
+    assetRetrySchedule,
+    markAssetKeysLoading,
+    mergeAssetUrlStates,
+    nextAssetRefreshDelay,
+    retryableAssetKeys,
+    transitionExpiredAssetStates,
+  } = await loadAssetUrlModule();
+  const key = "preview";
+  let states = {
+    [key]: { status: "ready", url: "https://signed.example/current", expiresAt: 10_000 },
+  };
+
+  for (let dispatched = 1; dispatched <= 4; dispatched += 1) {
+    states = markAssetKeysLoading([key], states, 1_000);
+    states = mergeAssetUrlStates(states, {
+      errors: [{ key, code: dispatched % 2 ? "SIGNING_FAILED" : "UNAVAILABLE" }],
+    }, 1_000, 1_000, { [key]: dispatched });
+
+    if (dispatched < 4) {
+      assert.equal(states[key].retryable, true);
+      assert.deepEqual(assetRetrySchedule(states, { [key]: dispatched }, 1_000), [{
+        key,
+        delay: 1_000 * (2 ** dispatched),
+      }]);
+    }
+  }
+
+  assert.deepEqual(states, {
+    [key]: {
+      status: "ready",
+      url: "https://signed.example/current",
+      expiresAt: 10_000,
+      retryExhausted: true,
+    },
+  });
+  assert.deepEqual(retryableAssetKeys(states), []);
+  assert.deepEqual(assetRetrySchedule(states, { [key]: 4 }, 1_000), []);
+  assert.equal(nextAssetRefreshDelay(states, 1_000), null);
+
+  const expired = transitionExpiredAssetStates(states, [key], 10_000);
+  assert.deepEqual(expired, {
+    states: { [key]: { status: "retry_exhausted" } },
+    requestKeys: [],
+  });
+
+  const manualLoading = markAssetKeysLoading([key], expired.states, 10_001);
+  assert.deepEqual(manualLoading, { [key]: { status: "loading", requestInFlight: true } });
+  const failedManual = mergeAssetUrlStates(manualLoading, {
+    errors: [{ key, code: "UNAVAILABLE" }],
+  }, 10_001, 10_001);
+  assert.deepEqual(failedManual, { [key]: { status: "unavailable", retryable: true } });
+  assert.deepEqual(assetRetrySchedule(failedManual, {}, 10_001), [{ key, delay: 1_000 }]);
+});
+
+test("another key's proactive refresh excludes an exhausted valid URL", async () => {
+  const { assetRefreshSchedule } = await loadAssetUrlModule();
+  const states = {
+    exhausted: {
+      status: "ready",
+      url: "https://signed.example/exhausted",
+      expiresAt: 10_000,
+      retryExhausted: true,
+    },
+    healthy: {
+      status: "ready",
+      url: "https://signed.example/healthy",
+      expiresAt: 20_000,
+    },
+  };
+
+  assert.deepEqual(
+    assetRefreshSchedule(states, ["exhausted", "healthy"], 1_000, 1_000),
+    { keys: ["healthy"], delay: 18_000 },
+  );
+  assert.equal(assetRefreshSchedule(states, ["exhausted"], 1_000, 1_000), null);
 });

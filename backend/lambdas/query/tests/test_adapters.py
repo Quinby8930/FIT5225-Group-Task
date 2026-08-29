@@ -244,6 +244,61 @@ def test_remote_tag_detector_stages_calls_c_normalizes_and_cleans_up():
 
 
 @pytest.mark.parametrize(
+    "base_url",
+    [
+        "https://inference.example/infer",
+        "https://inference.example/infer/",
+        "https://inference.example/api/infer",
+        "https://inference.example/%69nfer",
+        "https://inference.example/InFeR",
+        "https://inference.example/api/%49nF%65r/",
+    ],
+)
+def test_remote_tag_detector_rejects_a_decoded_infer_path_segment(base_url):
+    with pytest.raises(ValueError, match="infer"):
+        RemoteTagDetector(
+            bucket_name="private-media",
+            inference_api_url=base_url,
+            internal_api_key="internal-test-key",
+            s3_client=FakeS3Client(),
+            http_open=FakeUrlOpen(None),
+        )
+
+
+@pytest.mark.parametrize(
+    ("base_url", "expected_path"),
+    [
+        ("https://inference.example/inference", "/inference/infer"),
+        ("https://inference.example/api/inferential", "/api/inferential/infer"),
+    ],
+)
+def test_remote_tag_detector_accepts_infer_substrings_that_are_not_segments(
+    base_url, expected_path
+):
+    s3 = FakeS3Client()
+    opener = FakeUrlOpen(
+        FakeHttpResponse({"tags": {}, "detections": [], "model_version": "v1"})
+    )
+    detector = RemoteTagDetector(
+        bucket_name="private-media",
+        inference_api_url=base_url,
+        internal_api_key="internal-test-key",
+        s3_client=s3,
+        http_open=opener,
+    )
+
+    assert detector.detect(
+        user_id="user-1",
+        file_name="query.jpg",
+        content_type="image/jpeg",
+        content=b"image-bytes",
+    ) == {}
+    request, _ = opener.calls[0]
+    assert urlsplit(request.full_url).path == expected_path
+    assert len(s3.delete_calls) == 1
+
+
+@pytest.mark.parametrize(
     "response",
     [
         FakeHttpResponse(b"not-json"),

@@ -404,6 +404,55 @@ def test_image_thumbnail_cleanup_failure_preserves_the_processing_error():
     assert metadata.failed[0][1]["error_code"] == "INFERENCE_UNAVAILABLE"
 
 
+def test_terminal_image_failure_retries_cleanup_then_converges_without_thumbnail():
+    pipeline, storage, metadata, inference, _ = make_pipeline()
+    inference.error = MediaPipelineError(
+        "INFERENCE_REJECTED", "terminal inference rejection", retryable=False
+    )
+    thumbnail_objects = set()
+    real_upload = storage.upload
+    cleanup_attempts = 0
+
+    def track_upload(bucket, key, source, content_type):
+        real_upload(bucket, key, source, content_type)
+        thumbnail_objects.add(key)
+
+    def fail_first_cleanup(bucket, keys):
+        nonlocal cleanup_attempts
+        cleanup_attempts += 1
+        if cleanup_attempts == 1:
+            raise MediaPipelineError(
+                "STORAGE_DELETE_FAILED", "thumbnail cleanup failed", retryable=True
+            )
+        thumbnail_objects.difference_update(keys)
+
+    storage.upload = track_upload
+    storage.delete = fail_first_cleanup
+
+    with pytest.raises(MediaPipelineError) as caught:
+        pipeline.process_record(s3_record())
+
+    thumbnail_key = "thumbnails/user-1/file-1/thumbnail.jpg"
+    assert caught.value.code == "STORAGE_DELETE_FAILED"
+    assert caught.value.retryable is True
+    assert metadata.failed[0][1]["error_code"] == "INFERENCE_REJECTED"
+    assert thumbnail_objects == {thumbnail_key}
+
+    result = pipeline.process_record(s3_record())
+
+    assert result == {
+        "status": "failed",
+        "file_id": "file-1",
+        "error_code": "INFERENCE_REJECTED",
+    }
+    assert cleanup_attempts == 2
+    assert thumbnail_objects == set()
+    assert [payload[1]["error_code"] for payload in metadata.failed] == [
+        "INFERENCE_REJECTED",
+        "INFERENCE_REJECTED",
+    ]
+
+
 def test_completion_includes_the_acquired_processing_lease_token():
     lease_token = "a" * 43
     pipeline, _, metadata, _, _ = make_pipeline(

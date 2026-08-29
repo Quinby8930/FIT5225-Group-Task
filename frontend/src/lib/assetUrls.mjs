@@ -147,16 +147,16 @@ export function markAssetKeysLoading(keys, current = {}, nowMs = Date.now()) {
       && Number.isFinite(previous.expiresAt)
       && previous.expiresAt > nowMs
     ) {
-      const { retryable, ...ready } = previous;
-      next[key] = ready;
+      const { retryable, retryExhausted, requestInFlight, ...ready } = previous;
+      next[key] = { ...ready, requestInFlight: true };
       continue;
     }
-    next[key] = { status: "loading" };
+    next[key] = { status: "loading", requestInFlight: true };
   }
   return next;
 }
 
-export function mergeAssetUrlStates(current, response, signedAt = Date.now(), nowMs = Date.now()) {
+export function mergeAssetUrlStates(current, response, signedAt = Date.now(), nowMs = Date.now(), autoRetryCounts = {}) {
   const next = { ...(current || {}) };
   const successful = indexAssetUrls(response, signedAt);
   for (const [key, asset] of Object.entries(successful)) {
@@ -169,18 +169,27 @@ export function mergeAssetUrlStates(current, response, signedAt = Date.now(), no
       && !Object.hasOwn(successful, error.key)
     ) {
       const previous = next[error.key];
+      const transient = error.code === "SIGNING_FAILED" || error.code === "UNAVAILABLE";
+      const exhausted = Number.isInteger(autoRetryCounts?.[error.key])
+        && autoRetryCounts[error.key] >= 4;
       if (
-        error.code === "UNAVAILABLE"
-        && previous?.status === "ready"
-        && typeof previous.url === "string"
-        && Number.isFinite(previous.expiresAt)
-        && previous.expiresAt > nowMs
+        transient
+        && usableAssetUrl(previous, nowMs)
       ) {
-        next[error.key] = { ...previous, retryable: true };
+        const { retryable, retryExhausted, requestInFlight, ...ready } = previous;
+        next[error.key] = exhausted
+          ? { ...ready, retryExhausted: true }
+          : { ...ready, retryable: true };
       } else {
         const state = { status: assetErrorStatus(error.code) };
         if (error.code === "UNAVAILABLE") state.retryable = true;
         next[error.key] = state;
+      }
+      if (
+        exhausted
+        && (next[error.key]?.status === "signing_failed" || next[error.key]?.status === "unavailable")
+      ) {
+        next[error.key] = { status: "retry_exhausted" };
       }
     }
   }
@@ -189,8 +198,43 @@ export function mergeAssetUrlStates(current, response, signedAt = Date.now(), no
 
 export function retryableAssetKeys(assetStates) {
   return Object.entries(assetStates || {})
-    .filter(([, state]) => state?.status === "signing_failed" || state?.retryable === true)
+    .filter(([, state]) => (
+      state?.requestInFlight !== true
+      && (state?.status === "signing_failed" || state?.retryable === true)
+    ))
     .map(([key]) => key);
+}
+
+export function assetRetrySchedule(assetStates, retryEpisodes, nowMs = Date.now()) {
+  return retryableAssetKeys(assetStates).flatMap((key) => {
+    const state = assetStates[key];
+    const attempt = retryEpisodes?.[key] || 0;
+    const delay = state?.status === "ready"
+      ? nextAssetRetryDelay({ [key]: state }, attempt, nowMs)
+      : nextSigningRetryDelay(attempt);
+    return delay === null ? [] : [{ key, delay }];
+  });
+}
+
+export function transitionExpiredAssetStates(assetStates, requestedKeys, nowMs = Date.now()) {
+  const requested = new Set(Array.isArray(requestedKeys) ? requestedKeys : []);
+  const requestKeys = [];
+  const states = Object.fromEntries(Object.entries(assetStates || {}).map(([key, state]) => {
+    if (state?.status === "expired") {
+      if (requested.has(key)) requestKeys.push(key);
+      return [key, state];
+    }
+    if (state?.status !== "ready" || !Number.isFinite(state.expiresAt) || state.expiresAt > nowMs) {
+      return [key, state];
+    }
+    if (state.requestInFlight === true) {
+      return [key, { status: "loading", requestInFlight: true }];
+    }
+    if (state.retryExhausted === true) return [key, { status: "retry_exhausted" }];
+    if (requested.has(key)) requestKeys.push(key);
+    return [key, { status: "expired" }];
+  }));
+  return { states, requestKeys: [...new Set(requestKeys)] };
 }
 
 export function pruneAssetUrlStates(assetStates, nowMs = Date.now()) {
@@ -227,11 +271,28 @@ export function nextSigningRetryDelay(attempt, maxAttempts = 4) {
 
 export function nextAssetRefreshDelay(assetUrls, nowMs = Date.now(), leadMs = 30_000) {
   const expirations = Object.values(assetUrls || {})
+    .filter((asset) => asset?.retryExhausted !== true)
     .map((asset) => asset?.expiresAt)
     .filter((expiresAt) => Number.isFinite(expiresAt));
   if (!expirations.length) return null;
 
   return Math.max(1_000, Math.min(...expirations) - nowMs - leadMs);
+}
+
+export function assetRefreshSchedule(assetStates, requestedKeys, nowMs = Date.now(), leadMs = 30_000) {
+  const states = assetStates && typeof assetStates === "object" ? assetStates : {};
+  const keys = [...new Set(Array.isArray(requestedKeys) ? requestedKeys : [])].filter((key) => (
+    states[key]?.status === "ready"
+    && states[key]?.requestInFlight !== true
+    && states[key]?.retryExhausted !== true
+    && Number.isFinite(states[key]?.expiresAt)
+  ));
+  const delay = nextAssetRefreshDelay(
+    Object.fromEntries(keys.map((key) => [key, states[key]])),
+    nowMs,
+    leadMs,
+  );
+  return delay === null ? null : { keys, delay };
 }
 
 

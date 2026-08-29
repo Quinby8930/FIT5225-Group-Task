@@ -2,6 +2,23 @@ function uniqueKeys(keys) {
   return [...new Set((Array.isArray(keys) ? keys : []).filter((key) => typeof key === "string" && key))];
 }
 
+export function createLatestAssetStateCoordinator(initialStates = {}) {
+  let latest = initialStates && typeof initialStates === "object" ? initialStates : {};
+  return {
+    current() {
+      return latest;
+    },
+    replace(nextStates) {
+      latest = nextStates && typeof nextStates === "object" ? nextStates : {};
+      return latest;
+    },
+    transition(updater) {
+      latest = typeof updater === "function" ? updater(latest) : latest;
+      return latest;
+    },
+  };
+}
+
 export function assetDatasetIdentity(items) {
   return JSON.stringify((Array.isArray(items) ? items : []).map((item) => [
     item?.file_id,

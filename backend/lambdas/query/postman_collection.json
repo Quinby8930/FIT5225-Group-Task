@@ -85,7 +85,7 @@
         "method": "POST",
         "header": [{ "key": "Content-Type", "value": "application/json" }],
         "url": { "raw": "{{baseUrl}}/notifications/subscribe", "host": ["{{baseUrl}}"], "path": ["notifications", "subscribe"] },
-        "body": { "mode": "raw", "raw": "{\"user_id\": \"u1\", \"species\": \"wombat\"}" }
+        "body": { "mode": "raw", "raw": "{\"species\": \"wombat\"}" }
       }
     },
     {
@@ -93,13 +93,10 @@
       "request": {
         "method": "DELETE",
         "url": {
-          "raw": "{{baseUrl}}/notifications/subscribe?user_id=u1&species=wombat",
+          "raw": "{{baseUrl}}/notifications/subscribe?species=wombat",
           "host": ["{{baseUrl}}"],
           "path": ["notifications", "subscribe"],
-          "query": [
-            { "key": "user_id", "value": "u1" },
-            { "key": "species", "value": "wombat" }
-          ]
+          "query": [{ "key": "species", "value": "wombat" }]
         }
       }
     },
@@ -108,10 +105,9 @@
       "request": {
         "method": "GET",
         "url": {
-          "raw": "{{baseUrl}}/notifications/subscriptions?user_id=u1",
+          "raw": "{{baseUrl}}/notifications/subscriptions",
           "host": ["{{baseUrl}}"],
-          "path": ["notifications", "subscriptions"],
-          "query": [{ "key": "user_id", "value": "u1" }]
+          "path": ["notifications", "subscriptions"]
         }
       }
     },
@@ -120,10 +116,9 @@
       "request": {
         "method": "GET",
         "url": {
-          "raw": "{{baseUrl}}/notifications?user_id=u1",
+          "raw": "{{baseUrl}}/notifications",
           "host": ["{{baseUrl}}"],
-          "path": ["notifications"],
-          "query": [{ "key": "user_id", "value": "u1" }]
+          "path": ["notifications"]
         }
       }
     }

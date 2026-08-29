@@ -89,7 +89,7 @@ reserve 必须先于 complete 调用（状态机是 `reserve → processing → 
 
 **原因**（按概率）：
 
-1. 订阅没建立 —— 先 `POST /notifications/subscribe`，再 `GET /notifications/subscriptions?user_id=...`
+1. 订阅没建立 —— 先 `POST /notifications/subscribe`，再以同一登录用户调用 `GET /notifications/subscriptions`
    确认在列表里。
 2. **tags 用了错误的名字** —— 触发器按「团队简化名」匹配（见 `INTEGRATION.md §2`）。
    `complete` 里 `tags` 的 key 必须是 `"wombat"`、`"magpie"`、`"dingo"` 这类简化名，

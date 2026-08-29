@@ -4,9 +4,9 @@ import ConfirmDeleteDialog from "../../components/ConfirmDeleteDialog";
 import Field from "../../components/Field";
 import { parseSpeciesList } from "../../lib/forms";
 import { selectedMutationKeys } from "../../lib/manageSelection.mjs";
-import { beginDeleteConfirmation, beginMutation, canStartMutation, canSubmitTags, confirmDeleteOnce, finishMutation, mutationCount } from "../../lib/manageWorkflow.mjs";
+import { beginDeleteConfirmation, beginMutation, canCommitManageEffect, canStartMutation, canSubmitTags, confirmDeleteOnce, finishMutationForSession, mutationCount } from "../../lib/manageWorkflow.mjs";
 
-export default function ManagePanel({ selectedFileIds, currentItems, onStatus, onNavigate, onDeleted }) {
+export default function ManagePanel({ selectedFileIds, currentItems, getActiveSession, sessionKey, onStatus, onNavigate, onDeleted }) {
   const [tagsText, setTagsText] = useState("");
   const [operation, setOperation] = useState(1);
   const [deleteState, setDeleteState] = useState({ open: false, pending: false });
@@ -27,39 +27,67 @@ export default function ManagePanel({ selectedFileIds, currentItems, onStatus, o
 
   async function updateTags() {
     if (mutationInFlight.current || !canStartMutation(mutationState)) return;
+    const sourceSession = getActiveSession?.();
+    if (!canCommitManageEffect(sourceSession, sessionKey)) return;
     mutationInFlight.current = true;
     setMutationState((current) => beginMutation(current));
     try {
       const result = await editTags(keys, parseSpeciesList(tagsText), operation);
-      onStatus({ type: "success", message: `Updated ${mutationCount(result, keys.length, "updated")} item(s).` });
+      if (!canCommitManageEffect(getActiveSession?.(), sourceSession)) return;
+      onStatus(sourceSession, { type: "success", message: `Updated ${mutationCount(result, keys.length, "updated")} item(s).` });
     } catch (error) {
-      onStatus({ type: "error", message: error.message });
+      if (!canCommitManageEffect(getActiveSession?.(), sourceSession)) return;
+      onStatus(sourceSession, { type: "error", message: error.message });
     } finally {
+      if (!canCommitManageEffect(getActiveSession?.(), sourceSession)) return;
       mutationInFlight.current = false;
-      setMutationState((current) => finishMutation(current));
+      setMutationState((current) => finishMutationForSession(
+        current,
+        getActiveSession?.(),
+        sourceSession,
+      ));
     }
   }
 
   async function confirmDelete() {
     if (mutationInFlight.current || !canStartMutation(mutationState)) return;
+    const sourceSession = getActiveSession?.();
+    if (!canCommitManageEffect(sourceSession, sessionKey)) return;
     mutationInFlight.current = true;
     setMutationState((current) => beginMutation(current));
     setDeleteState((current) => confirmDeleteOnce(current));
     try {
       const result = await deleteFiles(keys);
-      onStatus({
+      if (!canCommitManageEffect(getActiveSession?.(), sourceSession)) return;
+      onStatus(sourceSession, {
         type: "success",
         message: `Deleted ${mutationCount(result, keys.length, "deleted_db_records")} database record(s) and ${mutationCount(result, keys.length, "storage_objects_removed")} storage object(s).`,
       });
-      setFocusEmptyAfterDelete(true);
-      onDeleted(selectedItems.map((item) => item.file_id));
-      setDeleteState({ open: false, pending: false });
+      setFocusEmptyAfterDelete((current) => (
+        canCommitManageEffect(getActiveSession?.(), sourceSession) ? true : current
+      ));
+      onDeleted(sourceSession, selectedItems.map((item) => item.file_id));
+      setDeleteState((current) => (
+        canCommitManageEffect(getActiveSession?.(), sourceSession)
+          ? { open: false, pending: false }
+          : current
+      ));
     } catch (error) {
-      setDeleteState({ open: false, pending: false });
-      onStatus({ type: "error", message: error.message });
+      if (!canCommitManageEffect(getActiveSession?.(), sourceSession)) return;
+      setDeleteState((current) => (
+        canCommitManageEffect(getActiveSession?.(), sourceSession)
+          ? { open: false, pending: false }
+          : current
+      ));
+      onStatus(sourceSession, { type: "error", message: error.message });
     } finally {
+      if (!canCommitManageEffect(getActiveSession?.(), sourceSession)) return;
       mutationInFlight.current = false;
-      setMutationState((current) => finishMutation(current));
+      setMutationState((current) => finishMutationForSession(
+        current,
+        getActiveSession?.(),
+        sourceSession,
+      ));
     }
   }
 

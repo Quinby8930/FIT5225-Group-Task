@@ -93,9 +93,10 @@ Local verification covers validation, duplicate mapping, object keys, IAM and
 template structure, S3-event parsing, bounded thumbnail/video behavior,
 one-frame-per-second command construction, pipeline idempotency, HTTP
 serialization/timeouts, per-object deletion errors, failure handling, and
-temporary-object cleanup. The asset-URL suite verifies JWT subject ownership,
-100-key request bounds, `originals/` and `thumbnails/` prefix isolation,
-15-minute GET signatures, CORS, and generic error responses.
+temporary-object cleanup. The asset-URL suite verifies authenticated callers,
+metadata-authorized completed-media preview, 100-key request bounds,
+`originals/` and `thumbnails/` prefix isolation, 15-minute GET signatures,
+CORS, and generic error responses.
 
 Only the manual AWS workflow can verify the deployed authorizer, real browser
 CORS, pre-signed PUT/GET behavior, S3 notification delivery, Lambda layer

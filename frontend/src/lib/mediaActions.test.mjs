@@ -45,3 +45,14 @@ test("does not run follow-up work when the browser blocks the blank window", asy
   assert.deepEqual(result, { opened: false, value: undefined });
   assert.equal(followUpCalls, 0);
 });
+
+test("announces only the terminal no-URL preview state politely", async () => {
+  const { previewStatusSemantics } = await loadMediaActions();
+
+  assert.deepEqual(previewStatusSemantics({ status: "retry_exhausted" }), {
+    role: "status",
+    "aria-live": "polite",
+  });
+  assert.deepEqual(previewStatusSemantics({ status: "loading" }), {});
+  assert.deepEqual(previewStatusSemantics({ status: "signing_failed" }), {});
+});

@@ -25,7 +25,8 @@ deployment remain manual steps.
 - A Node.js 20 storage-delete Lambda with delete access only to `originals/*`,
   `thumbnails/*`, and `processing/*`.
 - A Node.js 20 asset-URL Lambda with read access only to `originals/*` and
-  `thumbnails/*`; it signs at most 100 current-user keys for 15 minutes.
+  `thumbnails/*`; it signs at most 100 metadata-authorized completed-media keys
+  for an authenticated user for 15 minutes.
 - API Gateway v2 integrations, protected JWT POST routes, unauthenticated
   OPTIONS preflight routes, and method-scoped Lambda invoke permissions for the
   existing HTTP API.

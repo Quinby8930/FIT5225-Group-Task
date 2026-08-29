@@ -1,69 +1,103 @@
 import { useEffect, useRef, useState } from "react";
 import { listNotifications, listSubscriptions, subscribeToSpecies, unsubscribeFromSpecies } from "../../api/mediaApi";
 import Field from "../../components/Field";
-import { beginNotificationRefresh, normalizeNotifications, settleNotificationRefresh, shortFileId } from "../../lib/notificationState.mjs";
+import { beginNotificationRefresh, commitNotificationEffect, loadNotificationSnapshot, notificationMutationStatus, notificationPresentation, notificationRefreshFailureCopy, settleNotificationRefresh, shortFileId } from "../../lib/notificationState.mjs";
 
-export default function NotificationsPanel({ onStatus }) {
+export default function NotificationsPanel({ getActiveSession, onStatus, sessionKey }) {
   const [species, setSpecies] = useState("");
   const [subscriptions, setSubscriptions] = useState([]);
   const [state, setState] = useState({ generation: 0, phase: "idle", items: [] });
   const [busy, setBusy] = useState(false);
   const current = useRef(state);
+  const mounted = useRef(true);
 
-  async function refresh() {
+  function commitForSession(sourceSession, commit) {
+    if (!mounted.current || sourceSession !== sessionKey) return false;
+    return commitNotificationEffect(getActiveSession?.(), sourceSession, commit);
+  }
+
+  async function refresh(sourceSession = sessionKey) {
+    if (!commitForSession(sourceSession, () => {})) {
+      return { ok: false, stale: true };
+    }
     const started = beginNotificationRefresh(current.current);
     current.current = started;
     setState(started);
-    try {
-      const [subs, notes] = await Promise.all([listSubscriptions(), listNotifications()]);
-      const items = normalizeNotifications(notes);
-      const next = settleNotificationRefresh(current.current, started.generation, items);
-      if (next === current.current) return;
-      current.current = next;
-      setSubscriptions(Array.isArray(subs?.species) ? subs.species.filter((value) => typeof value === "string") : []);
-      setState(next);
-    } catch (error) {
-      const next = settleNotificationRefresh(current.current, started.generation, [], "error");
-      if (next !== current.current) {
+    const result = await loadNotificationSnapshot({ listSubscriptions, listNotifications });
+    if (!commitForSession(sourceSession, () => {})) {
+      return { ok: false, stale: true };
+    }
+    if (result.ok) {
+      const next = settleNotificationRefresh(current.current, started.generation, result.items);
+      if (next === current.current) {
+        return { ok: false, error: new Error("Notification refresh was superseded.") };
+      }
+      commitForSession(sourceSession, () => {
+        current.current = next;
+        setSubscriptions(result.subscriptions);
+        setState(next);
+      });
+      return result;
+    }
+
+    const next = settleNotificationRefresh(current.current, started.generation, [], "error");
+    if (next !== current.current) {
+      commitForSession(sourceSession, () => {
         current.current = next;
         setState(next);
-        onStatus({ type: "error", message: error.message });
-      }
+        onStatus(sourceSession, { type: "error", message: result.error?.message || "Notifications could not be refreshed." });
+      });
     }
+    return result;
   }
 
   useEffect(() => {
-    refresh();
+    mounted.current = true;
+    refresh(sessionKey);
+    return () => {
+      mounted.current = false;
+    };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   async function subscribe(event) {
     event.preventDefault();
     if (busy || !species.trim()) return;
+    const sourceSession = sessionKey;
     setBusy(true);
     try {
       await subscribeToSpecies(species.trim().toLowerCase());
-      setSpecies("");
-      await refresh();
-      onStatus({ type: "success", message: "Subscription saved." });
+      if (!commitForSession(sourceSession, () => setSpecies(""))) return;
+      const refreshResult = await refresh(sourceSession);
+      commitForSession(sourceSession, () => (
+        onStatus(sourceSession, notificationMutationStatus("Subscription saved.", refreshResult))
+      ));
     } catch (error) {
-      onStatus({ type: "error", message: error.message });
+      commitForSession(sourceSession, () => (
+        onStatus(sourceSession, { type: "error", message: error.message })
+      ));
     } finally {
-      setBusy(false);
+      commitForSession(sourceSession, () => setBusy(false));
     }
   }
 
   async function unsubscribe(value) {
     if (busy) return;
+    const sourceSession = sessionKey;
     setBusy(true);
     try {
       await unsubscribeFromSpecies(value);
-      await refresh();
-      onStatus({ type: "success", message: `Stopped watching ${value}.` });
+      if (!commitForSession(sourceSession, () => {})) return;
+      const refreshResult = await refresh(sourceSession);
+      commitForSession(sourceSession, () => (
+        onStatus(sourceSession, notificationMutationStatus(`Stopped watching ${value}.`, refreshResult))
+      ));
     } catch (error) {
-      onStatus({ type: "error", message: error.message });
+      commitForSession(sourceSession, () => (
+        onStatus(sourceSession, { type: "error", message: error.message })
+      ));
     } finally {
-      setBusy(false);
+      commitForSession(sourceSession, () => setBusy(false));
     }
   }
 
@@ -97,8 +131,10 @@ export default function NotificationsPanel({ onStatus }) {
           {!subscriptions.length && state.phase === "loading" && (
             <p className="empty-state">Loading subscriptions…</p>
           )}
-          {!subscriptions.length && state.phase === "error" && (
-            <p className="empty-state">Subscriptions could not be loaded.</p>
+          {state.phase === "error" && (
+            <p className="empty-state">
+              {notificationRefreshFailureCopy("Subscriptions", subscriptions.length > 0)}
+            </p>
           )}
           {!subscriptions.length && state.phase === "ready" && (
             <div className="notification-empty">
@@ -114,25 +150,26 @@ export default function NotificationsPanel({ onStatus }) {
             <p className="eyebrow">Recent activity</p>
             <h2>Notifications</h2>
           </div>
-          <button type="button" className="btn btn-secondary" disabled={busy || state.phase === "loading"} onClick={refresh}>Refresh</button>
+          <button type="button" className="btn btn-secondary" disabled={busy || state.phase === "loading"} onClick={() => refresh(sessionKey)}>Refresh</button>
         </div>
         {state.phase === "loading" && <p className="empty-state">Loading notifications…</p>}
-        {state.phase === "error" && <p className="empty-state">Notifications could not be loaded.</p>}
+        {state.phase === "error" && (
+          <p className="empty-state">
+            {notificationRefreshFailureCopy("Notifications", state.items.length > 0)}
+          </p>
+        )}
         <div className="notification-list">
-          {state.phase === "ready" && state.items.map((item) => (
-            <article key={item.notification_id} className="notification-item">
-              <strong>{item.species}</strong>
-              <span>A matching archive item is available.</span>
-              <span>File {shortFileId(item.file_id)}</span>
-              <time dateTime={item.created_at}>{new Date(item.created_at).toLocaleString()}</time>
-              {item.object_key && (
-                <details>
-                  <summary>Technical details</summary>
-                  <code>{item.object_key}</code>
-                </details>
-              )}
-            </article>
-          ))}
+          {state.items.map((item) => {
+            const visible = notificationPresentation(item);
+            return (
+              <article key={visible.notification_id} className="notification-item">
+                <strong>{visible.species}</strong>
+                <span>A matching archive item is available.</span>
+                <span>File {shortFileId(visible.file_id)}</span>
+                <time dateTime={visible.created_at}>{new Date(visible.created_at).toLocaleString()}</time>
+              </article>
+            );
+          })}
           {state.phase === "ready" && !state.items.length && (
             <div className="notification-empty delivery-protocol">
               <p className="eyebrow">Delivery protocol</p>

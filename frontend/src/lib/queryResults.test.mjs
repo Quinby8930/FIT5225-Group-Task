@@ -129,3 +129,21 @@ test("does not append a legacy original when a structured thumbnail lookup item 
   assert.equal(result.structuredItems.length, 1);
   assert.deepEqual(result.legacyItems, []);
 });
+
+test("raw media keys are displayable only with explicit management permission", async () => {
+  const { canRenderRawMediaKey } = await loadQueryResults();
+
+  assert.equal(canRenderRawMediaKey({ can_manage: true }), true);
+  assert.equal(canRenderRawMediaKey({ can_manage: false }), false);
+  assert.equal(canRenderRawMediaKey({ can_manage: 1 }), false);
+  assert.equal(canRenderRawMediaKey(null), false);
+});
+
+test("legacy result labels do not expose the normalized storage key", async () => {
+  const { legacyReferenceLabel, normalizeQueryResponse } = await loadQueryResults();
+  const result = normalizeQueryResponse({ results: ["legacy/private/storage-key.jpg"] });
+
+  assert.equal(result.legacyItems[0].display_key, "legacy/private/storage-key.jpg");
+  assert.equal(legacyReferenceLabel(0), "Legacy reference 1");
+  assert.equal(legacyReferenceLabel(0).includes(result.legacyItems[0].display_key), false);
+});
