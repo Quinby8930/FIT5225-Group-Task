@@ -87,6 +87,26 @@ def test_source_host_config_defaults_to_aws_s3_and_accepts_an_override(
     )
 
 
+def test_image_pixel_limit_defaults_to_40_million_and_is_configurable(
+    monkeypatch, tmp_path: Path
+) -> None:
+    monkeypatch.setenv("ML_SERVICE_ROOT", str(tmp_path))
+    monkeypatch.delenv("MAX_IMAGE_PIXELS", raising=False)
+
+    assert Settings.from_env().max_image_pixels == 40_000_000
+
+    monkeypatch.setenv("MAX_IMAGE_PIXELS", "123456")
+    assert Settings.from_env().max_image_pixels == 123_456
+
+    manifest = yaml.safe_load(
+        (Path(__file__).resolve().parents[1] / "s.yaml").read_text(encoding="utf-8")
+    )
+    environment = manifest["resources"]["ml_inference"]["props"][
+        "environmentVariables"
+    ]
+    assert environment["MAX_IMAGE_PIXELS"] == "40000000"
+
+
 def test_production_manifest_explicitly_disables_unauthenticated_inference() -> None:
     manifest = yaml.safe_load(
         (Path(__file__).resolve().parents[1] / "s.yaml").read_text(encoding="utf-8")
@@ -124,6 +144,68 @@ def test_species_mapper_uses_scientific_columns_and_team_short_name() -> None:
     assert mapper.normalize("Casuarius_casuarius") == "cassowary"
     assert mapper.normalize("cAnIs_FaMiLiArIs") == "dingo"
     assert mapper.normalize("Unlisted_species") == "Unlisted_species"
+
+
+def test_megadetector_without_an_animal_crop_returns_no_predictions() -> None:
+    from app.backends.speciesnet import SpeciesNetBackend
+
+    class NoAnimalDetector:
+        def generate_detections_one_image(self, image, **kwargs):
+            del image, kwargs
+            return {"detections": []}
+
+    backend = SpeciesNetBackend.__new__(SpeciesNetBackend)
+    backend._inference_lock = threading.RLock()
+    backend.detector = NoAnimalDetector()
+    backend.confidence_threshold = 0.05
+    backend._classify = lambda image: pytest.fail(
+        "full-image classification must not run when MegaDetector finds no animal"
+    )
+
+    with Image.new("RGB", (4, 4)) as image:
+        assert backend.predict_image(image) == []
+
+
+def test_explicit_full_image_mode_classifies_the_whole_image() -> None:
+    from app.backends.speciesnet import SpeciesNetBackend
+
+    expected = [Prediction("Vombatus_ursinus", 0.91)]
+    classified_sizes = []
+    backend = SpeciesNetBackend.__new__(SpeciesNetBackend)
+    backend._inference_lock = threading.RLock()
+    backend.detector = None
+
+    def classify(image):
+        classified_sizes.append(image.size)
+        return expected
+
+    backend._classify = classify
+
+    with Image.new("RGB", (7, 5)) as image:
+        assert backend.predict_image(image) == expected
+
+    assert classified_sizes == [(7, 5)]
+
+
+def test_megadetector_failure_propagates_without_full_image_fallback() -> None:
+    from app.backends.speciesnet import SpeciesNetBackend
+
+    class FailingDetector:
+        def generate_detections_one_image(self, image, **kwargs):
+            del image, kwargs
+            return {"failure": "detector unavailable"}
+
+    backend = SpeciesNetBackend.__new__(SpeciesNetBackend)
+    backend._inference_lock = threading.RLock()
+    backend.detector = FailingDetector()
+    backend.confidence_threshold = 0.05
+    backend._classify = lambda image: pytest.fail(
+        "detector failure must not fall back to full-image classification"
+    )
+
+    with Image.new("RGB", (4, 4)) as image:
+        with pytest.raises(RuntimeError, match="detector unavailable"):
+            backend.predict_image(image)
 
 
 def test_image_request_requires_exactly_one_image_url() -> None:
@@ -501,6 +583,93 @@ def test_inference_passes_its_absolute_deadline_to_the_source_fetcher() -> None:
     assert observed_deadlines == [deadline]
 
 
+def test_configured_pixel_limit_rejects_an_image_before_load_or_convert(
+    monkeypatch, tmp_path: Path
+) -> None:
+    from app import inference as inference_module
+    from app import main as main_module
+    from app.inference import InferenceInputError
+    from app.main import build_service
+
+    class OversizedHeader:
+        size = (10_000, 4_001)
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            del args
+
+        def load(self):
+            pytest.fail("oversized image pixels must not be decoded")
+
+        def convert(self, mode):
+            del mode
+            pytest.fail("oversized image pixels must not be converted")
+
+    class Backend:
+        model_version = "test-v1"
+
+        def predict_image(self, image):
+            del image
+            pytest.fail("oversized image must not reach the model")
+
+    monkeypatch.setattr(
+        inference_module.Image, "open", lambda source: OversizedHeader()
+    )
+    monkeypatch.setattr(main_module, "build_backend", lambda config: Backend())
+    monkeypatch.setattr(
+        main_module,
+        "build_fetcher",
+        lambda config: (lambda url, *, deadline=None: b"image header"),
+    )
+    original_pillow_limit = Image.MAX_IMAGE_PIXELS
+    request = parse_inference_request(
+        {
+            "file_id": "oversized-image",
+            "media_type": "image",
+            "image_urls": ["https://example.com/oversized.jpg"],
+        },
+        max_source_urls=3,
+    )
+    config = replace(settings(tmp_path), max_image_pixels=40_000_000)
+    config.labels_path.write_text("", encoding="utf-8")
+
+    with pytest.raises(InferenceInputError, match="pixel limit"):
+        build_service(config).infer(request)
+
+    assert Image.MAX_IMAGE_PIXELS == original_pillow_limit
+
+
+def test_pillow_decompression_bomb_error_maps_to_inference_input_error(
+    monkeypatch,
+) -> None:
+    from app import inference as inference_module
+    from app.inference import InferenceInputError
+    from app.species import SpeciesMapper
+
+    def raise_bomb(source):
+        del source
+        raise Image.DecompressionBombError("unsafe image dimensions")
+
+    monkeypatch.setattr(inference_module.Image, "open", raise_bomb)
+    request = parse_inference_request(
+        {
+            "file_id": "decompression-bomb",
+            "media_type": "image",
+            "image_urls": ["https://example.com/bomb.jpg"],
+        },
+        max_source_urls=3,
+    )
+
+    with pytest.raises(InferenceInputError, match="valid supported image"):
+        InferenceService(
+            MockInferenceBackend(),
+            lambda url, *, deadline=None: b"unsafe header",
+            SpeciesMapper({}),
+        ).infer(request)
+
+
 def test_inference_raises_when_monotonic_deadline_is_crossed(monkeypatch) -> None:
     from app import inference as inference_module
     from app.inference import InferenceTimeoutError
@@ -605,6 +774,67 @@ def test_http_maps_bounded_inference_failures(
         )
         assert status == expected_status
         assert body == {"error": expected_code, "detail": "bounded inference failure"}
+    finally:
+        server.shutdown()
+        thread.join(timeout=2)
+
+
+@pytest.mark.parametrize(
+    ("failure_mode", "expected_detail"),
+    [
+        ("pixel_limit", "source image exceeds the pixel limit"),
+        ("decompression_bomb", "source is not a valid supported image"),
+    ],
+)
+def test_http_maps_pixel_limit_failures_to_invalid_source(
+    monkeypatch,
+    tmp_path: Path,
+    failure_mode: str,
+    expected_detail: str,
+) -> None:
+    from app import inference as inference_module
+
+    class OversizedHeader:
+        size = (10_000, 4_001)
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            del args
+
+        def load(self):
+            pytest.fail("oversized image pixels must not be decoded")
+
+        def convert(self, mode):
+            del mode
+            pytest.fail("oversized image pixels must not be converted")
+
+    def open_source(source):
+        del source
+        if failure_mode == "decompression_bomb":
+            raise Image.DecompressionBombError("unsafe image dimensions")
+        return OversizedHeader()
+
+    monkeypatch.setattr(inference_module.Image, "open", open_source)
+    service = InferenceService(
+        MockInferenceBackend(),
+        lambda url, *, deadline=None: b"image header",
+        max_image_pixels=40_000_000,
+    )
+    server, thread = running_server(tmp_path, service)
+    try:
+        status, body = post(
+            server,
+            {
+                "file_id": "pixel-limit",
+                "media_type": "image",
+                "image_urls": ["https://example.com/image.jpg"],
+            },
+            {"X-Internal-Api-Key": "test-secret"},
+        )
+        assert status == 422
+        assert body == {"error": "invalid_source", "detail": expected_detail}
     finally:
         server.shutdown()
         thread.join(timeout=2)

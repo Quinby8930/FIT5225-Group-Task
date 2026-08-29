@@ -12,8 +12,10 @@ deployment approval.
 - Per-user duplicate reservation through Member D's HTTP contract.
 - S3 event parsing, 40 MP-bounded image thumbnails, one-frame-per-second video
   sampling with a 600-second/900-frame bound, 1,024-pixel scaling, a 2 GiB
-  extracted-frame ceiling, Lambda time-budget checks, Member C inference calls,
-  Member D status calls, and temporary-frame cleanup.
+  extracted-frame ceiling, consecutive inference batches of at most 30 URLs,
+  Lambda time-budget checks, Member C inference calls, Member D status calls,
+  and temporary-frame/abandoned-thumbnail cleanup. The 900-frame extraction
+  guard is not a guaranteed completion capacity.
 - Guarded, prefix-scoped storage deletion for Member D.
 - Private-bucket SAM resources, prefix-filtered notification, least-privilege
   S3 IAM statements, and API Gateway v2 route resources.

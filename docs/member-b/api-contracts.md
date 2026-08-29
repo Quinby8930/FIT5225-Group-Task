@@ -11,7 +11,9 @@ by A/C through a secure channel and must never be committed to Git or posted in 
 clients reject plaintext or malformed endpoint configuration before sending a
 request. Authenticated requests do not follow redirects, so the shared key is
 never forwarded to a second destination. JSON dependency responses are limited
-to 1 MiB.
+to 1 MiB. The inference client appends `/infer`, so `INFERENCE_API_URL` rejects
+an exact decoded `infer` path segment; metadata stage paths such as `/dev`
+remain valid.
 
 ## Ownership
 
@@ -330,20 +332,33 @@ POST {INFERENCE_API_URL}/infer
 
 For an image, `media_type` is `image` and `image_urls` contains one temporary
 GET URL for the original. For a video it contains the one-frame-per-second
-temporary images in lexical order. Image decoding is capped at 40,000,000
-pixels. Video extraction samples one frame per second, scales each frame so its
+temporary images in lexical order. B makes consecutive video requests of at
+most 30 URLs, presigning each batch immediately before its call. It sums tag
+counts and sorts their keys, concatenates detections in batch/response order,
+requires exact `model_version` consistency, and rejects the whole video if the
+aggregate would exceed 1,000 tag counts or 1,000 detections. Image decoding is capped at 40,000,000
+pixels per C service request. Video extraction samples one frame per second, scales each frame so its
 longest dimension is at most 1,024 pixels without upscaling, and writes JPEGs
 at FFmpeg quality 5. Extraction times out after at most 600 seconds, rejects
 more than 900 sampled frames (about 15 minutes), and rejects more than 2 GiB of
-total frame output rather than silently truncating a longer video. FFmpeg is
+total frame output rather than silently truncating a longer video. The
+900-frame extraction bound is not a completion guarantee because every batch
+must still fit the remaining Lambda and C inference deadlines. FFmpeg is
 non-interactive and can read only local `file`/`pipe` protocols.
 
 The processing Lambda reserves 180 seconds from its reported remaining time
 for frame upload, inference, status reporting, and cleanup. It recalculates the
 FFmpeg timeout from that budget and rechecks the reserve before every frame
-upload and before inference. Budget exhaustion deletes all frames already
+upload and every inference batch. Budget exhaustion deletes all frames already
 uploaded under `processing/`, records the retryable failed transition to clear
 the lease, and then lets the exception escape so Lambda delivery can retry.
+Metadata completion occurs only after every batch succeeds, so partial video
+results are never persisted.
+
+For image processing, a thumbnail uploaded before a later pre-completion error
+is deleted before failure reporting. Cleanup failure never replaces the primary
+processing error. Once the first completion call is attempted, B does not
+delete the thumbnail because a timeout may be an ambiguous remote success.
 
 Successful JSON response:
 
@@ -357,7 +372,11 @@ Successful JSON response:
 
 Species keys and detection species use the team's short wire names, such as
 `dingo`, `wombat`, and `cassowary`, rather than scientific model labels.
-`tags` must be an object and `model_version` a non-empty string. `detections`
+`tags` must be an object with at most 1,000 raw keys and a total count no greater
+than 1,000. B trims species keys, combines whitespace-equivalent duplicates
+without case-folding, and sorts the normalized keys. Each species is nonblank
+and at most 128 characters after trimming; each count is an integer (not a
+Boolean) in `[0,1000]`. `model_version` is a non-empty string. `detections`
 contains at most 1,000 objects; every object has a non-empty species of at most
 128 characters and a finite numeric confidence in `[0,1]`. Invalid UTF-8/JSON,
 a response over 1 MiB, or a malformed schema maps to non-retryable

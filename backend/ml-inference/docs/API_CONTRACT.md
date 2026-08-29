@@ -6,7 +6,9 @@ The service is the secondary-cloud ML component for Pacific BioArchive. B's
 media-processing Lambda calls it over HTTPS after an image is uploaded or
 after video frames have been extracted at one frame per second. C applies
 MegaDetector to each received image and then classifies detected animal crops
-with the supplied fine-tuned model.
+with the supplied fine-tuned model. A MegaDetector result with no animal crop
+produces no species prediction; only explicit `full_image` mode classifies the
+whole image.
 
 ## Authentication
 
@@ -86,11 +88,17 @@ present in the file pass through unchanged.
 
 - The JSON request body is at most 26,214,400 bytes.
 - Each downloaded source image is at most 12,582,912 bytes.
+- Each source image is at most 40,000,000 pixels. C reads dimensions after
+  opening the container and rejects an excess before loading or converting
+  pixels; Pillow decompression-bomb errors use the same invalid-source response.
 - Source URLs must use HTTPS, contain no embedded credentials, use the default
   HTTPS port, and match C's `ALLOWED_SOURCE_HOSTS`. Production defaults to
   standard AWS S3 endpoints and never follows redirects.
 - A request contains at most 900 source URLs and C fetches, decodes, predicts,
   and closes one source before starting the next.
+- B currently sends consecutive video batches of at most 30 URLs. The larger C
+  request ceiling is not a guarantee that 900 frames fit the application
+  deadline.
 - A response contains at most 1,000 detections; C rejects the whole inference
   instead of returning a partial result.
 - C's application deadline is 45 seconds, the Function Compute timeout is 60

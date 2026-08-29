@@ -18,7 +18,8 @@ C owns a standalone HTTPS inference service with:
 
 1. The B media service will provide short-lived AWS S3 HTTPS URLs in
    `image_urls`; C rejects other hosts and redirects by default.
-2. B will extract video frames at one frame per second.
+2. B will extract video frames at one frame per second and send consecutive
+   batches of at most 30 presigned URLs.
 3. B sends `file_id`, `media_type` (`image` or `video`), and `image_urls`
    exactly as specified in `docs/API_CONTRACT.md`.
 4. B will store `tags`, `detections`, and `model_version` through D's metadata
@@ -36,7 +37,13 @@ are `false`. Health and readiness routes remain public.
 
 - Image uploads and C source downloads are capped at 12,582,912 bytes. Video
   uploads keep B's separate 262,144,000-byte cap.
-- C accepts at most 900 source URLs and returns at most 1,000 detections.
+- C also caps each decoded source at 40,000,000 pixels before pixel load or
+  conversion. MegaDetector with no animal crop returns no species.
+- C accepts at most 900 source URLs, while B sends at most 30 per video batch.
+  Neither limit guarantees that a 900-frame video fits the end-to-end deadline.
+  C returns at most 1,000 detections per request; B enforces the same 1,000 cap
+  globally across the video, also caps the global tag-count sum at 1,000, and
+  requires one exact model version.
 - C's application deadline is 45 seconds, its Function Compute timeout is 60
   seconds, and B's inference HTTP timeout is 70 seconds. C also caps each
   source socket timeout to the remaining application deadline.

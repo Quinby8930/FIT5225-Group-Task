@@ -50,12 +50,15 @@ class InferenceResult:
         }
 
 
-def _open_image(raw: bytes) -> Image.Image:
+def _open_image(raw: bytes, max_image_pixels: int) -> Image.Image:
     try:
         with Image.open(io.BytesIO(raw)) as image:
+            width, height = image.size
+            if width * height > max_image_pixels:
+                raise InferenceInputError("source image exceeds the pixel limit")
             image.load()
             return image.convert("RGB")
-    except (UnidentifiedImageError, OSError) as exc:
+    except (Image.DecompressionBombError, UnidentifiedImageError, OSError) as exc:
         raise InferenceInputError("source is not a valid supported image") from exc
 
 
@@ -67,11 +70,13 @@ class InferenceService:
         species_mapper: SpeciesMapper | None = None,
         *,
         max_detections: int = 1000,
+        max_image_pixels: int = 40_000_000,
     ) -> None:
         self.backend = backend
         self.fetch_url = fetch_url
         self.species_mapper = species_mapper or SpeciesMapper({})
         self.max_detections = max_detections
+        self.max_image_pixels = max_image_pixels
 
     @staticmethod
     def _check_deadline(deadline: float | None) -> None:
@@ -94,7 +99,9 @@ class InferenceService:
             raw = self._within_deadline(
                 lambda: self.fetch_url(url, deadline=deadline), deadline
             )
-            image = self._within_deadline(lambda: _open_image(raw), deadline)
+            image = self._within_deadline(
+                lambda: _open_image(raw, self.max_image_pixels), deadline
+            )
             try:
                 predictions = self._within_deadline(
                     lambda: self.backend.predict_image(image), deadline

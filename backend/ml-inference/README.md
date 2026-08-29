@@ -11,6 +11,7 @@ The service provides:
 - `tags`, `detections`, and model version;
 - `X-Internal-Api-Key` authentication for the internal cross-cloud call;
 - request/file/URL limits, validation, timeouts, structured errors, and logs;
+- a configurable 40,000,000-pixel per-source gate before pixel decoding;
 - HTTPS-only, S3-host allowlisted source downloads with redirects disabled;
 - `/health` and `/ready` deployment probes;
 - configurable model path/version so model upgrades do not require caller code changes;

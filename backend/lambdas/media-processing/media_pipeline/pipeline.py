@@ -1,3 +1,4 @@
+from collections import Counter
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
@@ -13,6 +14,9 @@ from .video_processor import (
 IMAGE_CONTENT_TYPES = {"image/jpeg", "image/png", "image/webp"}
 VIDEO_CONTENT_TYPES = {"video/mp4", "video/quicktime"}
 FINALIZATION_RESERVE_MILLIS = 180_000
+MAX_INFERENCE_BATCH_URLS = 30
+MAX_AGGREGATE_DETECTIONS = 1000
+MAX_AGGREGATE_TAG_COUNT = 1000
 UNEXPECTED_PROCESSING_FAILURE_CODE = "PROCESSING_FAILED"
 UNEXPECTED_PROCESSING_FAILURE_MESSAGE = "Media processing failed unexpectedly"
 
@@ -75,6 +79,9 @@ class MediaPipeline:
         if lease_token is None:
             return {"status": "skipped", "file_id": record.file_id}
 
+        thumbnail_key = None
+        thumbnail_uploaded = False
+        completion_attempted = False
         try:
             content_type = self.storage.get_content_type(record.bucket, record.key)
             media_type = self._media_type(content_type)
@@ -85,8 +92,27 @@ class MediaPipeline:
                 local_source = temporary_root / record.filename
                 self.storage.download(record.bucket, record.key, local_source)
                 if media_type == "image":
-                    thumbnail_key, inference_result = self._process_image(
-                        record, local_source, temporary_root
+                    local_thumbnail = temporary_root / "thumbnail.jpg"
+                    self.create_thumbnail(local_source, local_thumbnail)
+                    thumbnail_key = (
+                        f"thumbnails/{record.user_id}/{record.file_id}/thumbnail.jpg"
+                    )
+                    self.storage.upload(
+                        record.bucket,
+                        thumbnail_key,
+                        local_thumbnail,
+                        "image/jpeg",
+                    )
+                    thumbnail_uploaded = True
+                    original_url = self.storage.presign_get(
+                        record.bucket, record.key
+                    )
+                    inference_result = self.inference.infer(
+                        {
+                            "file_id": record.file_id,
+                            "media_type": "image",
+                            "image_urls": [original_url],
+                        }
                     )
                 else:
                     thumbnail_key, inference_result = self._process_video(
@@ -108,9 +134,15 @@ class MediaPipeline:
                 }
                 if lease_token:
                     completion["lease_token"] = lease_token
+                completion_attempted = True
                 self.metadata.complete(record.file_id, completion)
             return {"status": "completed", "file_id": record.file_id}
         except Exception as error:
+            if thumbnail_uploaded and not completion_attempted:
+                try:
+                    self.storage.delete(record.bucket, [thumbnail_key])
+                except Exception:
+                    pass
             if isinstance(error, MediaPipelineError):
                 error_code = error.code
                 message = error.message[:240]
@@ -197,28 +229,6 @@ class MediaPipeline:
             return "video"
         raise MediaPipelineError("INVALID_MEDIA", "Unsupported media content type")
 
-    def _process_image(self, record, local_source, temporary_root):
-        local_thumbnail = temporary_root / "thumbnail.jpg"
-        self.create_thumbnail(local_source, local_thumbnail)
-        thumbnail_key = (
-            f"thumbnails/{record.user_id}/{record.file_id}/thumbnail.jpg"
-        )
-        self.storage.upload(
-            record.bucket,
-            thumbnail_key,
-            local_thumbnail,
-            "image/jpeg",
-        )
-        original_url = self.storage.presign_get(record.bucket, record.key)
-        result = self.inference.infer(
-            {
-                "file_id": record.file_id,
-                "media_type": "image",
-                "image_urls": [original_url],
-            }
-        )
-        return thumbnail_key, result
-
     def _process_video(
         self,
         record,
@@ -241,7 +251,6 @@ class MediaPipeline:
                 temporary_root / "frames",
                 timeout_seconds=extraction_timeout,
             )
-            frame_urls = []
             for frame in frames:
                 _require_finalization_reserve(get_remaining_time_in_millis)
                 frame_key = (
@@ -249,16 +258,50 @@ class MediaPipeline:
                 )
                 self.storage.upload(record.bucket, frame_key, frame, "image/jpeg")
                 uploaded_keys.append(frame_key)
-                frame_urls.append(self.storage.presign_get(record.bucket, frame_key))
-            _require_finalization_reserve(get_remaining_time_in_millis)
-            result = self.inference.infer(
-                {
-                    "file_id": record.file_id,
-                    "media_type": "video",
-                    "image_urls": frame_urls,
-                }
-            )
-            return None, result
+
+            tags = Counter()
+            detections = []
+            model_version = None
+            for offset in range(0, len(uploaded_keys), MAX_INFERENCE_BATCH_URLS):
+                _require_finalization_reserve(get_remaining_time_in_millis)
+                batch_keys = uploaded_keys[offset : offset + MAX_INFERENCE_BATCH_URLS]
+                batch_urls = [
+                    self.storage.presign_get(record.bucket, frame_key)
+                    for frame_key in batch_keys
+                ]
+                batch_result = self.inference.infer(
+                    {
+                        "file_id": record.file_id,
+                        "media_type": "video",
+                        "image_urls": batch_urls,
+                    }
+                )
+                batch_version = batch_result["model_version"]
+                if model_version is None:
+                    model_version = batch_version
+                elif batch_version != model_version:
+                    raise MediaPipelineError(
+                        "INFERENCE_UNAVAILABLE",
+                        "Inference model version changed between video batches",
+                        retryable=True,
+                    )
+                tags.update(batch_result["tags"])
+                if sum(tags.values()) > MAX_AGGREGATE_TAG_COUNT:
+                    raise MediaPipelineError(
+                        "INFERENCE_FAILED",
+                        "Inference response exceeded the aggregate tag limit",
+                    )
+                detections.extend(batch_result["detections"])
+                if len(detections) > MAX_AGGREGATE_DETECTIONS:
+                    raise MediaPipelineError(
+                        "INFERENCE_FAILED",
+                        "Inference response exceeded the aggregate detection limit",
+                    )
+            return None, {
+                "tags": dict(sorted(tags.items())),
+                "detections": detections,
+                "model_version": model_version,
+            }
         except Exception as error:
             primary_error = error
             raise

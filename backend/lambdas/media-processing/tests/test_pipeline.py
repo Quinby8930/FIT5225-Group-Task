@@ -229,6 +229,21 @@ def fake_frames(source, output_dir, *, timeout_seconds=None):
     return [first, second]
 
 
+def frame_extractor(count):
+    def extract(source, output_dir, *, timeout_seconds=None):
+        del source, timeout_seconds
+        output_dir = Path(output_dir)
+        output_dir.mkdir()
+        frames = []
+        for number in range(1, count + 1):
+            frame = output_dir / f"frame-{number:06}.jpg"
+            frame.write_bytes(f"frame {number}".encode("ascii"))
+            frames.append(frame)
+        return frames
+
+    return extract
+
+
 def make_pipeline(*, content_type="image/jpeg", should_process=True):
     order = []
     storage = FakeStorage(order, content_type=content_type)
@@ -338,6 +353,57 @@ def test_image_pipeline_stores_deterministic_thumbnail_and_serializes_completion
     assert all(not path.exists() for path in storage.local_paths)
 
 
+def test_image_thumbnail_cleanup_is_limited_to_pre_completion_failures():
+    pipeline, storage, metadata, inference, order = make_pipeline()
+    inference.error = MediaPipelineError(
+        "INFERENCE_UNAVAILABLE", "temporary inference outage", retryable=True
+    )
+
+    with pytest.raises(MediaPipelineError, match="temporary inference outage"):
+        pipeline.process_record(s3_record())
+
+    thumbnail_key = "thumbnails/user-1/file-1/thumbnail.jpg"
+    assert storage.deleted_keys == [thumbnail_key]
+    assert order.index("delete") < order.index("fail")
+    assert metadata.completed == []
+
+    pipeline, storage, metadata, _, order = make_pipeline()
+    metadata.complete_error = MediaPipelineError(
+        "DEPENDENCY_UNAVAILABLE", "ambiguous completion", retryable=True
+    )
+
+    with pytest.raises(MediaPipelineError, match="ambiguous completion"):
+        pipeline.process_record(s3_record())
+
+    assert storage.deleted_keys == []
+    assert order[-2:] == ["complete", "fail"]
+
+
+def test_image_thumbnail_cleanup_failure_preserves_the_processing_error():
+    pipeline, storage, metadata, inference, _ = make_pipeline()
+    inference.error = MediaPipelineError(
+        "INFERENCE_UNAVAILABLE", "primary inference outage", retryable=True
+    )
+    cleanup_calls = []
+
+    def fail_cleanup(bucket, keys):
+        cleanup_calls.append((bucket, keys))
+        raise MediaPipelineError(
+            "STORAGE_DELETE_FAILED", "thumbnail cleanup failed", retryable=True
+        )
+
+    storage.delete = fail_cleanup
+
+    with pytest.raises(MediaPipelineError) as caught:
+        pipeline.process_record(s3_record())
+
+    assert caught.value.code == "INFERENCE_UNAVAILABLE"
+    assert cleanup_calls == [
+        ("private-media", ["thumbnails/user-1/file-1/thumbnail.jpg"])
+    ]
+    assert metadata.failed[0][1]["error_code"] == "INFERENCE_UNAVAILABLE"
+
+
 def test_completion_includes_the_acquired_processing_lease_token():
     lease_token = "a" * 43
     pipeline, _, metadata, _, _ = make_pipeline(
@@ -407,6 +473,203 @@ def test_video_pipeline_uploads_signed_frames_once_and_cleans_them_after_success
     assert metadata.completed[0][1]["thumbnail_key"] is None
     assert storage.deleted_keys == frame_keys
     assert all(not path.exists() for path in storage.local_paths)
+
+
+def test_video_pipeline_batches_presigning_and_aggregates_in_stable_order():
+    pipeline, storage, metadata, inference, _ = make_pipeline(content_type="video/mp4")
+    pipeline.extract_frames = frame_extractor(31)
+    timeline = []
+    real_presign = storage.presign_get
+
+    def record_presign(bucket, key):
+        timeline.append(("presign", key))
+        return real_presign(bucket, key)
+
+    responses = iter(
+        [
+            {
+                "tags": {"zebra": 1, "ant": 2},
+                "detections": [{"species": "zebra", "confidence": 0.91}],
+                "model_version": "speciesnet-v1",
+            },
+            {
+                "tags": {"badger": 1, "ant": 3},
+                "detections": [{"species": "badger", "confidence": 0.82}],
+                "model_version": "speciesnet-v1",
+            },
+        ]
+    )
+
+    def record_infer(payload):
+        timeline.append(("infer", len(payload["image_urls"])))
+        inference.calls.append(payload)
+        return next(responses)
+
+    storage.presign_get = record_presign
+    inference.infer = record_infer
+
+    pipeline.process_record(s3_record("wombat.mp4"))
+
+    frame_keys = [
+        f"processing/user-1/file-1/frames/frame-{number:06}.jpg"
+        for number in range(1, 32)
+    ]
+    assert [len(call["image_urls"]) for call in inference.calls] == [30, 1]
+    assert inference.calls[0]["image_urls"] == [
+        f"https://signed.example/{key}" for key in frame_keys[:30]
+    ]
+    assert inference.calls[1]["image_urls"] == [
+        f"https://signed.example/{frame_keys[30]}"
+    ]
+    assert timeline == (
+        [("presign", key) for key in frame_keys[:30]]
+        + [("infer", 30), ("presign", frame_keys[30]), ("infer", 1)]
+    )
+    completion = metadata.completed[0][1]
+    assert list(completion["tags"]) == ["ant", "badger", "zebra"]
+    assert completion["tags"] == {"ant": 5, "badger": 1, "zebra": 1}
+    assert completion["detections"] == [
+        {"species": "zebra", "confidence": 0.91},
+        {"species": "badger", "confidence": 0.82},
+    ]
+    assert completion["model_version"] == "speciesnet-v1"
+    assert storage.deleted_keys == frame_keys
+
+
+def test_video_pipeline_rejects_model_version_drift_without_partial_metadata():
+    pipeline, storage, metadata, inference, _ = make_pipeline(content_type="video/mp4")
+    pipeline.extract_frames = frame_extractor(31)
+    versions = iter(["speciesnet-v1", "speciesnet-v2"])
+
+    def infer_with_drift(payload):
+        inference.calls.append(payload)
+        return {
+            "tags": {},
+            "detections": [],
+            "model_version": next(versions),
+        }
+
+    inference.infer = infer_with_drift
+
+    with pytest.raises(MediaPipelineError) as caught:
+        pipeline.process_record(s3_record("wombat.mp4"))
+
+    assert caught.value.code == "INFERENCE_UNAVAILABLE"
+    assert caught.value.retryable is True
+    assert len(inference.calls) == 2
+    assert metadata.completed == []
+    assert metadata.failed[0][1]["error_code"] == "INFERENCE_UNAVAILABLE"
+    assert len(storage.deleted_keys) == 31
+
+
+def test_video_pipeline_rejects_aggregate_detection_1001_without_partial_metadata():
+    pipeline, storage, metadata, inference, _ = make_pipeline(content_type="video/mp4")
+    pipeline.extract_frames = frame_extractor(31)
+    responses = iter(
+        [
+            {
+                "tags": {"wombat": 600},
+                "detections": [
+                    {"species": "wombat", "confidence": 0.8}
+                ]
+                * 600,
+                "model_version": "speciesnet-v1",
+            },
+            {
+                "tags": {"wombat": 401},
+                "detections": [
+                    {"species": "wombat", "confidence": 0.7}
+                ]
+                * 401,
+                "model_version": "speciesnet-v1",
+            },
+        ]
+    )
+
+    def infer_over_limit(payload):
+        inference.calls.append(payload)
+        return next(responses)
+
+    inference.infer = infer_over_limit
+
+    result = pipeline.process_record(s3_record("wombat.mp4"))
+
+    assert result == {
+        "status": "failed",
+        "file_id": "file-1",
+        "error_code": "INFERENCE_FAILED",
+    }
+    assert len(inference.calls) == 2
+    assert metadata.completed == []
+    assert metadata.failed[0][1]["error_code"] == "INFERENCE_FAILED"
+    assert len(storage.deleted_keys) == 31
+
+
+def test_video_pipeline_rejects_aggregate_tag_1001_without_partial_metadata():
+    pipeline, storage, metadata, inference, _ = make_pipeline(content_type="video/mp4")
+    pipeline.extract_frames = frame_extractor(31)
+    responses = iter(
+        [
+            {
+                "tags": {"wombat": 600},
+                "detections": [],
+                "model_version": "speciesnet-v1",
+            },
+            {
+                "tags": {"wombat": 401},
+                "detections": [],
+                "model_version": "speciesnet-v1",
+            },
+        ]
+    )
+
+    def infer_over_limit(payload):
+        inference.calls.append(payload)
+        return next(responses)
+
+    inference.infer = infer_over_limit
+
+    result = pipeline.process_record(s3_record("wombat.mp4"))
+
+    assert result == {
+        "status": "failed",
+        "file_id": "file-1",
+        "error_code": "INFERENCE_FAILED",
+    }
+    assert len(inference.calls) == 2
+    assert metadata.completed == []
+    assert metadata.failed[0][1]["error_code"] == "INFERENCE_FAILED"
+    assert len(storage.deleted_keys) == 31
+
+
+def test_video_pipeline_checks_remaining_budget_before_every_inference_batch():
+    pipeline, storage, metadata, inference, _ = make_pipeline(content_type="video/mp4")
+    pipeline.extract_frames = frame_extractor(31)
+    remaining = {"milliseconds": 900_000}
+
+    def exhaust_after_first_batch(payload):
+        inference.calls.append(payload)
+        remaining["milliseconds"] = 180_000
+        return {
+            "tags": {"wombat": 1},
+            "detections": [{"species": "wombat", "confidence": 0.9}],
+            "model_version": "speciesnet-v1",
+        }
+
+    inference.infer = exhaust_after_first_batch
+
+    with pytest.raises(MediaPipelineError) as caught:
+        pipeline.process_record(
+            s3_record("wombat.mp4"),
+            get_remaining_time_in_millis=lambda: remaining["milliseconds"],
+        )
+
+    assert caught.value.code == "PROCESSING_TIME_BUDGET_EXHAUSTED"
+    assert len(inference.calls) == 1
+    assert len(inference.calls[0]["image_urls"]) == 30
+    assert metadata.completed == []
+    assert metadata.failed[0][1]["error_code"] == "PROCESSING_TIME_BUDGET_EXHAUSTED"
+    assert len(storage.deleted_keys) == 31
 
 
 def test_video_pipeline_acknowledges_bounded_inference_failure_and_cleans_frames():

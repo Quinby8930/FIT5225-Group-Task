@@ -309,6 +309,77 @@ def test_inference_client_accepts_exact_detection_boundaries(monkeypatch):
 
 
 @pytest.mark.parametrize(
+    "tags",
+    [
+        {"wombat": True},
+        {"wombat": -1},
+        {"wombat": 1.5},
+        {"wombat": "1"},
+        {"wombat": 1001},
+        {"": 1},
+        {"   ": 1},
+        {"w" * 129: 1},
+        {"wombat": 501, "dingo": 500},
+        {f"species-{index}": 0 for index in range(1001)},
+    ],
+)
+def test_inference_client_rejects_invalid_tag_contracts(monkeypatch, tags):
+    monkeypatch.setattr(
+        http_clients_module,
+        "urlopen",
+        RecordingUrlOpen(
+            [{"tags": tags, "detections": [], "model_version": "v1"}]
+        ),
+    )
+
+    with pytest.raises(MediaPipelineError) as caught:
+        InferenceClient("https://inference.example").infer({})
+
+    assert caught.value.code == "INFERENCE_FAILED"
+    assert caught.value.retryable is False
+
+
+def test_inference_client_normalizes_tag_whitespace_without_casefolding(monkeypatch):
+    boundary_species = "x" * 128
+    response = {
+        "tags": {
+            " wombat ": 600,
+            "wombat": 400,
+            "Wombat": 0,
+            f" {boundary_species} ": 0,
+        },
+        "detections": [],
+        "model_version": "v1",
+    }
+    monkeypatch.setattr(
+        http_clients_module, "urlopen", RecordingUrlOpen([response])
+    )
+
+    result = InferenceClient("https://inference.example").infer({})
+
+    assert list(result["tags"]) == ["Wombat", "wombat", boundary_species]
+    assert result["tags"] == {
+        "Wombat": 0,
+        "wombat": 1000,
+        boundary_species: 0,
+    }
+
+
+def test_inference_client_accepts_exact_tag_key_and_sum_boundaries(monkeypatch):
+    tags = {f"species-{index:04}": 1 for index in range(1000)}
+    response = {"tags": tags, "detections": [], "model_version": "v1"}
+    monkeypatch.setattr(
+        http_clients_module, "urlopen", RecordingUrlOpen([response])
+    )
+
+    result = InferenceClient("https://inference.example").infer({})
+
+    assert result["tags"] == tags
+    assert len(result["tags"]) == 1000
+    assert sum(result["tags"].values()) == 1000
+
+
+@pytest.mark.parametrize(
     "response",
     [
         b"not-json",
@@ -486,6 +557,26 @@ def test_inference_client_caps_json_response_reads_at_one_mib(monkeypatch):
 def test_internal_http_clients_reject_non_https_base_urls(client_type, base_url):
     with pytest.raises(ValueError, match="HTTPS"):
         client_type(base_url, internal_api_key="must-not-be-sent")
+
+
+@pytest.mark.parametrize(
+    "base_url",
+    [
+        "https://inference.example/infer",
+        "https://inference.example/infer/",
+        "https://inference.example/api/infer",
+        "https://inference.example/api/infer/",
+        "https://inference.example/%69nfer",
+        "https://inference.example/%69nfer/",
+        "https://inference.example/InFeR",
+        "https://inference.example/api/%49nF%65r/",
+    ],
+)
+def test_only_inference_client_rejects_a_decoded_infer_path_segment(base_url):
+    assert MetadataClient(base_url).base_url == base_url.rstrip("/")
+
+    with pytest.raises(ValueError, match="infer"):
+        InferenceClient(base_url, internal_api_key="must-not-be-sent")
 
 
 @pytest.mark.parametrize(

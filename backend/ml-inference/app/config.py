@@ -53,6 +53,7 @@ class Settings:
         "s3.amazonaws.com",
         "s3.ap-southeast-2.amazonaws.com",
     )
+    max_image_pixels: int = 40_000_000
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -77,6 +78,7 @@ class Settings:
             max_request_bytes=_positive_int("MAX_REQUEST_BYTES", 25 * 1024 * 1024),
             max_source_urls=_positive_int("MAX_SOURCE_URLS", 900),
             max_image_bytes=_positive_int("MAX_IMAGE_BYTES", 12 * 1024 * 1024),
+            max_image_pixels=_positive_int("MAX_IMAGE_PIXELS", 40_000_000),
             max_detections=_positive_int("MAX_DETECTIONS", 1000),
             request_timeout_seconds=_positive_int("INFER_TIMEOUT_SECONDS", 45),
             confidence_threshold=confidence,

@@ -161,13 +161,12 @@ class SpeciesNetBackend:
         with self._inference_lock:
             if self.detector is not None:
                 crops = self._detect_animal_crops(image)
-                if crops:
-                    predictions: list[Prediction] = []
-                    for crop in crops:
-                        ranked = self._classify(crop)
-                        if ranked:
-                            predictions.append(ranked[0])
-                    return predictions
+                predictions: list[Prediction] = []
+                for crop in crops:
+                    ranked = self._classify(crop)
+                    if ranked:
+                        predictions.append(ranked[0])
+                return predictions
 
             ranked = self._classify(image)
             return ranked[:1]

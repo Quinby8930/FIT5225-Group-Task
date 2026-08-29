@@ -114,6 +114,40 @@ def test_endpoint_parameter_patterns_require_an_https_host_and_base_path(templat
         assert all(not pattern.fullmatch(value) for value in invalid_urls)
 
 
+def test_inference_url_constraint_rejects_decoded_infer_segments_only(template):
+    parameters = template["Parameters"]
+    metadata_pattern = re.compile(parameters["MetadataApiBaseUrl"]["AllowedPattern"])
+    inference_pattern = re.compile(parameters["InferenceApiUrl"]["AllowedPattern"])
+    valid_inference_urls = [
+        "https://inference.example",
+        "https://inference.example/api",
+        "https://inference.example/dev/",
+    ]
+    rejected_inference_urls = [
+        "https://inference.example/infer",
+        "https://inference.example/infer/",
+        "https://inference.example/api/infer",
+        "https://inference.example/api/infer/",
+        "https://inference.example/%69nfer",
+        "https://inference.example/%69nfer/",
+        "https://inference.example/InFeR",
+        "https://inference.example/api/%49nF%65r/",
+    ]
+
+    assert parameters["InferenceApiUrl"]["AllowedPattern"] != (
+        parameters["MetadataApiBaseUrl"]["AllowedPattern"]
+    )
+    assert all(inference_pattern.fullmatch(value) for value in valid_inference_urls)
+    assert all(
+        not inference_pattern.fullmatch(value) for value in rejected_inference_urls
+    )
+    assert all(metadata_pattern.fullmatch(value) for value in rejected_inference_urls)
+    assert "must not contain" in parameters["InferenceApiUrl"][
+        "ConstraintDescription"
+    ].lower()
+    assert "infer" in parameters["InferenceApiUrl"]["ConstraintDescription"]
+
+
 def test_media_bucket_is_private_encrypted_and_recoverable(template):
     bucket = _properties(template, "MediaBucket")
     assert bucket["PublicAccessBlockConfiguration"] == {
@@ -406,12 +440,20 @@ def test_s3_policies_are_limited_to_owned_bucket_prefixes(template):
             {
                 "Effect": "Allow",
                 "Action": "s3:DeleteObject",
-                "Resource": {
-                    "Fn::Sub": (
-                        "arn:${AWS::Partition}:s3:::pacificbioarchive-media-"
-                        "${AWS::AccountId}-${AWS::Region}/processing/*"
-                    )
-                },
+                "Resource": [
+                    {
+                        "Fn::Sub": (
+                            "arn:${AWS::Partition}:s3:::pacificbioarchive-media-"
+                            "${AWS::AccountId}-${AWS::Region}/processing/*"
+                        )
+                    },
+                    {
+                        "Fn::Sub": (
+                            "arn:${AWS::Partition}:s3:::pacificbioarchive-media-"
+                            "${AWS::AccountId}-${AWS::Region}/thumbnails/*"
+                        )
+                    },
+                ],
             },
         ],
         "StorageDeleteFunction": [

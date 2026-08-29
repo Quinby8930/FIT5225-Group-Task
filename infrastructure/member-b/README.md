@@ -20,7 +20,8 @@ deployment remain manual steps.
 - A Node.js 20 upload Lambda with write access only to `originals/*`.
 - A Python 3.12 processing Lambda triggered only by object creation under
   `originals/`; it can read originals and processing frames, write thumbnails
-  and processing frames, and delete processing frames.
+  and processing frames, and delete processing frames plus thumbnails abandoned
+  by a failure before metadata completion is attempted.
 - A Node.js 20 storage-delete Lambda with delete access only to `originals/*`,
   `thumbnails/*`, and `processing/*`.
 - A Node.js 20 asset-URL Lambda with read access only to `originals/*` and
@@ -37,7 +38,7 @@ deployment remain manual steps.
 | `ExistingJwtAuthorizerId` | Yes | None | Authorizer ID already configured on that HTTP API. |
 | `AllowedOrigin` | No | `http://localhost:3000` | Exact browser origin allowed by Lambda responses and S3 CORS. |
 | `MetadataApiBaseUrl` | Yes | None | Member D HTTPS base URL used for reservation and processing status calls. |
-| `InferenceApiUrl` | Yes | None | Member C HTTPS base URL; the processing client appends `/infer`. |
+| `InferenceApiUrl` | Yes | None | Member C HTTPS base URL; its deployment constraint and runtime client reject an exact case-insensitive decoded `infer` path segment because the client appends `/infer`. |
 | `InternalApiKey` | Yes | None (`NoEcho`, minimum length 1) | Non-empty shared internal HTTP credential; provide it only through an approved deployment secret-handling process. |
 | `FfmpegLayerArn` | Yes | None | Versioned Lambda Layer ARN for a compatible layer that exposes `/opt/bin/ffmpeg`; the processing Lambda always attaches it. |
 | `MaxUploadBytes` | No | `262144000` | Maximum accepted upload size passed to the upload handler. |

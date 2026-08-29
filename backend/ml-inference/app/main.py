@@ -150,6 +150,7 @@ def build_service(settings: Settings) -> InferenceService:
         build_fetcher(settings),
         SpeciesMapper.from_file(settings.labels_path),
         max_detections=settings.max_detections,
+        max_image_pixels=settings.max_image_pixels,
     )
 
 

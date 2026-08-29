@@ -1,7 +1,7 @@
 import json
 import math
 from urllib.error import HTTPError, URLError
-from urllib.parse import quote, urlsplit
+from urllib.parse import quote, unquote, urlsplit
 from urllib.request import HTTPRedirectHandler, Request, build_opener
 
 from .errors import MediaPipelineError
@@ -181,6 +181,9 @@ class InferenceClient(_JsonHttpClient):
         super().__init__(
             base_url, internal_api_key=internal_api_key, timeout=timeout
         )
+        decoded_path = unquote(urlsplit(self.base_url).path)
+        if any(segment.lower() == "infer" for segment in decoded_path.split("/")):
+            raise ValueError("inference base_url must not contain an infer path segment")
 
     @staticmethod
     def _map_http_error(status):
@@ -200,9 +203,14 @@ class InferenceClient(_JsonHttpClient):
             transport_error_code="INFERENCE_UNAVAILABLE",
             transport_retryable=True,
         )
+        normalized_tags = (
+            self._normalize_tags(result.get("tags"))
+            if isinstance(result, dict)
+            else None
+        )
         if not (
             isinstance(result, dict)
-            and isinstance(result.get("tags"), dict)
+            and normalized_tags is not None
             and isinstance(result.get("detections"), list)
             and len(result["detections"]) <= 1000
             and isinstance(result.get("model_version"), str)
@@ -212,7 +220,31 @@ class InferenceClient(_JsonHttpClient):
             raise MediaPipelineError(
                 "INFERENCE_FAILED", "Inference response did not match its contract"
             )
-        return result
+        return {**result, "tags": normalized_tags}
+
+    @staticmethod
+    def _normalize_tags(tags):
+        if not isinstance(tags, dict) or len(tags) > 1000:
+            return None
+        normalized = {}
+        response_total = 0
+        for species, count in tags.items():
+            if not isinstance(species, str):
+                return None
+            species = species.strip()
+            if not species or len(species) > 128:
+                return None
+            if type(count) is not int or not 0 <= count <= 1000:
+                return None
+            response_total += count
+            if response_total > 1000:
+                return None
+            normalized[species] = normalized.get(species, 0) + count
+            if normalized[species] > 1000:
+                return None
+        if sum(normalized.values()) > 1000:
+            return None
+        return dict(sorted(normalized.items()))
 
     @staticmethod
     def _valid_detection(value):

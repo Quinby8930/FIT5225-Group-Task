@@ -35,6 +35,7 @@ resources:
         LABELS_PATH: /app/config/labels.txt
         INFER_TIMEOUT_SECONDS: "45"
         MAX_IMAGE_BYTES: "12582912"
+        MAX_IMAGE_PIXELS: "40000000"
         MAX_DETECTIONS: "1000"
         MAX_SOURCE_URLS: "900"
         MAX_REQUEST_BYTES: "26214400"
