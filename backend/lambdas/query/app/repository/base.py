@@ -110,13 +110,17 @@ class FileRepository(ABC):
         """Set status to ``failed`` with a bounded diagnostic (idempotent)."""
 
     @abstractmethod
-    def begin_delete(self, file_id: str, user_id: str) -> bool:
-        """Atomically mark an owned completed/deleting record as deleting."""
+    def begin_delete(
+        self, file_id: str, user_id: str, deletion_attempt_token: str
+    ) -> bool:
+        """Install a fresh fencing token on an owned completed/deleting record."""
 
     @abstractmethod
-    def restore_completed(self, file_id: str, user_id: str) -> bool:
-        """Restore an owned deleting record after storage deletion fails."""
-
-    @abstractmethod
-    def delete_by_ids(self, file_ids: list[str]) -> int:
+    def delete_by_ids(
+        self,
+        file_ids: list[str],
+        *,
+        user_id: Optional[str] = None,
+        deletion_attempt_tokens: Optional[dict[str, str]] = None,
+    ) -> int:
         """Delete records by id. Returns the number of rows removed."""

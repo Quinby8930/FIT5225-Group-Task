@@ -76,9 +76,10 @@ Internal metadata state machine (called by Member B, see
 `complete` also fires the **notification trigger**: every user subscribed to a
 species the file detected (count ≥1) gets a notification record + a
 `NotificationPublisher.publish` call. Deterministic inbox rows are idempotently
-persisted pending before the completed transition. Failed publish/state updates
-are logged; completed replay publishes only inbox rows that already remain
-pending. It does not re-read current subscriptions or notify late subscribers.
+created only after the lease-token-fenced completed transition wins. Failed
+publish/state updates are logged; completed replay idempotently ensures inbox
+rows from stored completed metadata (never the retry body) and republishes rows
+that remain pending.
 There is no periodic worker/DLQ: recovery uses automatic/manual complete replay,
 with at-least-once delivery if SNS succeeded before state persistence failed.
 
@@ -96,8 +97,10 @@ python -m pytest tests/ -v
 The SAM template sets `REPO_BACKEND=dynamodb`, `STORAGE_BACKEND=lambda`, and
 `TAG_DETECTOR_BACKEND=remote`. Storage deletion synchronously invokes Member B's
 guarded-delete Lambda after metadata is marked `deleting` and before metadata
-is removed. Storage failure restores `completed`; metadata failure remains
-hidden and is safely retryable. File queries accept only
+is removed. Every attempt installs a fresh random fencing token. Storage or
+metadata failure remains hidden `deleting`; retry repeats the idempotent storage
+delete, while final metadata removal is fenced by owner, status, and attempt
+token. File queries accept only
 JPEG/PNG/WebP up to 4,194,304 bytes, stage the image privately under
 `query-inputs/`, give Member C a 120-second HTTPS GET URL, and call C with a
 25-second no-redirect HTTP timeout inside a 30-second Lambda. Cleanup is

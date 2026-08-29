@@ -185,7 +185,7 @@ def main(argv: list[str] | None = None) -> int:
     import boto3
 
     resource = boto3.resource("dynamodb", region_name=args.region)
-    transaction_client = boto3.client("dynamodb", region_name=args.region)
+    transaction_client = resource.meta.client
     report = migrate_reservations(
         resource.Table(args.files_table),
         resource.Table(args.reservations_table),

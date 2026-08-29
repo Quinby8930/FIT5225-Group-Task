@@ -565,13 +565,12 @@ def delete_files(
         raise HTTPException(status_code=403, detail=FORBIDDEN_OWNER_DETAIL)
     if any(record.status not in {"completed", "deleting"} for record in records):
         raise HTTPException(status_code=409, detail="media is not ready for deletion")
-    marked_records: list[FileRecord] = []
+    deletion_attempt_tokens: dict[str, str] = {}
     for record in records:
-        if not repo_.begin_delete(record.file_id, _user):
-            for marked in marked_records:
-                repo_.restore_completed(marked.file_id, _user)
+        attempt_token = secrets.token_urlsafe(32)
+        if not repo_.begin_delete(record.file_id, _user, attempt_token):
             raise HTTPException(status_code=409, detail="media deletion state changed")
-        marked_records.append(record)
+        deletion_attempt_tokens[record.file_id] = attempt_token
     keys_to_delete: list[str] = []
     for record in records:
         keys = [record.object_key] + (
@@ -582,14 +581,6 @@ def delete_files(
         try:
             storage_.delete(_user, keys_to_delete)
         except Exception as exc:
-            for record in marked_records:
-                try:
-                    repo_.restore_completed(record.file_id, _user)
-                except Exception:
-                    logger.exception(
-                        "delete state rollback failed after storage deletion error",
-                        extra={"file_id": record.file_id},
-                    )
             if isinstance(exc, StorageClientUnavailable):
                 raise HTTPException(
                     status_code=503, detail="storage deletion unavailable"
@@ -599,7 +590,11 @@ def delete_files(
                     status_code=502, detail="storage deletion failed"
                 ) from exc
             raise
-    removed_db = repo_.delete_by_ids([record.file_id for record in records])
+    removed_db = repo_.delete_by_ids(
+        [record.file_id for record in records],
+        user_id=_user,
+        deletion_attempt_tokens=deletion_attempt_tokens,
+    )
     return {
         "deleted_db_records": removed_db,
         "storage_objects_removed": len(keys_to_delete),
@@ -775,8 +770,19 @@ def complete_processing(
     repo_: FileRepository = Depends(get_repo),
     notif_repo_: NotificationRepository = Depends(get_notification_repo),
     publisher_: NotificationPublisher = Depends(get_publisher),
+    settings_: Settings = Depends(get_settings),
     _internal_auth: None = Depends(require_internal_api_key),
 ) -> dict:
+    if body.lease_token is None and not getattr(
+        settings_, "allow_legacy_processing_callbacks", False
+    ):
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "PROCESSING_LEASE_TOKEN_REQUIRED",
+                "message": "processing callback must include its lease token",
+            },
+        )
     record = repo_.get(file_id)
     if record is None:
         raise HTTPException(status_code=404, detail="file not found")
@@ -787,16 +793,21 @@ def complete_processing(
         file_type=body.file_type,
     )
     if record.status == "completed":
+        _ensure_notification_inbox(
+            file_id,
+            record.object_key,
+            record.tags,
+            notif_repo_,
+        )
         _publish_pending_notifications(file_id, notif_repo_, publisher_)
         return {}
-    if (
+    if body.lease_token is not None and (
         record.status != "processing"
         or record.processing_lease_token != body.lease_token
     ):
         return {}
     tags = _normalise_tags(body.tags)
     detections = _normalise_detections(body.detections)
-    _ensure_notification_inbox(file_id, body.original_key, tags, notif_repo_)
     changed = repo_.mark_completed(
         file_id,
         body.original_key,
@@ -809,6 +820,14 @@ def complete_processing(
     )
     if not changed:
         return {}
+    completed = repo_.get(file_id)
+    if completed is not None and completed.status == "completed":
+        _ensure_notification_inbox(
+            file_id,
+            completed.object_key,
+            completed.tags,
+            notif_repo_,
+        )
     _publish_pending_notifications(file_id, notif_repo_, publisher_)
     return {}
 
@@ -818,15 +837,26 @@ def fail_processing(
     file_id: str,
     body: FailedRequest,
     repo_: FileRepository = Depends(get_repo),
+    settings_: Settings = Depends(get_settings),
     _internal_auth: None = Depends(require_internal_api_key),
 ) -> dict:
+    if body.lease_token is None and not getattr(
+        settings_, "allow_legacy_processing_callbacks", False
+    ):
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "PROCESSING_LEASE_TOKEN_REQUIRED",
+                "message": "processing callback must include its lease token",
+            },
+        )
     record = repo_.get(file_id)
     if record is None:
         raise HTTPException(status_code=404, detail="file not found")
     _require_matching_metadata(record, user_id=body.user_id)
     if record.status == "completed":
         return {}  # never downgrade a completed file
-    if (
+    if body.lease_token is not None and (
         record.status != "processing"
         or record.processing_lease_token != body.lease_token
     ):

@@ -130,9 +130,9 @@ guarded storage-delete Lambda，入参
 一致；请求中只要有一条外部 owner 记录，整批返回 `403 FORBIDDEN_OWNER` 且不产生副作用。
 生产环境设置 `STORAGE_BACKEND=lambda` 和非空 `STORAGE_DELETE_FUNCTION_NAME`；D
 同步调用 Lambda 并验证外层调用状态、FunctionError、1 MiB 响应边界和内层状态。
-adapter 失败返回稳定的 502 并把 metadata 恢复为 `completed`；未配置返回 503。
-metadata 删除失败则保留 `deleting`，公开查询和资源授权都不可见，重试会幂等删除
-storage 后继续删 metadata。stub 只可在本地/测试中显式选择。
+adapter 失败返回稳定的 502，未配置返回 503；两者都保留隐藏的 `deleting`。
+storage 或 metadata 删除失败时，重试会安装新的随机 attempt token 并幂等删除 storage
+后继续删 metadata。旧 attempt 不能完成或重新暴露较新的 attempt。stub 只可在本地/测试中显式选择。
 
 ### 4.3 成员 A — `get_current_user`
 
@@ -265,8 +265,9 @@ POST /files/delete
 响应：`{"deleted_db_records": 1, "storage_objects_removed": 2}`
 
 记录 owner 必须等于当前 Cognito `sub`；外部 owner 或混合 owner 请求整批返回 `403`。
-记录先标为 `deleting` 并立即从查询和资源授权隐藏。storage 失败恢复为 `completed`；
-storage 成功但 metadata 删除失败时保留 `deleting`，同一请求可安全重试直至收敛。
+记录先以新随机 attempt token 标为 `deleting` 并立即从查询和资源授权隐藏。任何 storage
+错误都保留 `deleting`；metadata 删除也以 owner/status/attempt token 为条件。同一请求可
+安全重试直至收敛，旧并发 attempt 不能删除或重新暴露较新的 attempt。
 
 ### 5.7 内部元数据状态机（成员 B 上传/处理 Lambda 调用）
 

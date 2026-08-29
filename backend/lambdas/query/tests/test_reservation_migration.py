@@ -127,14 +127,13 @@ def test_verify_cli_exits_nonzero_for_non_bijective_tables(
     assert exit_code == 2
 
 
-def test_backfill_cli_uses_low_level_client_for_serialized_transactions(monkeypatch):
+def test_backfill_cli_reuses_the_resources_low_level_client(monkeypatch):
     import sys
     from types import SimpleNamespace
 
     files = _Table("files", [_file("f1")])
     claims = _Table("reservations")
     resource_client = _TransactionClient()
-    low_level_client = _TransactionClient()
     resource = SimpleNamespace(
         Table=lambda name: files if name == "files" else claims,
         meta=SimpleNamespace(client=resource_client),
@@ -145,8 +144,7 @@ def test_backfill_cli_uses_low_level_client_for_serialized_transactions(monkeypa
         "boto3",
         SimpleNamespace(
             resource=lambda *_args, **_kwargs: resource,
-            client=lambda service, **kwargs: client_calls.append((service, kwargs))
-            or low_level_client,
+            client=lambda service, **kwargs: client_calls.append((service, kwargs)),
         ),
     )
 
@@ -162,9 +160,8 @@ def test_backfill_cli_uses_low_level_client_for_serialized_transactions(monkeypa
     )
 
     assert exit_code == 0
-    assert len(low_level_client.calls) == 1
-    assert resource_client.calls == []
-    assert client_calls == [("dynamodb", {"region_name": "ap-southeast-2"})]
+    assert len(resource_client.calls) == 1
+    assert client_calls == []
 
 
 def test_verify_fails_closed_when_claim_points_to_wrong_file():

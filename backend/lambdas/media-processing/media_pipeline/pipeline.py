@@ -176,7 +176,7 @@ class MediaPipeline:
             )
         if state == "acquired" and should_process:
             lease_token = lease_response.get("lease_token")
-            if isinstance(lease_token, str) and len(lease_token) >= 32:
+            if isinstance(lease_token, str) and 32 <= len(lease_token) <= 256:
                 return lease_token
             raise MediaPipelineError(
                 "DEPENDENCY_UNAVAILABLE",

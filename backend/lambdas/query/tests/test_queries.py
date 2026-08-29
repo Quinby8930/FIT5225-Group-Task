@@ -26,6 +26,7 @@ from app.services.query_service import (
 from app.storage_client import (
     LambdaStorageClient,
     StorageClient,
+    StorageClientError,
     StubStorageClient,
     UnavailableStorageClient,
 )
@@ -52,6 +53,9 @@ def _record(fid, ftype, thumb, tags, obj=None):
 # Pure query logic
 # ---------------------------------------------------------------------------
 class TestPureLogic:
+    def test_legacy_processing_callbacks_are_disabled_by_default(self):
+        assert main.Settings().allow_legacy_processing_callbacks is False
+
     def test_sqlite_repository_migrates_existing_processing_schema(self, tmp_path):
         database = tmp_path / "legacy.db"
         connection = sqlite3.connect(database)
@@ -1014,7 +1018,7 @@ class TestEndpoints:
         assert response.status_code == 422
         assert response.json()["detail"]["code"] == "INVALID_MEDIA_REFERENCE"
 
-    def test_delete_keeps_metadata_when_storage_deletion_fails(self, client):
+    def test_delete_storage_failure_leaves_metadata_hidden_for_retry(self, client):
         def fail_delete(_user_id, _keys):
             raise RuntimeError("storage unavailable")
 
@@ -1023,7 +1027,57 @@ class TestEndpoints:
         with pytest.raises(RuntimeError, match="storage unavailable"):
             client.post("/files/delete", json={"keys": ["originals/f1"]})
 
-        assert client.repo.get("f1").status == "completed"
+        record = client.repo.get("f1")
+        assert record.status == "deleting"
+        assert len(record.deletion_attempt_token) >= 32
+
+    def test_ambiguous_partial_storage_delete_retries_with_a_new_attempt_token(
+        self, client
+    ):
+        attempt_tokens = []
+        attempts = 0
+
+        def ambiguous_then_success(_user_id, keys):
+            nonlocal attempts
+            attempts += 1
+            attempt_tokens.append(client.repo.get("f1").deletion_attempt_token)
+            if attempts == 1:
+                client.storage.deleted.append(keys[0])
+                raise StorageClientError("storage response lost after partial delete")
+            client.storage.deleted.extend(keys)
+
+        client.storage.delete = ambiguous_then_success
+
+        first = client.post("/files/delete", json={"keys": ["originals/f1"]})
+        retry = client.post("/files/delete", json={"keys": ["originals/f1"]})
+
+        assert first.status_code == 502
+        assert retry.status_code == 200
+        assert attempt_tokens[0] != attempt_tokens[1]
+        assert all(len(token) >= 32 for token in attempt_tokens)
+        assert client.repo.get("f1") is None
+
+    def test_older_delete_attempt_cannot_finalize_a_newer_attempt(self, client):
+        old_attempt = "o" * 43
+        new_attempt = "n" * 43
+        assert client.repo.begin_delete("f1", "u1", old_attempt) is True
+        assert client.repo.begin_delete("f1", "u1", new_attempt) is True
+
+        removed_by_old = client.repo.delete_by_ids(
+            ["f1"],
+            user_id="u1",
+            deletion_attempt_tokens={"f1": old_attempt},
+        )
+
+        record = client.repo.get("f1")
+        assert removed_by_old == 0
+        assert record.status == "deleting"
+        assert record.deletion_attempt_token == new_attempt
+        assert client.repo.delete_by_ids(
+            ["f1"],
+            user_id="u1",
+            deletion_attempt_tokens={"f1": new_attempt},
+        ) == 1
 
     def test_delete_marks_metadata_deleting_before_storage_and_removes_it_on_success(
         self, client
@@ -1059,12 +1113,12 @@ class TestEndpoints:
         original_delete_by_ids = client.repo.delete_by_ids
         attempts = 0
 
-        def fail_first_metadata_delete(file_ids):
+        def fail_first_metadata_delete(file_ids, **kwargs):
             nonlocal attempts
             attempts += 1
             if attempts == 1:
                 raise RuntimeError("metadata delete failed")
-            return original_delete_by_ids(file_ids)
+            return original_delete_by_ids(file_ids, **kwargs)
 
         client.repo.delete_by_ids = fail_first_metadata_delete
 
@@ -1396,6 +1450,71 @@ class TestMetadataEndpoints:
         assert completed.status == "completed"
         assert completed.tags == {"dingo": 1}
         assert completed.model_version == "fresh"
+
+    @pytest.mark.parametrize("callback", ["complete", "failed"])
+    def test_tokenless_processing_callbacks_are_rejected_by_default(
+        self, client, callback
+    ):
+        file_id = f"tokenless-default-{callback}"
+        _reserve(client, file_id)
+        _active_lease_token(client, file_id)
+        payload = (
+            {
+                "user_id": "u1",
+                "file_type": "image",
+                "original_key": f"originals/{file_id}",
+                "tags": {"wombat": 1},
+                "model_version": "legacy",
+            }
+            if callback == "complete"
+            else {"user_id": "u1", "error_code": "LEGACY", "message": "old B"}
+        )
+
+        response = client.put(
+            f"/internal/files/{file_id}/{callback}",
+            headers={"X-Internal-Api-Key": INTERNAL_API_KEY},
+            json=payload,
+        )
+
+        assert response.status_code == 409
+        assert response.json()["detail"]["code"] == "PROCESSING_LEASE_TOKEN_REQUIRED"
+        assert client.repo.get(file_id).status == "processing"
+
+    @pytest.mark.parametrize(
+        ("callback", "expected_status"),
+        [("complete", "completed"), ("failed", "failed")],
+    )
+    def test_compatibility_flag_accepts_legacy_tokenless_callbacks(
+        self, client, callback, expected_status
+    ):
+        file_id = f"tokenless-enabled-{callback}"
+        _reserve(client, file_id)
+        _active_lease_token(client, file_id)
+        main.app.dependency_overrides[main.get_settings] = lambda: SimpleNamespace(
+            internal_api_key=INTERNAL_API_KEY,
+            query_input_bucket="private-media",
+            allow_legacy_processing_callbacks=True,
+        )
+        payload = (
+            {
+                "user_id": "u1",
+                "file_type": "image",
+                "original_key": f"originals/{file_id}",
+                "tags": {"wombat": 1},
+                "model_version": "legacy",
+            }
+            if callback == "complete"
+            else {"user_id": "u1", "error_code": "LEGACY", "message": "old B"}
+        )
+
+        response = client.put(
+            f"/internal/files/{file_id}/{callback}",
+            headers={"X-Internal-Api-Key": INTERNAL_API_KEY},
+            json=payload,
+        )
+
+        assert response.status_code == 200
+        assert client.repo.get(file_id).status == expected_status
 
     def test_stale_failure_cannot_mutate_a_reacquired_processing_lease(self, client):
         _reserve(client, "stale-failure")
@@ -1872,7 +1991,7 @@ class TestSubscriptionAndNotification:
         assert len(attempts) == 2
         assert client.notif_repo.pending_for_file("n-retry") == []
 
-    def test_inbox_is_ensured_before_fenced_completion_and_retry_is_idempotent(
+    def test_inbox_is_not_written_until_fenced_completion_succeeds(
         self, client
     ):
         client.notif_repo.subscribe("u2", "wombat")
@@ -1886,7 +2005,7 @@ class TestSubscriptionAndNotification:
             self._complete(client, "n-mark-fails", {"wombat": 1})
 
         assert client.repo.get("n-mark-fails").status == "processing"
-        assert len(client.notif_repo.pending_for_file("n-mark-fails")) == 1
+        assert client.notif_repo.pending_for_file("n-mark-fails") == []
 
         client.repo.mark_completed = original_mark_completed
         replay = self._complete(client, "n-mark-fails", {"wombat": 1})
@@ -1895,16 +2014,55 @@ class TestSubscriptionAndNotification:
         assert len(client.notif_repo.notifications("u2")) == 1
         assert len(client.publisher.published) == 1
 
-    def test_completed_replay_does_not_notify_late_subscribers(self, client):
+    def test_stale_completion_cannot_write_notifications_after_lease_reacquisition(
+        self, client
+    ):
+        client.notif_repo.subscribe("u2", "wombat")
+        _reserve(client, "n-stale-complete")
+        original_mark_completed = client.repo.mark_completed
+        newer_token = "n" * 43
+
+        def reacquire_before_compare_and_swap(*args, **kwargs):
+            client.repo._conn.execute(
+                "UPDATE files SET lease_expires_at=? WHERE file_id=?",
+                ("2000-01-01T00:00:00+00:00", "n-stale-complete"),
+            )
+            client.repo._conn.commit()
+            now = main.utcnow()
+            assert client.repo.try_acquire_processing(
+                "n-stale-complete",
+                "newer-sequencer",
+                now,
+                now + main.timedelta(seconds=60),
+                newer_token,
+            ) == "acquired"
+            return original_mark_completed(*args, **kwargs)
+
+        client.repo.mark_completed = reacquire_before_compare_and_swap
+
+        response = self._complete(client, "n-stale-complete", {"wombat": 1})
+
+        record = client.repo.get("n-stale-complete")
+        assert response.status_code == 200
+        assert record.status == "processing"
+        assert record.processing_lease_token == newer_token
+        assert client.notif_repo.notifications("u2") == []
+        assert client.publisher.published == []
+
+    def test_completed_replay_ensures_notifications_from_stored_metadata(self, client):
         _reserve(client, "n-late-subscriber")
         self._complete(client, "n-late-subscriber", {"wombat": 1})
         client.notif_repo.subscribe("u2", "wombat")
+        client.notif_repo.subscribe("u2", "fox")
 
-        replay = self._complete(client, "n-late-subscriber", {})
+        replay = self._complete(client, "n-late-subscriber", {"fox": 99})
 
         assert replay.status_code == 200
-        assert client.notif_repo.notifications("u2") == []
-        assert client.publisher.published == []
+        notifications = client.notif_repo.notifications("u2")
+        assert [(item.species, item.object_key) for item in notifications] == [
+            ("wombat", "originals/n-late-subscriber")
+        ]
+        assert len(client.publisher.published) == 1
 
     def test_delivery_status_update_failure_does_not_fail_complete(self, client):
         client.notif_repo.subscribe("u2", "wombat")

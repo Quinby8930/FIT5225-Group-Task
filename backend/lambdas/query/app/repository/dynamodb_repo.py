@@ -90,7 +90,7 @@ class DynamoDBRepository(FileRepository):
         self._table = resource.Table(table_name)
         self._reservations = resource.Table(reservations_table)
         self._reservations_table_name = reservations_table
-        self._client = boto3.client("dynamodb", region_name=region)
+        self._client = resource.meta.client
 
     @staticmethod
     def _reservation_key(user_id: str, checksum: str) -> str:
@@ -138,6 +138,7 @@ class DynamoDBRepository(FileRepository):
             "message": record.message,
             "processing_sequencer": record.processing_sequencer,
             "processing_lease_token": record.processing_lease_token,
+            "deletion_attempt_token": record.deletion_attempt_token,
             "lease_expires_at": (
                 record.lease_expires_at.isoformat() if record.lease_expires_at else None
             ),
@@ -165,6 +166,7 @@ class DynamoDBRepository(FileRepository):
             message=item.get("message"),
             processing_sequencer=item.get("processing_sequencer"),
             processing_lease_token=item.get("processing_lease_token"),
+            deletion_attempt_token=item.get("deletion_attempt_token"),
             lease_expires_at=_dt(item.get("lease_expires_at")),
             upload_time=_dt(item["upload_time"]),
         )
@@ -254,7 +256,10 @@ class DynamoDBRepository(FileRepository):
         return self._from_item(attributes) if attributes else None
 
     def all(self) -> list[FileRecord]:
-        return [self._from_item(item) for item in _scan_all(self._table)]
+        return [
+            self._from_item(item)
+            for item in _scan_all(self._table, ConsistentRead=True)
+        ]
 
     def get(self, file_id: str) -> Optional[FileRecord]:
         response = self._table.get_item(Key={"file_id": file_id}, ConsistentRead=True)
@@ -266,6 +271,7 @@ class DynamoDBRepository(FileRepository):
             self._table,
             FilterExpression="thumbnail_key = :k",
             ExpressionAttributeValues={":k": key},
+            ConsistentRead=True,
         )
         return self._from_item(items[0]) if items else None
 
@@ -560,13 +566,17 @@ class DynamoDBRepository(FileRepository):
                 return False
             raise
 
-    def begin_delete(self, file_id: str, user_id: str) -> bool:
+    def begin_delete(
+        self, file_id: str, user_id: str, deletion_attempt_token: str
+    ) -> bool:
         import botocore.exceptions
 
         try:
             self._table.update_item(
                 Key={"file_id": file_id},
-                UpdateExpression="SET #s = :deleting",
+                UpdateExpression=(
+                    "SET #s = :deleting, deletion_attempt_token = :attempt_token"
+                ),
                 ConditionExpression=(
                     "attribute_exists(file_id) AND user_id = :user_id AND "
                     "#s IN (:completed, :deleting)"
@@ -576,6 +586,7 @@ class DynamoDBRepository(FileRepository):
                     ":user_id": user_id,
                     ":completed": "completed",
                     ":deleting": "deleting",
+                    ":attempt_token": deletion_attempt_token,
                 },
             )
             return True
@@ -584,38 +595,36 @@ class DynamoDBRepository(FileRepository):
                 return False
             raise
 
-    def restore_completed(self, file_id: str, user_id: str) -> bool:
+    def delete_by_ids(
+        self,
+        file_ids: list[str],
+        *,
+        user_id: Optional[str] = None,
+        deletion_attempt_tokens: Optional[dict[str, str]] = None,
+    ) -> int:
         import botocore.exceptions
 
-        try:
-            self._table.update_item(
-                Key={"file_id": file_id},
-                UpdateExpression="SET #s = :completed",
-                ConditionExpression=(
-                    "attribute_exists(file_id) AND user_id = :user_id AND "
-                    "#s = :deleting"
-                ),
-                ExpressionAttributeNames={"#s": "status"},
-                ExpressionAttributeValues={
-                    ":user_id": user_id,
-                    ":completed": "completed",
-                    ":deleting": "deleting",
-                },
-            )
-            return True
-        except botocore.exceptions.ClientError as exc:
-            if exc.response.get("Error", {}).get("Code") == "ConditionalCheckFailedException":
-                return False
-            raise
-
-    def delete_by_ids(self, file_ids: list[str]) -> int:
-        import botocore.exceptions
-
+        if user_id is None or deletion_attempt_tokens is None:
+            raise ValueError("deletion attempt fence is required")
+        if any(file_id not in deletion_attempt_tokens for file_id in file_ids):
+            raise ValueError("deletion attempt fence is required for every file")
         removed = 0
         for fid in file_ids:
             record = self.get(fid)
             if record is None:
                 continue
+            attempt_token = deletion_attempt_tokens[fid]
+            file_condition = (
+                "attribute_exists(file_id) AND user_id = :user_id AND "
+                "#s = :deleting AND deletion_attempt_token = :attempt_token AND "
+                "checksum = :checksum"
+            )
+            file_values = {
+                ":user_id": user_id,
+                ":checksum": record.checksum,
+                ":deleting": "deleting",
+                ":attempt_token": attempt_token,
+            }
             try:
                 self._client.transact_write_items(
                     TransactItems=[
@@ -623,15 +632,10 @@ class DynamoDBRepository(FileRepository):
                             "Delete": {
                                 "TableName": self._table.name,
                                 "Key": self._serialize_item({"file_id": fid}),
-                                "ConditionExpression": (
-                                    "attribute_not_exists(file_id) OR "
-                                    "(user_id = :user_id AND checksum = :checksum)"
-                                ),
+                                "ConditionExpression": file_condition,
+                                "ExpressionAttributeNames": {"#s": "status"},
                                 "ExpressionAttributeValues": self._serialize_item(
-                                    {
-                                        ":user_id": record.user_id,
-                                        ":checksum": record.checksum,
-                                    }
+                                    file_values
                                 ),
                             }
                         },
@@ -659,7 +663,13 @@ class DynamoDBRepository(FileRepository):
             except botocore.exceptions.ClientError as exc:
                 if exc.response.get("Error", {}).get("Code") != "TransactionCanceledException":
                     raise
-                if self.get(fid) is not None:
+                current = self.get(fid)
+                if current is not None and not (
+                    current.status == "deleting"
+                    and current.deletion_attempt_token != attempt_token
+                ):
                     raise
+                if current is not None:
+                    continue
             removed += 1
         return removed

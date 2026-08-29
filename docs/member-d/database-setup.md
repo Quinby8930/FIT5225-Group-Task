@@ -26,6 +26,7 @@
 | `StorageDeleteFunctionName` | 成员 A 管理的 Member B guarded-delete Lambda 名称（使用 B 栈的同名输出，不要填 ARN；ARN 只用于审计/IAM 参考） |
 | `InferenceApiBaseUrl` | Member C 阿里云 HTTPS 根地址（不要加 `/infer`） |
 | `InternalApiKey` | 仅 A/C 通过安全渠道配置的非空共享密钥 |
+| `AllowLegacyProcessingCallbacks` | 滚动升级临时开关；默认 `false`，稳定态必须保持 `false` |
 | `NotificationEmailEndpoint` | 可选；留空则只创建 Topic，不创建 email subscription |
 
 模板不会提供推理地址或密钥默认值。
@@ -68,7 +69,19 @@ sam deploy --guided
 `TAG_DETECTOR_BACKEND=remote`、`NOTIFICATION_PUBLISHER=sns`，并把四张表、SNS Topic、
 私有桶、删除函数、C 地址和内部密钥参数接入 Lambda。生产环境绝不会自动选择 stub。
 
-### 3.1 从旧 FilesTable 受控切换 reservation claims
+### 3.1 B/D 安全滚动升级顺序
+
+`AllowLegacyProcessingCallbacks` 默认 `false`，此时 complete/failed 回调必须携带
+processing 返回的 32–256 字符 `lease_token`。若线上仍有旧 Member B，严格按以下顺序：
+
+1. 先部署 Member D，并临时设置 `AllowLegacyProcessingCallbacks=true`；
+2. 再部署会保存并转发 lease token 的 Member B，确认新回调均带 token；
+3. 最后重新部署 Member D，设置 `AllowLegacyProcessingCallbacks=false`。
+
+不能交换第 1、2 步，也不能把兼容开关留在稳定态。兼容开启时，无 token 回调仅使用旧的
+无 fencing repository transition，目的是接住升级期间已在途的旧 B invocation。
+
+### 3.2 从旧 FilesTable 受控切换 reservation claims
 
 新 `ReservationsTable` 部署后，**不能只依赖运行时 fallback Scan 当作迁移**。fallback
 使用强一致 Scan 和条件 claim，只是 fail-closed 兼容保护。成员 A 必须：
@@ -139,10 +152,10 @@ invoke permission。没有 `ANY /{proxy+}` 或 `$default`。API Gateway 对 inte
 - **订阅/通知两张表**：`complete` 时通知触发器会写 `PacificBioArchiveNotifications`
   （并查 `PacificBioArchiveSubscriptions`），所以 Lambda 的 IAM 角色必须同时授权
   这两张表（新模板已含 `dynamodb:Query`）。
-- **SNS 临时失败**：确定性 notification ID 的 inbox 在 file 标为 completed **之前**先以
-  `pending` 幂等写入，所以 mark_completed 失败时可能短暂看到 pre-completion pending。
-  publish 或 delivery-state 更新失败只写日志。completed replay 只重试已存在的 pending，
-  不重新读取订阅或给晚订阅者补发历史通知；成功后标 `delivered`。本课程实现没有周期 worker/DLQ，
+- **SNS 临时失败**：只有 processing lease token 的条件更新成功后，才从已存储的 completed
+  metadata 幂等创建确定性 notification inbox；过期 worker 不会留下 inbox side effect。
+  publish 或 delivery-state 更新失败只写日志。completed replay 从已存储 metadata（不信任
+  retry body）补齐 inbox 并重试 pending；成功后标 `delivered`。本课程实现没有周期 worker/DLQ，
   恢复依赖自动重放或 A 人工重放同一 complete PUT。投递是 at-least-once：SNS 已接受
   但状态更新失败时可能重复，消费者应按确定性 `notification_id` 去重。
 - **排错**：报错先看 `docs/member-d/troubleshooting.md`，绝大多数问题（旧 schema、

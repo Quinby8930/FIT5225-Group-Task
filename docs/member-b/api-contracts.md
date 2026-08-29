@@ -256,9 +256,11 @@ Image payload:
 For videos, `file_type` is `video` and `thumbnail_key` is `null`. Member D must
 return a successful status with a JSON object, for example `200 {}`. Completion
 is fenced by the active acquisition token, idempotent for metadata, and uses a
-deterministic inbox identity. A stale worker cannot overwrite a newer lease. A completed replay
-publishes only already-persisted pending inbox entries; it does not re-read
-current subscriptions or create historical notifications for late subscribers.
+deterministic inbox identity. Member D wins the token-conditioned metadata update
+before it creates any inbox rows, so a stale worker cannot persist notifications
+or overwrite a newer lease. A completed replay idempotently ensures the inbox
+from the metadata already stored on the completed record (never from the retry
+body), then republishes pending entries.
 Delivery is at-least-once, so consumers should dedupe by
 `notification_id` if SNS succeeded before delivery-state persistence failed.
 
@@ -289,6 +291,18 @@ A retryable error rethrows after the failed transition is attempted, permitting
 the same S3 event to acquire processing again. The failure PUT is fenced by the
 active acquisition token and is idempotent for a replayed attempt; a stale
 worker cannot clear a newer lease.
+
+The request schema permits an omitted `lease_token` only for a controlled rolling
+deployment. Member D rejects omission by default. The only safe rollout is:
+
+1. deploy Member D with `AllowLegacyProcessingCallbacks=true`;
+2. deploy this token-aware Member B and confirm acquired callbacks include a
+   32–256 character token;
+3. redeploy Member D with `AllowLegacyProcessingCallbacks=false` (the default).
+
+Do not leave compatibility enabled in steady state. While enabled, tokenless
+callbacks use the legacy unfenced repository transition and therefore exist only
+as a temporary bridge for old Member B invocations already in flight.
 
 ## Member C inference contract
 

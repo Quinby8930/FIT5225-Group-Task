@@ -4,11 +4,14 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 from decimal import Decimal
+import json
 import sys
 from types import SimpleNamespace
 
 import pytest
 from botocore.exceptions import ClientError
+from botocore.serialize import create_serializer
+from botocore.session import get_session
 
 from app.repository.dynamodb_repo import DynamoDBRepository
 from app.repository.notification_repo import DynamoDBNotificationRepository
@@ -89,9 +92,8 @@ def _file_repo(table: _PagedTable) -> DynamoDBRepository:
     return repository
 
 
-def test_repository_uses_low_level_client_for_serialized_transactions(monkeypatch):
+def test_repository_reuses_the_resources_low_level_client_for_transactions(monkeypatch):
     resource_client = object()
-    low_level_client = object()
     files = _PagedTable()
     files.name = "files"
     reservations = _PagedTable()
@@ -107,15 +109,36 @@ def test_repository_uses_low_level_client_for_serialized_transactions(monkeypatc
         "boto3",
         SimpleNamespace(
             resource=lambda *_args, **_kwargs: resource,
-            client=lambda service, **kwargs: client_calls.append((service, kwargs))
-            or low_level_client,
+            client=lambda service, **kwargs: client_calls.append((service, kwargs)),
         ),
     )
 
     repository = DynamoDBRepository("files", reservations_table="reservations")
 
-    assert repository._client is low_level_client
-    assert client_calls == [("dynamodb", {"region_name": "ap-southeast-2"})]
+    assert repository._client is resource_client
+    assert client_calls == []
+
+
+def test_botocore_serializes_manual_attribute_values_exactly_once():
+    service_model = get_session().get_service_model("dynamodb")
+    serializer = create_serializer(service_model.protocol)
+    request = serializer.serialize_to_request(
+        {
+            "TransactItems": [
+                {
+                    "Put": {
+                        "TableName": "files",
+                        "Item": {"file_id": {"S": "f1"}},
+                    }
+                }
+            ]
+        },
+        service_model.operation_model("TransactWriteItems"),
+    )
+
+    assert json.loads(request["body"])["TransactItems"][0]["Put"]["Item"] == {
+        "file_id": {"S": "f1"}
+    }
 
 
 def test_reserve_uses_one_transaction_for_checksum_claim_and_file_record():
@@ -239,6 +262,33 @@ def test_legacy_fallback_scan_atomically_checks_file_and_creates_claim():
         "attribute_not_exists(reservation_key)"
     )
     assert writes[1]["Put"]["Item"]["file_id"] == {"S": "legacy"}
+
+
+def test_public_and_asset_lookup_scans_observe_begin_delete_strongly():
+    class _StaleUnlessConsistentTable(_PagedTable):
+        def scan(self, **kwargs):
+            self.scan_calls.append(kwargs)
+            status = "deleting" if kwargs.get("ConsistentRead") else "completed"
+            return {
+                "Items": [
+                    _item(
+                        "f1",
+                        "originals/u1/f1.jpg",
+                        thumbnail_key="thumbnails/u1/f1.jpg",
+                        status=status,
+                    )
+                ]
+            }
+
+    table = _StaleUnlessConsistentTable()
+    repository = _file_repo(table)
+
+    public_record = repository.all()[0]
+    asset_record = repository.by_thumbnail_key("thumbnails/u1/f1.jpg")
+
+    assert public_record.status == "deleting"
+    assert asset_record.status == "deleting"
+    assert [call["ConsistentRead"] for call in table.scan_calls] == [True, True]
 
 
 def test_legacy_claim_competition_loser_reads_the_winning_claim():
@@ -433,13 +483,23 @@ def test_delete_removes_file_and_checksum_reservation_in_one_transaction():
     table = _PagedTable()
     table.name = "files"
     table.get_item = lambda **_kwargs: {
-        "Item": _item("f1", "originals/u1/f1.jpg", checksum="sha256:shared")
+        "Item": _item(
+            "f1",
+            "originals/u1/f1.jpg",
+            checksum="sha256:shared",
+            status="deleting",
+            deletion_attempt_token="attempt-token",
+        )
     }
     repository = _file_repo(table)
     repository._reservations_table_name = "reservations"
     repository._client = _TransactionClient()
 
-    removed = repository.delete_by_ids(["f1"])
+    removed = repository.delete_by_ids(
+        ["f1"],
+        user_id="u1",
+        deletion_attempt_tokens={"f1": "attempt-token"},
+    )
 
     assert removed == 1
     writes = repository._client.calls[0]["TransactItems"]
@@ -449,12 +509,16 @@ def test_delete_removes_file_and_checksum_reservation_in_one_transaction():
                 "TableName": "files",
                 "Key": {"file_id": {"S": "f1"}},
                 "ConditionExpression": (
-                    "attribute_not_exists(file_id) OR "
-                    "(user_id = :user_id AND checksum = :checksum)"
+                    "attribute_exists(file_id) AND user_id = :user_id AND "
+                    "#s = :deleting AND deletion_attempt_token = :attempt_token AND "
+                    "checksum = :checksum"
                 ),
+                "ExpressionAttributeNames": {"#s": "status"},
                 "ExpressionAttributeValues": {
                     ":user_id": {"S": "u1"},
                     ":checksum": {"S": "sha256:shared"},
+                    ":deleting": {"S": "deleting"},
+                    ":attempt_token": {"S": "attempt-token"},
                 },
             }
         },
@@ -480,7 +544,15 @@ def test_late_delete_cancellation_is_idempotent_when_old_file_is_already_gone():
     table.name = "files"
     responses = iter(
         [
-            {"Item": _item("f1", "originals/u1/f1.jpg", checksum="shared")},
+            {
+                "Item": _item(
+                    "f1",
+                    "originals/u1/f1.jpg",
+                    checksum="shared",
+                    status="deleting",
+                    deletion_attempt_token="attempt-token",
+                )
+            },
             {},
         ]
     )
@@ -489,7 +561,11 @@ def test_late_delete_cancellation_is_idempotent_when_old_file_is_already_gone():
     repository._reservations_table_name = "reservations"
     repository._client = _CanceledTransactionClient()
 
-    removed = repository.delete_by_ids(["f1"])
+    removed = repository.delete_by_ids(
+        ["f1"],
+        user_id="u1",
+        deletion_attempt_tokens={"f1": "attempt-token"},
+    )
 
     assert removed == 1
 
@@ -497,8 +573,20 @@ def test_late_delete_cancellation_is_idempotent_when_old_file_is_already_gone():
 def test_late_delete_does_not_hide_cancellation_when_file_id_now_exists():
     table = _PagedTable()
     table.name = "files"
-    old = _item("f1", "originals/u1/f1.jpg", checksum="old")
-    replacement = _item("f1", "originals/u1/f1-new.jpg", checksum="new")
+    old = _item(
+        "f1",
+        "originals/u1/f1.jpg",
+        checksum="old",
+        status="deleting",
+        deletion_attempt_token="attempt-token",
+    )
+    replacement = _item(
+        "f1",
+        "originals/u1/f1-new.jpg",
+        checksum="new",
+        status="deleting",
+        deletion_attempt_token="attempt-token",
+    )
     responses = iter([{"Item": old}, {"Item": replacement}])
     table.get_item = lambda **_kwargs: next(responses)
     repository = _file_repo(table)
@@ -506,7 +594,11 @@ def test_late_delete_does_not_hide_cancellation_when_file_id_now_exists():
     repository._client = _CanceledTransactionClient()
 
     with pytest.raises(ClientError):
-        repository.delete_by_ids(["f1"])
+        repository.delete_by_ids(
+            ["f1"],
+            user_id="u1",
+            deletion_attempt_tokens={"f1": "attempt-token"},
+        )
 
 
 def test_processing_lease_acquisition_is_one_conditional_update():
@@ -902,7 +994,7 @@ def test_begin_delete_is_owner_scoped_and_accepts_only_completed_or_deleting():
     table = _PagedTable()
     repository = _file_repo(table)
 
-    changed = repository.begin_delete("f1", "u1")
+    changed = repository.begin_delete("f1", "u1", "attempt-token")
 
     assert changed is True
     assert table.updated["ConditionExpression"] == (
@@ -913,19 +1005,59 @@ def test_begin_delete_is_owner_scoped_and_accepts_only_completed_or_deleting():
         ":user_id": "u1",
         ":completed": "completed",
         ":deleting": "deleting",
+        ":attempt_token": "attempt-token",
+    }
+    assert table.updated["UpdateExpression"] == (
+        "SET #s = :deleting, deletion_attempt_token = :attempt_token"
+    )
+
+
+def test_delete_finalization_is_fenced_by_owner_status_and_attempt_token():
+    table = _PagedTable()
+    table.name = "files"
+    table.get_item = lambda **_kwargs: {
+        "Item": _item(
+            "f1",
+            "originals/u1/f1.jpg",
+            checksum="sha256:shared",
+            status="deleting",
+            deletion_attempt_token="attempt-token",
+        )
+    }
+    repository = _file_repo(table)
+    repository._reservations_table_name = "reservations"
+    repository._client = _TransactionClient()
+
+    removed = repository.delete_by_ids(
+        ["f1"],
+        user_id="u1",
+        deletion_attempt_tokens={"f1": "attempt-token"},
+    )
+
+    assert removed == 1
+    delete = repository._client.calls[0]["TransactItems"][0]["Delete"]
+    assert delete["ConditionExpression"] == (
+        "attribute_exists(file_id) AND user_id = :user_id AND #s = :deleting AND "
+        "deletion_attempt_token = :attempt_token AND checksum = :checksum"
+    )
+    assert delete["ExpressionAttributeNames"] == {"#s": "status"}
+    assert delete["ExpressionAttributeValues"][":attempt_token"] == {
+        "S": "attempt-token"
     }
 
 
-def test_restore_completed_is_owner_scoped_and_only_rolls_back_deleting():
+def test_delete_finalization_fails_closed_without_an_attempt_fence():
     table = _PagedTable()
+    table.name = "files"
+    table.get_item = lambda **_kwargs: {
+        "Item": _item("f1", "originals/u1/f1.jpg", status="deleting")
+    }
     repository = _file_repo(table)
+    repository._reservations_table_name = "reservations"
+    repository._client = _TransactionClient()
 
-    changed = repository.restore_completed("f1", "u1")
-
-    assert changed is True
-    assert table.updated["ConditionExpression"] == (
-        "attribute_exists(file_id) AND user_id = :user_id AND #s = :deleting"
-    )
+    with pytest.raises(ValueError, match="deletion attempt fence is required"):
+        repository.delete_by_ids(["f1"])
 
 
 def test_concurrent_completed_winner_is_preserved_as_idempotent_noop():

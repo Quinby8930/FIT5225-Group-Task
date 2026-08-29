@@ -29,6 +29,11 @@ Parameters:
     Type: String
     NoEcho: true
     MinLength: 1
+  AllowLegacyProcessingCallbacks:
+    Type: String
+    Default: 'false'
+    AllowedValues: ['true', 'false']
+    Description: Temporary rolling-deployment compatibility for tokenless Member B processing callbacks. Disable after Member B is token-aware.
   NotificationEmailEndpoint:
     Type: String
     Default: ''
@@ -134,6 +139,7 @@ Resources:
           QUERY_INPUT_BUCKET: !Ref QueryInputBucketName
           INFERENCE_API_URL: !Ref InferenceApiBaseUrl
           INTERNAL_API_KEY: !Ref InternalApiKey
+          ALLOW_LEGACY_PROCESSING_CALLBACKS: !Ref AllowLegacyProcessingCallbacks
           NOTIFICATION_PUBLISHER: sns
           SNS_TOPIC_ARN: !Ref NotificationTopic
           CORS_ORIGINS: !Join [',', [!Ref AllowedOrigin, !Ref PublicAllowedOrigin]]

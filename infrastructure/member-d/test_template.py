@@ -102,6 +102,15 @@ def test_template_is_sam_and_requires_external_deployment_values(template):
         "Default": "",
         "Description": "Optional email address subscribed to the notification topic.",
     }
+    assert parameters["AllowLegacyProcessingCallbacks"] == {
+        "Type": "String",
+        "Default": "false",
+        "AllowedValues": ["true", "false"],
+        "Description": (
+            "Temporary rolling-deployment compatibility for tokenless Member B "
+            "processing callbacks. Disable after Member B is token-aware."
+        ),
+    }
 
 
 def test_iam_arn_parameters_reject_wildcards_and_accept_resource_names(template):
@@ -168,6 +177,9 @@ def test_query_function_runtime_handler_and_production_environment(template):
         "QUERY_INPUT_BUCKET": {"Ref": "QueryInputBucketName"},
         "INFERENCE_API_URL": {"Ref": "InferenceApiBaseUrl"},
         "INTERNAL_API_KEY": {"Ref": "InternalApiKey"},
+        "ALLOW_LEGACY_PROCESSING_CALLBACKS": {
+            "Ref": "AllowLegacyProcessingCallbacks"
+        },
         "NOTIFICATION_PUBLISHER": "sns",
         "SNS_TOPIC_ARN": {"Ref": "NotificationTopic"},
         "CORS_ORIGINS": {

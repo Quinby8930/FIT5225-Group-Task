@@ -239,6 +239,7 @@ def test_metadata_client_rejects_invalid_processing_state_combinations(
     [
         {"should_process": True, "state": "acquired"},
         {"should_process": True, "state": "acquired", "lease_token": "short"},
+        {"should_process": True, "state": "acquired", "lease_token": "x" * 257},
         {"should_process": True, "state": "acquired", "lease_token": 123},
     ],
 )

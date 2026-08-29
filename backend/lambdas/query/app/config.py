@@ -13,6 +13,12 @@ from dataclasses import dataclass
 class Settings:
     # Shared secret used only by Member B when calling Member D's internal API.
     internal_api_key: str = os.getenv("INTERNAL_API_KEY", "")
+    # Temporary rolling-deployment bridge for pre-fencing Member B callbacks.
+    # Steady state is fail-closed and requires lease tokens.
+    allow_legacy_processing_callbacks: bool = (
+        os.getenv("ALLOW_LEGACY_PROCESSING_CALLBACKS", "false").casefold()
+        == "true"
+    )
 
     # Which repository backend to use: "sqlite" (local) or "dynamodb" (cloud).
     repository_backend: str = os.getenv("REPO_BACKEND", "sqlite")

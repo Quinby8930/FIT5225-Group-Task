@@ -353,6 +353,20 @@ def test_completion_includes_the_acquired_processing_lease_token():
     assert metadata.completed[0][1]["lease_token"] == lease_token
 
 
+def test_pipeline_rejects_an_oversized_processing_lease_token():
+    with pytest.raises(MediaPipelineError) as caught:
+        MediaPipeline._processing_lease_token(
+            {
+                "should_process": True,
+                "state": "acquired",
+                "lease_token": "x" * 257,
+            }
+        )
+
+    assert caught.value.code == "DEPENDENCY_UNAVAILABLE"
+    assert caught.value.retryable is True
+
+
 def test_failure_includes_the_acquired_processing_lease_token():
     lease_token = "b" * 43
     pipeline, _, metadata, inference, _ = make_pipeline(

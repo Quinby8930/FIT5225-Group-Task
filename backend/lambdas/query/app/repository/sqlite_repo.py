@@ -37,6 +37,7 @@ CREATE TABLE IF NOT EXISTS files (
     message              TEXT,
     processing_sequencer TEXT,
     processing_lease_token TEXT,
+    deletion_attempt_token TEXT,
     lease_expires_at     TEXT,
     upload_time          TEXT NOT NULL
 );
@@ -49,7 +50,8 @@ _COLUMNS = (
     "file_id", "user_id", "file_type", "object_key", "thumbnail_key",
     "filename", "content_type", "size_bytes", "tags_json", "detections_json",
     "model_version", "checksum", "status", "error_code", "message",
-    "processing_sequencer", "processing_lease_token", "lease_expires_at", "upload_time",
+    "processing_sequencer", "processing_lease_token", "deletion_attempt_token",
+    "lease_expires_at", "upload_time",
 )
 
 
@@ -76,6 +78,7 @@ def _serialise(record: FileRecord) -> tuple:
         record.message,
         record.processing_sequencer,
         record.processing_lease_token,
+        record.deletion_attempt_token,
         record.lease_expires_at.isoformat() if record.lease_expires_at else None,
         record.upload_time.isoformat(),
     )
@@ -100,6 +103,7 @@ def _deserialise(row: sqlite3.Row) -> FileRecord:
         message=row["message"],
         processing_sequencer=row["processing_sequencer"],
         processing_lease_token=row["processing_lease_token"],
+        deletion_attempt_token=row["deletion_attempt_token"],
         lease_expires_at=_dt(row["lease_expires_at"]),
         upload_time=_dt(row["upload_time"]),
     )
@@ -117,6 +121,10 @@ class SQLiteRepository(FileRepository):
         if "processing_lease_token" not in columns:
             self._conn.execute(
                 "ALTER TABLE files ADD COLUMN processing_lease_token TEXT"
+            )
+        if "deletion_attempt_token" not in columns:
+            self._conn.execute(
+                "ALTER TABLE files ADD COLUMN deletion_attempt_token TEXT"
             )
         self._conn.commit()
 
@@ -260,33 +268,40 @@ class SQLiteRepository(FileRepository):
         record = self.get(file_id)
         return cursor.rowcount == 1 or record is not None and record.status == "completed"
 
-    def begin_delete(self, file_id: str, user_id: str) -> bool:
+    def begin_delete(
+        self, file_id: str, user_id: str, deletion_attempt_token: str
+    ) -> bool:
         cursor = self._conn.execute(
-            "UPDATE files SET status='deleting' "
+            "UPDATE files SET status='deleting', deletion_attempt_token=? "
             "WHERE file_id=? AND user_id=? AND status IN ('completed', 'deleting')",
-            (file_id, user_id),
+            (deletion_attempt_token, file_id, user_id),
         )
         self._conn.commit()
         return cursor.rowcount == 1
 
-    def restore_completed(self, file_id: str, user_id: str) -> bool:
-        cursor = self._conn.execute(
-            "UPDATE files SET status='completed' "
-            "WHERE file_id=? AND user_id=? AND status='deleting'",
-            (file_id, user_id),
-        )
-        self._conn.commit()
-        return cursor.rowcount == 1
-
-    def delete_by_ids(self, file_ids: list[str]) -> int:
+    def delete_by_ids(
+        self,
+        file_ids: list[str],
+        *,
+        user_id: Optional[str] = None,
+        deletion_attempt_tokens: Optional[dict[str, str]] = None,
+    ) -> int:
         if not file_ids:
             return 0
-        cur = self._conn.execute(
-            f"DELETE FROM files WHERE file_id IN ({','.join('?' * len(file_ids))})",
-            file_ids,
-        )
+        if user_id is None or deletion_attempt_tokens is None:
+            raise ValueError("deletion attempt fence is required")
+        if any(file_id not in deletion_attempt_tokens for file_id in file_ids):
+            raise ValueError("deletion attempt fence is required for every file")
+        removed = 0
+        for file_id in file_ids:
+            cursor = self._conn.execute(
+                "DELETE FROM files WHERE file_id=? AND user_id=? "
+                "AND status='deleting' AND deletion_attempt_token=?",
+                (file_id, user_id, deletion_attempt_tokens[file_id]),
+            )
+            removed += cursor.rowcount
         self._conn.commit()
-        return cur.rowcount
+        return removed
 
     # -- reads ------------------------------------------------------------
     def all(self) -> list[FileRecord]:
