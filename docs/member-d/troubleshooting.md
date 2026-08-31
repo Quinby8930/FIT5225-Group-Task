@@ -64,8 +64,10 @@ reserve 必须先于 complete 调用（状态机是 `reserve → processing → 
 
 **解决**：
 
-1. 由成员 A 用**最新**的 `infrastructure/member-d/dynamodb.yaml` 重新 `sam build` +
-   `sam deploy`（会创建 4 张表、SNS Topic、QueryFunction、策略和显式路由）。
+1. 先判断账号状态：全新账号且没有 Member D 在线资源时，才可用最新
+   `infrastructure/member-d/dynamodb.yaml` 正常 `sam build` + `sam deploy --guided`。
+   当前已有 Query Lambda/integration/routes 的账号必须先完整执行
+   [`aws-resource-adoption.md`](aws-resource-adoption.md)，不能直接重跑 SAM。
 2. Lambda 环境变量补齐：
 
    | 变量 | 值 |
@@ -159,3 +161,21 @@ SQLite 模式通常不会调用它。`requirements.txt` 仍包含 boto3，因为
 ```bash
 rm -f data/pacific_bioarchive.db && python seed.py
 ```
+
+---
+
+## 11. CloudFormation 为 `UPDATE_ROLLBACK_COMPLETE`，事件显示 `RouteKey ... already exists`
+
+**原因**：Member D 的在线 API Gateway route/integration 是在 stack 外创建的，而当前 SAM
+模板试图用相同 RouteKey 再创建一次。CloudFormation 回滚不会自动把现有资源纳管。
+
+**解决**：
+
+1. 不要再次运行相同的 `sam deploy` / `sam deploy --guided`；结果仍会冲突。
+2. 不要运行 `delete-route`、`delete-integration`、`delete-function` 或 `delete-stack`，也不要
+   在 Console 中手工删除在线资源。
+3. 按 [`aws-resource-adoption.md`](aws-resource-adoption.md) 从只读 audit 开始，先用
+   IMPORT 纳管现有 Lambda、integration 和 16 条 Member D 非 OPTIONS 路由。
+4. IMPORT 验收完成后再审查正常 UPDATE；只有得到第二次明确审批，才执行 UPDATE。
+
+全新账号没有这些在线资源，不需要 adoption，可按 `database-setup.md §2.1` 正常部署。

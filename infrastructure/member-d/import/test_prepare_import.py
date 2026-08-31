@@ -90,7 +90,9 @@ class FakeAwsCli:
         if "get-authorizers" in command:
             return {"Items": [valid_snapshot()["api"]["authorizer"]]}
         if "get-bucket-location" in command:
-            return {"LocationConstraint": None if self.bucket_state != "wrong-region" else "us-east-1"}
+            if self.bucket_state == "null-region":
+                return {"LocationConstraint": None}
+            return {"LocationConstraint": "ap-southeast-2" if self.bucket_state != "wrong-region" else "us-east-1"}
         if "list-buckets" in command:
             foreign = self.bucket_state in {"wrong-account", "authorized-cross-account"}
             return {"Buckets": [] if foreign else [{"Name": "private-artifacts"}, {"Name": "artifacts"}]}
@@ -144,6 +146,16 @@ def test_audit_refuses_root_before_writing_snapshot(tmp_path):
     assert not (tmp_path / "sanitized-snapshot.json").exists()
 
 
+@pytest.mark.parametrize("principal", [
+    "arn:aws:sts::111122223333:federated-user/fit5225-cli-deployer",
+    "arn:aws:sts::111122223333:assumed-role/team/fit5225-cli-deployer",
+])
+def test_collection_refuses_non_iam_deployer_principal(tmp_path, principal):
+    with pytest.raises(AdoptionError, match="exact IAM user"):
+        run_audit(FakeAwsCli(caller_arn=principal), fixture_config(tmp_path))
+    assert not (tmp_path / "sanitized-snapshot.json").exists()
+
+
 def test_generated_snapshot_contains_no_download_url_or_secret(tmp_path):
     path = run_audit(FakeAwsCli(), fixture_config(tmp_path))
     text = path.read_text(encoding="utf-8")
@@ -174,7 +186,7 @@ def test_backup_rejects_hash_mismatch_without_upload():
         backup_function_package(FakeAwsCli(), {"Location": "https://signed.invalid", "CodeSha256": "wrong"}, "private-artifacts", lambda _url, path: path.write_bytes(lambda_zip_bytes()))
 
 
-@pytest.mark.parametrize("bucket_state", ["public", "unencrypted", "wrong-account", "authorized-cross-account", "wrong-region", "unversioned", "unreadable"])
+@pytest.mark.parametrize("bucket_state", ["public", "unencrypted", "wrong-account", "authorized-cross-account", "wrong-region", "null-region", "unversioned", "unreadable"])
 def test_prepare_rejects_unsafe_artifact_bucket(bucket_state):
     with pytest.raises(AdoptionError, match="artifact bucket"):
         verify_artifact_bucket(FakeAwsCli(bucket_state=bucket_state), "artifacts", "ap-southeast-2")
@@ -275,6 +287,10 @@ def test_prepare_writes_only_sanitized_deterministic_artifacts(tmp_path, capsys)
         assert "X-Amz-Signature" not in text
     parameters = json.loads((tmp_path / "import-parameters.json").read_text(encoding="utf-8"))
     assert parameters == [{"ParameterKey": "InternalApiKey", "UsePreviousValue": True}]
+    template = json.loads((tmp_path / "import-template.json").read_text(encoding="utf-8"))
+    function_properties = template["Resources"]["QueryFunction"]["Properties"]
+    assert {"KmsKeyArn", "CodeSigningConfigArn", "ReservedConcurrentExecutions"}.isdisjoint(function_properties)
+    assert all(value is not None for value in function_properties.values())
     captured = capsys.readouterr()
     assert "internal-secret" not in captured.out + captured.err
     assert "X-Amz-Signature" not in captured.out + captured.err
@@ -472,7 +488,7 @@ def test_change_set_validator_uses_explicit_workdir_and_candidate_template(tmp_p
         def json(self, *args):
             calls.append(args)
             if args[:2] == ("cloudformation", "describe-change-set"):
-                return {"Changes": []}
+                return {"Changes": [], "ChangeSetType": expected_type}
             if args[:2] == ("cloudformation", "get-template"):
                 return {"TemplateBody": {"Resources": {}}}
             raise AssertionError(args)
@@ -487,3 +503,43 @@ def test_change_set_validator_uses_explicit_workdir_and_candidate_template(tmp_p
         assert ("--change-set-name", "candidate-update") == get_template[get_template.index("--change-set-name"):get_template.index("--change-set-name") + 2]
     aws_calls = [call for call in calls if isinstance(call, tuple) and len(call) > 1 and call[0] == "cloudformation"]
     assert not any("execute" in " ".join(call) or "create-change-set" in " ".join(call) for call in aws_calls)
+
+
+def test_change_set_validator_rejects_mismatched_type(tmp_path, monkeypatch):
+    import prepare_import
+    class ValidatorCli:
+        def json(self, *args):
+            return {"Changes": [], "ChangeSetType": "IMPORT"}
+    monkeypatch.setattr(prepare_import, "AwsCli", lambda: ValidatorCli())
+    with pytest.raises(AdoptionError, match="type does not match"):
+        prepare_import.main(["validate-change-set", "--region", "ap-southeast-2", "--stack", "stack", "--change-set", "candidate", "--expected-type", "UPDATE", "--workdir", str(tmp_path)])
+
+
+@pytest.mark.parametrize("mismatch", ["stack", "iam", "processed"])
+def test_collection_rejects_each_role_identity_mismatch(tmp_path, mismatch):
+    class RoleMismatchCli(FakeAwsCli):
+        def json(self, *args):
+            response = super().json(*args)
+            command = " ".join(args)
+            if mismatch == "stack" and "list-stack-resources" in command:
+                for item in response["StackResourceSummaries"]:
+                    if item["LogicalResourceId"] == "QueryLambdaRole":
+                        item["PhysicalResourceId"] = "wrong"
+            elif mismatch == "iam" and "get-role" in command:
+                response["Role"]["RoleName"] = "wrong"
+            elif mismatch == "processed" and "get-template" in command:
+                response["TemplateBody"]["Resources"]["QueryLambdaRole"]["Properties"]["RoleName"] = "wrong"
+            return response
+    with pytest.raises(AdoptionError, match="role|Role"):
+        collect_snapshot(RoleMismatchCli(), fixture_config(tmp_path))
+
+
+def test_collection_rejects_role_shape_when_processed_template_only_has_name(tmp_path):
+    class NameOnlyRoleCli(FakeAwsCli):
+        def json(self, *args):
+            response = super().json(*args)
+            if args[:2] == ("cloudformation", "get-template"):
+                response["TemplateBody"]["Resources"]["QueryLambdaRole"]["Properties"] = {"RoleName": "PacificBioArchive-QueryLambdaRole"}
+            return response
+    with pytest.raises(AdoptionError, match="live definition"):
+        collect_snapshot(NameOnlyRoleCli(), fixture_config(tmp_path))

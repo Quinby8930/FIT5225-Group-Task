@@ -182,10 +182,11 @@ def _semantic_tags(tags: Any) -> set[tuple[str, str]]:
 def collect_snapshot(cli: AwsCli, config: AuditConfig) -> dict[str, Any]:
     caller = cli.json("sts", "get-caller-identity", "--region", config.region)
     arn = caller.get("Arn") if isinstance(caller, Mapping) else None
-    if not isinstance(arn, str) or arn.endswith(":root"):
+    account = caller.get("Account") if isinstance(caller, Mapping) else None
+    if arn == f"arn:aws:iam::{account}:root":
         raise AdoptionError("Root caller is not permitted")
-    if not arn.endswith("user/fit5225-cli-deployer"):
-        raise AdoptionError("caller must be user/fit5225-cli-deployer")
+    if not isinstance(account, str) or arn != f"arn:aws:iam::{account}:user/fit5225-cli-deployer":
+        raise AdoptionError("caller must be exact IAM user/fit5225-cli-deployer")
     stacks = cli.json("cloudformation", "describe-stacks", "--stack-name", config.stack, "--region", config.region)
     stack_items = stacks.get("Stacks", []) if isinstance(stacks, Mapping) else []
     if len(stack_items) != 1:
@@ -239,37 +240,38 @@ def collect_snapshot(cli: AwsCli, config: AuditConfig) -> dict[str, Any]:
     # The signed deployment URL is deliberately held only in this local object.
     cli.json("lambda", "get-function", "--function-name", config.function, "--region", config.region, "--query", "Code")
     role_name = str(function.get("Role", "")).rsplit("/", 1)[-1]
+    if managed.get("QueryLambdaRole") != role_name:
+        raise AdoptionError("QueryLambdaRole physical identity differs from Lambda role")
     role_response = cli.json("iam", "get-role", "--role-name", role_name)
     role = role_response.get("Role") if isinstance(role_response, Mapping) else None
     if not isinstance(role, Mapping):
         raise AdoptionError("stack-owned role is unavailable")
+    if role.get("RoleName") != role_name:
+        raise AdoptionError("IAM role identity differs from Lambda role")
     attached = cli.json("iam", "list-attached-role-policies", "--role-name", role_name).get("AttachedPolicies", [])
     inline_names = cli.json("iam", "list-role-policies", "--role-name", role_name).get("PolicyNames", [])
     inline = {name: cli.json("iam", "get-role-policy", "--role-name", role_name, "--policy-name", name) for name in inline_names}
     tags = cli.json("iam", "list-role-tags", "--role-name", role_name).get("Tags", [])
-    role_view = {"path": role.get("Path"), "trust_policy": role.get("AssumeRolePolicyDocument"), "permissions_boundary": role.get("PermissionsBoundary"), "managed_policies": attached, "inline_policies": inline, "tags": tags}
+    role_view = {"role_name": role.get("RoleName"), "path": role.get("Path"), "trust_policy": role.get("AssumeRolePolicyDocument"), "permissions_boundary": role.get("PermissionsBoundary"), "managed_policies": attached, "inline_policies": inline, "tags": tags}
     processed_role = template.get("Resources", {}).get("QueryLambdaRole", {})
     processed_properties = processed_role.get("Properties", {}) if isinstance(processed_role, Mapping) else {}
-    if processed_properties:
-        checks = {
-            "Path": role_view["path"],
-            "AssumeRolePolicyDocument": role_view["trust_policy"],
-            "PermissionsBoundary": role_view["permissions_boundary"],
-        }
-        for key, live_value in checks.items():
-            if key == "Path" and key not in processed_properties and live_value == "/":
-                continue
-            if (key in processed_properties and _canonical(processed_properties[key]) != _canonical(live_value)) or (live_value not in (None, {}, [], "") and key not in processed_properties):
-                raise AdoptionError("QueryLambdaRole live definition differs from processed template")
-        live_arns = {policy.get("PolicyArn") for policy in attached}
-        if (live_arns and "ManagedPolicyArns" not in processed_properties) or ("ManagedPolicyArns" in processed_properties and {_canonical(value) for value in processed_properties["ManagedPolicyArns"]} != {_canonical(value) for value in live_arns}):
-                raise AdoptionError("QueryLambdaRole managed policies differ from processed template")
-        live_inline = {(name, _canonical(value.get("PolicyDocument"))) for name, value in inline.items()}
-        processed_inline = {(item.get("PolicyName"), _canonical(item.get("PolicyDocument"))) for item in processed_properties.get("Policies", [])}
-        if live_inline != processed_inline:
-            raise AdoptionError("QueryLambdaRole inline policies differ from processed template")
-        if _semantic_tags(processed_properties.get("Tags", [])) != _semantic_tags(tags):
-            raise AdoptionError("QueryLambdaRole tags differ from processed template")
+    if processed_properties.get("RoleName") != role_name:
+        raise AdoptionError("processed QueryLambdaRole identity differs from Lambda role")
+    checks = {"Path": role_view["path"], "AssumeRolePolicyDocument": role_view["trust_policy"], "PermissionsBoundary": role_view["permissions_boundary"]}
+    for key, live_value in checks.items():
+        if key == "Path" and key not in processed_properties and live_value == "/":
+            continue
+        if (key in processed_properties and _canonical(processed_properties[key]) != _canonical(live_value)) or (live_value not in (None, {}, [], "") and key not in processed_properties):
+            raise AdoptionError("QueryLambdaRole live definition differs from processed template")
+    live_arns = {policy.get("PolicyArn") for policy in attached}
+    if (live_arns and "ManagedPolicyArns" not in processed_properties) or ("ManagedPolicyArns" in processed_properties and {_canonical(value) for value in processed_properties["ManagedPolicyArns"]} != {_canonical(value) for value in live_arns}):
+        raise AdoptionError("QueryLambdaRole managed policies differ from processed template")
+    live_inline = {(name, _canonical(value.get("PolicyDocument"))) for name, value in inline.items()}
+    processed_inline = {(item.get("PolicyName"), _canonical(item.get("PolicyDocument"))) for item in processed_properties.get("Policies", [])}
+    if live_inline != processed_inline:
+        raise AdoptionError("QueryLambdaRole inline policies differ from processed template")
+    if _semantic_tags(processed_properties.get("Tags", [])) != _semantic_tags(tags):
+        raise AdoptionError("QueryLambdaRole tags differ from processed template")
     role_view["processed_definition"] = processed_role
     integration = _sanitized_api_gateway_resource(
         cli.json("apigatewayv2", "get-integration", "--api-id", config.api, "--integration-id", config.integration, "--region", config.region),
@@ -374,7 +376,8 @@ def verify_artifact_bucket(cli: AwsCli, artifact_bucket: str, region: str = "ap-
         if artifact_bucket not in {item.get("Name") for item in owned.get("Buckets", []) if isinstance(item, Mapping)}:
             raise AdoptionError("artifact bucket is unsafe")
         location = cli.json("s3api", "get-bucket-location", "--bucket", artifact_bucket)
-        expected_location = location.get("LocationConstraint") or "ap-southeast-2"
+        raw_location = location.get("LocationConstraint")
+        expected_location = "us-east-1" if raw_location is None else ("eu-west-1" if raw_location == "EU" else raw_location)
         public = cli.json("s3api", "get-public-access-block", "--bucket", artifact_bucket)["PublicAccessBlockConfiguration"]
         encryption = cli.json("s3api", "get-bucket-encryption", "--bucket", artifact_bucket)
         versioning = cli.json("s3api", "get-bucket-versioning", "--bucket", artifact_bucket)
@@ -461,6 +464,8 @@ def main(argv: list[str] | None = None) -> int:
         print("no CloudFormation change set was created")
         return 0
     change_set = cli.json("cloudformation", "describe-change-set", "--stack-name", args.stack, "--change-set-name", args.change_set, "--region", args.region)
+    if change_set.get("ChangeSetType") != args.expected_type:
+        raise AdoptionError("change set type does not match --expected-type")
     snapshot_path = Path(args.workdir) / "sanitized-snapshot.json"
     audited = json.loads(snapshot_path.read_text(encoding="utf-8"))
     if args.expected_type == "IMPORT":

@@ -4,8 +4,8 @@ This directory contains the Member D SAM stack: four DynamoDB tables, an SNS
 topic, the query Lambda, its least-privilege adapter policies, and explicit
 routes on the existing HTTP API.
 
-The query application code lives in `../../backend/lambdas/query/`; the operator
-setup guide (which single file to read) is in
+The query application code lives in `../../backend/lambdas/query/`; the deployment
+entry guide is in
 [`../../docs/member-d/database-setup.md`](../../docs/member-d/database-setup.md).
 
 ## Resources
@@ -26,7 +26,12 @@ setup guide (which single file to read) is in
   internal and OPTIONS routes. Internal routes remain protected by the shared
   application key. There is no `$default` route.
 
-## Deploy
+## Choose the deployment path
+
+### Fresh ordinary AWS account
+
+Use normal SAM deployment only when the account has no existing Member D query
+Lambda, integration, routes, or tables:
 
 ```bash
 sam build --template-file infrastructure/member-d/dynamodb.yaml
@@ -40,6 +45,20 @@ URL, and a non-empty shared internal key. `NotificationEmailEndpoint` may be
 left empty. For `StorageDeleteFunctionName`, Member A uses Member B's
 `StorageDeleteFunctionName` output, never its ARN output. Do not save a live
 key in Git or use a fake/default endpoint.
+
+### Existing project account
+
+The current account already has an unmanaged live Query Lambda, one integration,
+and sixteen Member D non-OPTIONS routes. Do **not** run `sam deploy --guided` in
+that account before adoption. Follow
+[`../../docs/member-d/aws-resource-adoption.md`](../../docs/member-d/aws-resource-adoption.md)
+to import exactly those eighteen resources, pass the first explicit execution
+approval, verify runtime continuity, then review and separately approve the
+normal UPDATE.
+
+If the stack is `UPDATE_ROLLBACK_COMPLETE` because a RouteKey already exists,
+never retry the same template and never delete the live route, integration,
+function, or stack to clear the conflict.
 
 ## Outputs
 

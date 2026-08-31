@@ -1,6 +1,7 @@
 # Member D 数据库部署指南（成员 A / AWS 操作）
 
-> **这是唯一要读的文件。** 看完照着做，就能把 Member D 的数据库在 AWS 上跑起来。
+> 这是 Member D 的部署入口。先判断是“全新账号”还是“当前已有在线资源的账号”；当前
+> 账号必须先读 [`aws-resource-adoption.md`](aws-resource-adoption.md)。
 > 代码在 `backend/lambdas/query/`，基础设施模板在 `infrastructure/member-d/dynamodb.yaml`。
 
 ---
@@ -33,10 +34,15 @@
 
 ---
 
-## 2. 构建并部署 SAM 堆栈
+## 2. 先选择正确的部署路径
 
 模板文件：**`infrastructure/member-d/dynamodb.yaml`**（CloudFormation，区域
 `ap-southeast-2`，和 Cognito / S3 / Lambda 同区）。
+
+### 2.1 全新普通 AWS 账号：正常 SAM 部署
+
+只有在目标账号中**不存在** Member D 的 Query Lambda、integration、16 条业务路由和
+对应 DynamoDB 资源时，才使用普通 SAM 部署：
 
 ```bash
 sam build --template-file infrastructure/member-d/dynamodb.yaml
@@ -46,6 +52,21 @@ sam deploy --guided
 在 guided prompts 中填入上表参数，并将区域设为 `ap-southeast-2`。密钥应通过团队
 认可的安全部署流程输入；不要把真实值写入 `samconfig.toml`、shell 脚本、文档、Git
 或群聊。C 只负责阿里云部署，不操作 AWS；B/D 不持有部署职责。
+
+### 2.2 当前账号：先纳管现有在线资源
+
+当前账号已经存在 `PacificBioArchive-QueryLambda`、单一 integration 和 16 条 Member D
+非 OPTIONS 路由，但这些资源不完全属于 `PacificBioArchive-Database` stack。这里禁止直接
+运行 `sam deploy --guided` 或重试失败的 UPDATE；必须完整执行
+[`aws-resource-adoption.md`](aws-resource-adoption.md)：
+
+1. 先创建并审查恰好 18 项的 IMPORT change set；
+2. 得到第一次明确批准后执行 IMPORT，并证明运行时未改变；
+3. 再创建并审查正常 UPDATE change set；
+4. 得到第二次明确批准后执行 UPDATE。
+
+如果 stack 是 `UPDATE_ROLLBACK_COMPLETE`，事件包含 `RouteKey ... already exists`，不要
+重试同一模板，也不要删除在线 route/integration/Lambda/stack。该状态正说明要先纳管资源。
 
 **会创建：**
 

@@ -7,6 +7,7 @@ from __future__ import annotations
 
 from copy import deepcopy
 from dataclasses import dataclass
+import re
 from typing import Any, Mapping
 
 
@@ -111,13 +112,20 @@ def _route_lookup(snapshot: Mapping[str, Any]) -> dict[str, Mapping[str, Any]]:
     return result
 
 
-def _validate_function(function: Mapping[str, Any]) -> None:
+def _role_name_from_arn(value: Any, account: str) -> str | None:
+    if not isinstance(value, str):
+        return None
+    match = re.fullmatch(rf"arn:aws:iam::{re.escape(account)}:role/(?:[^/]+/)*([^/]+)", value)
+    return match.group(1) if match else None
+
+
+def _validate_function(function: Mapping[str, Any], account: str) -> None:
     _require(function.get("FunctionName") == "PacificBioArchive-QueryLambda", "function name mismatch")
     _require(function.get("PackageType") == "Zip", "package type is not Zip")
     _require(function.get("Runtime") == "python3.12", "function runtime mismatch")
     _require(function.get("Handler") == "lambda_function.handler", "function handler mismatch")
     _require(function.get("Timeout") == 30 and function.get("MemorySize") == 512, "function sizing mismatch")
-    _require(function.get("Role", "").endswith(":role/PacificBioArchive-QueryLambdaRole"), "function role mismatch")
+    _require(_role_name_from_arn(function.get("Role"), account) == "PacificBioArchive-QueryLambdaRole", "function role mismatch")
     for key in _FUNCTION_PROPERTIES:
         _require(key in function, f"unsupported function configuration: {key}")
     _require(function.get("Architectures") == ["x86_64"], "function architectures mismatch")
@@ -145,9 +153,8 @@ def validate_snapshot(snapshot: Mapping[str, Any]) -> None:
     caller = snapshot.get("caller", {})
     arn = caller.get("Arn") if isinstance(caller, Mapping) else None
     account = caller.get("Account") if isinstance(caller, Mapping) else None
-    _require(isinstance(arn, str) and not arn.endswith(":root"), "Root caller is not permitted")
-    _require(arn.endswith("user/fit5225-cli-deployer"), "caller must be user/fit5225-cli-deployer")
-    _require(isinstance(account, str) and arn.split(":")[4] == account, "caller account does not match ARN")
+    _require(arn != f"arn:aws:iam::{account}:root", "Root caller is not permitted")
+    _require(isinstance(account, str) and isinstance(arn, str) and arn == f"arn:aws:iam::{account}:user/fit5225-cli-deployer", "caller must be exact IAM user/fit5225-cli-deployer")
     stack = snapshot.get("stack", {})
     _require(isinstance(stack, Mapping) and stack.get("status") in _STABLE_STACK_STATUSES, "stack is not in an import-safe stable state")
     managed = stack.get("managed")
@@ -155,6 +162,18 @@ def validate_snapshot(snapshot: Mapping[str, Any]) -> None:
     template = stack.get("template", {})
     resources = template.get("Resources", {}) if isinstance(template, Mapping) else {}
     _require(isinstance(resources, Mapping) and resources.get("QueryLambdaRole", {}).get("Type") == "AWS::IAM::Role", "stack-owned QueryLambdaRole missing")
+    role_name = "PacificBioArchive-QueryLambdaRole"
+    processed_role_name = resources["QueryLambdaRole"].get("Properties", {}).get("RoleName")
+    role_snapshot = snapshot.get("role", {})
+    role_snapshot_name = role_snapshot.get("role_name") if isinstance(role_snapshot, Mapping) else None
+    role_snapshot_processed_name = role_snapshot.get("processed_definition", {}).get("Properties", {}).get("RoleName") if isinstance(role_snapshot, Mapping) else None
+    _require(
+        managed.get("QueryLambdaRole") == role_name
+        and processed_role_name == role_name
+        and role_snapshot_name == role_name
+        and role_snapshot_processed_name == role_name,
+        "QueryLambdaRole role identity mismatch",
+    )
     schemas = snapshot.get("type_schemas")
     _require(isinstance(schemas, Mapping), "primary identifier schemas missing")
     for resource_type, expected in _REQUIRED_TYPE_SCHEMAS.items():
@@ -175,7 +194,7 @@ def validate_snapshot(snapshot: Mapping[str, Any]) -> None:
     _require(isinstance(uri, str) and uri.endswith(expected_suffix) and ":function:PacificBioArchive-QueryLambda:" not in uri, "integration URI is not bound to the unqualified Query Lambda account and region")
     function = snapshot.get("function", {})
     _require(isinstance(function, Mapping), "function missing")
-    _validate_function(function)
+    _validate_function(function, account)
     routes = _route_lookup(snapshot)
     for contract in ROUTES_BY_LOGICAL_ID.values():
         route = routes.get(contract.route_key)
@@ -214,7 +233,8 @@ def _function_properties(function: Mapping[str, Any], artifact: CodeArtifact) ->
         "Environment": {"Variables": {**dict(function["safe_environment"]), "INTERNAL_API_KEY": {"Ref": "InternalApiKey"}}},
     }
     for key in _FUNCTION_PROPERTIES[4:]:
-        properties[key] = deepcopy(function[key])
+        if function[key] is not None:
+            properties[key] = deepcopy(function[key])
     return properties
 
 
@@ -294,7 +314,7 @@ def validate_update_change_set(changes: list[Mapping[str, Any]], processed: Mapp
         resource_change = change.get("ResourceChange", {})
         logical_id = resource_change.get("LogicalResourceId")
         action = resource_change.get("Action")
-        if logical_id in protected and (action == "Remove" or resource_change.get("Replacement") not in ("False", False)):
+        if logical_id in protected and (action != "Modify" or resource_change.get("Replacement") not in ("False", False)):
             raise AdoptionError(f"replacement or removal of {logical_id} is forbidden")
         if logical_id == "QueryLambdaRole" and action not in (None, "Modify"):
             raise AdoptionError("QueryLambdaRole must be unchanged or an in-place modify")

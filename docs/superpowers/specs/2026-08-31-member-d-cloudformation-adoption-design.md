@@ -1,7 +1,7 @@
 # Member D Existing AWS Resource Adoption Design
 
-**Status:** Approved in chat on 2026-08-31  
-**Engineering mode:** Coursework  
+**Status:** Approved in chat on 2026-08-31
+**Engineering mode:** Coursework
 **Scope:** Adopt the existing Member D AWS resources into the existing
 `PacificBioArchive-Database` stack, then update that stack to the repository's
 current implementation without deleting live API routes.

@@ -48,7 +48,10 @@ def valid_snapshot():
                     "FilesTable": {"Type": "AWS::DynamoDB::Table"},
                     "SubscriptionsTable": {"Type": "AWS::DynamoDB::Table"},
                     "NotificationsTable": {"Type": "AWS::DynamoDB::Table"},
-                    "QueryLambdaRole": {"Type": "AWS::IAM::Role"},
+                    "QueryLambdaRole": {"Type": "AWS::IAM::Role", "Properties": {
+                        "RoleName": "PacificBioArchive-QueryLambdaRole",
+                        "AssumeRolePolicyDocument": {"Version": "2012-10-17", "Statement": []},
+                    }},
                 },
             },
             "managed": {
@@ -116,6 +119,17 @@ def valid_snapshot():
             "AWS::ApiGatewayV2::Route": ["/properties/ApiId", "/properties/RouteId"],
         },
         "owned_physical_ids": set(),
+        "role": {
+            "role_name": "PacificBioArchive-QueryLambdaRole",
+            "path": "/",
+            "trust_policy": {"Version": "2012-10-17", "Statement": []},
+            "permissions_boundary": None,
+            "managed_policies": [], "inline_policies": {}, "tags": [],
+            "processed_definition": {"Type": "AWS::IAM::Role", "Properties": {
+                "RoleName": "PacificBioArchive-QueryLambdaRole",
+                "AssumeRolePolicyDocument": {"Version": "2012-10-17", "Statement": []},
+            }},
+        },
     }
 
 
@@ -128,6 +142,30 @@ def test_root_caller_is_rejected():
     snapshot = valid_snapshot()
     snapshot["caller"]["Arn"] = "arn:aws:iam::111122223333:root"
     with pytest.raises(AdoptionError, match="Root"):
+        validate_snapshot(snapshot)
+
+
+@pytest.mark.parametrize("principal", [
+    "arn:aws:sts::111122223333:federated-user/fit5225-cli-deployer",
+    "arn:aws:sts::111122223333:assumed-role/team/fit5225-cli-deployer",
+])
+def test_non_iam_principal_cannot_impersonate_deployer(principal):
+    snapshot = valid_snapshot()
+    snapshot["caller"]["Arn"] = principal
+    with pytest.raises(AdoptionError, match="exact IAM user"):
+        validate_snapshot(snapshot)
+
+
+@pytest.mark.parametrize("mutation", [
+    lambda snapshot: snapshot["stack"]["managed"].update({"QueryLambdaRole": "wrong"}),
+    lambda snapshot: snapshot["stack"]["template"]["Resources"]["QueryLambdaRole"]["Properties"].update({"RoleName": "wrong"}),
+    lambda snapshot: snapshot["function"].update({"Role": "arn:aws:iam::999988887777:role/PacificBioArchive-QueryLambdaRole"}),
+    lambda snapshot: snapshot["role"].update({"role_name": "wrong"}),
+])
+def test_role_identity_mismatch_fails_pure_validation(mutation):
+    snapshot = valid_snapshot()
+    mutation(snapshot)
+    with pytest.raises(AdoptionError, match="role identity|function role"):
         validate_snapshot(snapshot)
 
 
@@ -199,6 +237,29 @@ def test_import_template_keeps_exact_live_lambda_rollback_package():
     assert function["Properties"]["Environment"]["Variables"]["INTERNAL_API_KEY"] == {"Ref": "InternalApiKey"}
 
 
+def test_import_template_omits_unset_optional_lambda_properties_but_keeps_set_values():
+    snapshot = valid_snapshot()
+    template = build_import_template(snapshot, CodeArtifact("private-artifacts", "backups/code.zip", "version-1"))
+    properties = template["Resources"]["QueryFunction"]["Properties"]
+    assert {"KmsKeyArn", "CodeSigningConfigArn", "ReservedConcurrentExecutions"}.isdisjoint(properties)
+    assert properties["RuntimeManagementConfig"] == {"UpdateRuntimeOn": "Auto"}
+
+
+def test_import_template_preserves_explicit_optional_lambda_values_and_role_path():
+    snapshot = valid_snapshot()
+    snapshot["function"]["Role"] = "arn:aws:iam::111122223333:role/service/team/PacificBioArchive-QueryLambdaRole"
+    snapshot["function"].update({
+        "KmsKeyArn": "arn:aws:kms:ap-southeast-2:111122223333:key/example",
+        "CodeSigningConfigArn": "arn:aws:lambda:ap-southeast-2:111122223333:code-signing-config:csc-example",
+        "ReservedConcurrentExecutions": 0,
+    })
+    template = build_import_template(snapshot, CodeArtifact("private-artifacts", "backups/code.zip", "version-1"))
+    properties = template["Resources"]["QueryFunction"]["Properties"]
+    assert properties["KmsKeyArn"].endswith("key/example")
+    assert properties["CodeSigningConfigArn"].endswith("csc-example")
+    assert properties["ReservedConcurrentExecutions"] == 0
+
+
 def test_import_parameters_reuse_existing_internal_key_without_reading_it():
     parameters = build_parameters_to_reuse(valid_snapshot())
     assert {"ParameterKey": "InternalApiKey", "UsePreviousValue": True} in parameters
@@ -230,6 +291,14 @@ def test_update_rejects_conditional_or_missing_protected_resource(replacement):
         processed["Resources"].pop("AuthTestRoute")
     changes = [] if replacement is None else [{"ResourceChange": {"Action": "Modify", "LogicalResourceId": "QueryFunction", "Replacement": replacement}}]
     with pytest.raises(AdoptionError):
+        validate_update_change_set(changes, processed)
+
+
+@pytest.mark.parametrize("action", ["Add", "Remove", "Import"])
+def test_update_rejects_non_modify_action_for_protected_resource(action):
+    processed = _update_processed({"Type": "AWS::IAM::Role"})
+    changes = [{"ResourceChange": {"Action": action, "LogicalResourceId": "QueryFunction", "Replacement": "False"}}]
+    with pytest.raises(AdoptionError, match="forbidden"):
         validate_update_change_set(changes, processed)
 
 

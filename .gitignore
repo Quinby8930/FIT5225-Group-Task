@@ -16,3 +16,4 @@ __pycache__/
 *.zip
 *.rar
 .superpowers/
+infrastructure/member-d/import/.work/
