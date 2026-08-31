@@ -3,6 +3,9 @@ from __future__ import annotations
 from pathlib import Path
 
 
+GENUS_SHORT_NAME_OVERRIDES = {"rattus": "rat"}
+
+
 class SpeciesMapper:
     """Normalize model scientific labels to the team's short wire tags."""
 
@@ -21,9 +24,15 @@ class SpeciesMapper:
             genus = columns[4].strip()
             species = columns[5].strip()
             common_name = columns[6].strip()
-            if not genus or not species or not common_name:
+            if not genus:
                 continue
-            scientific_to_team[f"{genus}_{species}"] = common_name.split()[-1].casefold()
+            scientific = f"{genus}_{species}" if species else genus
+            short_name = (
+                common_name.split()[-1].casefold()
+                if common_name
+                else GENUS_SHORT_NAME_OVERRIDES.get(genus.casefold(), genus.casefold())
+            )
+            scientific_to_team[scientific] = short_name
         return cls(scientific_to_team)
 
     def normalize(self, label: str) -> str:

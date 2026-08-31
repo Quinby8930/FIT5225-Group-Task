@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import io
 import importlib
 import os
 import threading
@@ -61,6 +62,15 @@ DEFAULT_CLASSES = (
     "Uromys_caudimaculatus",
 )
 
+# The course reference pipeline first normalizes each MegaDetector animal crop
+# to this size before the classifier's 480 x 480 input transform.
+OFFICIAL_CROP_SIZE = (600, 600)
+CLASSIFIER_INPUT_SIZE = (480, 480)
+
+
+class UnsupportedSourceFormatError(ValueError):
+    """Raised when the reference encode/reopen step cannot preserve a format."""
+
 
 def _load_classes(path: Path) -> tuple[str, ...]:
     if not path.exists():
@@ -85,6 +95,33 @@ def _import_torch() -> Any:
         ) from exc
 
 
+def _build_classifier_transform(transforms: Any) -> Any:
+    return transforms.Compose(
+        [
+            transforms.Resize(CLASSIFIER_INPUT_SIZE),
+            transforms.ToTensor(),
+        ]
+    )
+
+
+def _roundtrip_crop(crop: Image.Image, source_format: str) -> Image.Image:
+    """Reproduce the course script's save/reopen step without using disk."""
+    image_format = source_format.upper()
+    if image_format == "JPG":
+        image_format = "JPEG"
+    with io.BytesIO() as buffer:
+        try:
+            crop.save(buffer, format=image_format)
+        except (KeyError, OSError, ValueError) as exc:
+            raise UnsupportedSourceFormatError(
+                f"source image format {source_format!r} cannot be reproduced"
+            ) from exc
+        buffer.seek(0)
+        with Image.open(buffer) as encoded:
+            encoded.load()
+            return encoded.convert("RGB")
+
+
 class SpeciesNetBackend:
     """Adapter for the supplied fine-tuned PyTorch classifier.
 
@@ -98,11 +135,13 @@ class SpeciesNetBackend:
         detector_model_path: Path,
         labels_path: Path,
         model_version: str,
-        confidence_threshold: float,
+        detection_threshold: float,
+        species_confidence_threshold: float,
     ) -> None:
         self._torch = _import_torch()
         self.model_version = model_version
-        self.confidence_threshold = confidence_threshold
+        self.detection_threshold = detection_threshold
+        self.species_confidence_threshold = species_confidence_threshold
         self.classes = _load_classes(labels_path)
         self.detector_mode = os.getenv("ANIMAL_DETECTOR", "megadetector").lower()
         self.detector = None
@@ -150,12 +189,7 @@ class SpeciesNetBackend:
             )
 
         transforms = importlib.import_module("torchvision.transforms")
-        self.transform = transforms.Compose(
-            [
-                transforms.Resize((480, 480)),
-                transforms.ToTensor(),
-            ]
-        )
+        self.transform = _build_classifier_transform(transforms)
 
     def predict_image(self, image: Image.Image) -> list[Prediction]:
         with self._inference_lock:
@@ -187,14 +221,14 @@ class SpeciesNetBackend:
                 confidence=float(probabilities[int(index)]),
             )
             for index in ranked
-            if float(probabilities[int(index)]) >= self.confidence_threshold
+            if float(probabilities[int(index)]) >= self.species_confidence_threshold
         ]
 
     def _detect_animal_crops(self, image: Image.Image) -> list[Image.Image]:
         result = self.detector.generate_detections_one_image(
             image.convert("RGB"),
             image_id="in-memory",
-            detection_threshold=self.confidence_threshold,
+            detection_threshold=self.detection_threshold,
         )
         if result.get("failure"):
             raise RuntimeError(result["failure"])
@@ -202,12 +236,13 @@ class SpeciesNetBackend:
         if not detections:
             return []
         width, height = image.size
+        source_format = str(image.info.get("source_format", "PNG"))
         crops: list[Image.Image] = []
         for detection in detections:
             if detection.get("category") != "1":
                 continue
             confidence = float(detection.get("conf", 0.0))
-            if confidence < self.confidence_threshold:
+            if confidence < self.detection_threshold:
                 continue
             x, y, w, h = detection["bbox"]
             left = max(0, int(x * width))
@@ -215,5 +250,10 @@ class SpeciesNetBackend:
             right = min(width, int((x + w) * width))
             bottom = min(height, int((y + h) * height))
             if right > left and bottom > top:
-                crops.append(image.crop((left, top, right, bottom)))
+                crop = image.crop((left, top, right, bottom))
+                resized = crop.resize(
+                    OFFICIAL_CROP_SIZE,
+                    resample=Image.Resampling.BILINEAR,
+                )
+                crops.append(_roundtrip_crop(resized, source_format))
         return crops

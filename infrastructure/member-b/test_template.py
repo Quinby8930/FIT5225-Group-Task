@@ -226,6 +226,45 @@ def test_function_runtime_and_handler_contracts(template):
     assert asset_urls["Handler"] == "index.handler"
 
 
+def test_media_processing_async_failures_are_retained_for_manual_replay(template):
+    resources = template["Resources"]
+    failure_queue = resources["MediaProcessingFailureQueue"]
+    assert failure_queue["Type"] == "AWS::SQS::Queue"
+
+    processing = _properties(template, "MediaProcessingFunction")
+    assert processing["EventInvokeConfig"] == {
+        "MaximumRetryAttempts": 2,
+        "MaximumEventAgeInSeconds": 21600,
+        "DestinationConfig": {
+            "OnFailure": {
+                "Type": "SQS",
+                "Destination": {"Fn::GetAtt": "MediaProcessingFailureQueue.Arn"},
+            }
+        },
+    }
+
+    sqs_statements = [
+        statement
+        for policy in processing["Policies"]
+        if isinstance(policy, dict)
+        for statement in policy.get("Statement", [])
+        if "sqs:SendMessage" in _as_list(statement["Action"])
+    ]
+    assert sqs_statements == [
+        {
+            "Effect": "Allow",
+            "Action": "sqs:SendMessage",
+            "Resource": {"Fn::GetAtt": "MediaProcessingFailureQueue.Arn"},
+        }
+    ]
+    assert not any(
+        resource["Type"] == "AWS::Lambda::EventSourceMapping"
+        and resource.get("Properties", {}).get("EventSourceArn")
+        == {"Fn::GetAtt": "MediaProcessingFailureQueue.Arn"}
+        for resource in resources.values()
+    )
+
+
 def test_function_environment_names_match_production_handlers(template):
     expected = {
         "UploadFunction": {

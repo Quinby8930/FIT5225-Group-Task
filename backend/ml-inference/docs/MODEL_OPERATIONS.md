@@ -22,6 +22,21 @@ cropping. The B media service remains responsible for S3 access and video
 frame extraction. Set `ANIMAL_DETECTOR=full_image` only for controlled
 experiments with an already-cropped animal image.
 
+For a detected animal, the adapter mirrors the course `batch.py`: crop the
+normalized MegaDetector box, resize it to 600 x 600 with bilinear sampling,
+encode/decode it in the source image format, and then apply the classifier's
+480 x 480 tensor transform. The encode/decode is performed in memory, so no
+user media is persisted on the Alibaba runtime filesystem.
+
+Keep the two confidence controls independent:
+
+- `DETECTION_THRESHOLD=0.05` follows the course MegaDetector configuration;
+- `SPECIES_CONFIDENCE_THRESHOLD=0.45` rejects uncertain classifier results
+  without changing which animal boxes are considered.
+
+`CONFIDENCE_THRESHOLD` is accepted only as a legacy fallback for the detector
+threshold. It never changes the classifier threshold.
+
 ## Model upgrade
 
 To roll out a new model without changing B's source code:

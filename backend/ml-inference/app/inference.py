@@ -7,7 +7,7 @@ from collections import Counter
 from dataclasses import dataclass
 from typing import Callable
 
-from PIL import Image, UnidentifiedImageError
+from PIL import Image, ImageOps, UnidentifiedImageError
 
 from .backends.base import InferenceBackend, Prediction
 from .schemas import InferenceRequest
@@ -56,8 +56,12 @@ def _open_image(raw: bytes, max_image_pixels: int) -> Image.Image:
             width, height = image.size
             if width * height > max_image_pixels:
                 raise InferenceInputError("source image exceeds the pixel limit")
-            image.load()
-            return image.convert("RGB")
+            source_format = (getattr(image, "format", None) or "PNG").upper()
+            oriented = ImageOps.exif_transpose(image)
+            oriented.load()
+            converted = oriented.convert("RGB")
+            converted.info["source_format"] = source_format
+            return converted
     except (Image.DecompressionBombError, UnidentifiedImageError, OSError) as exc:
         raise InferenceInputError("source is not a valid supported image") from exc
 

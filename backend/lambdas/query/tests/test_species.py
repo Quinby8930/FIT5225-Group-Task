@@ -26,5 +26,14 @@ def test_case_insensitive():
     assert _mapper().common_name("Casuarius_casuarius") == "cassowary"
 
 
+def test_cat_mouse_and_rat_labels_do_not_collide():
+    mapper = _mapper()
+    assert mapper.common_name("Felis_catus") == "cat"
+    assert mapper.common_name("Mus_musculus") == "mouse"
+    assert mapper.common_name("Rattus") == "rat"
+    assert mapper.common_name("Rattus_fuscipes") == "rat"
+    assert mapper.common_name("Rattus_rattus") == "rat"
+
+
 def test_unknown_class_passes_through():
     assert _mapper().common_name("Madeup_species") == "Madeup_species"

@@ -250,7 +250,8 @@ def require_internal_api_key(
             },
         )
     if x_internal_api_key is None or not hmac.compare_digest(
-        x_internal_api_key, settings_.internal_api_key
+        x_internal_api_key.encode("utf-8"),
+        settings_.internal_api_key.encode("utf-8"),
     ):
         raise HTTPException(
             status_code=401,

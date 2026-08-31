@@ -24,12 +24,22 @@ export default function MediaCard({ item, assetStates, selected, onToggle, onOpe
   const state = assetStates[previewKey];
   const url = canRenderPreview ? usableAssetUrl(state) : null;
   const shortId = item.file_id.slice(0, 8);
+  const canOpenOriginal = canOpenFullImage(item);
 
   return (
     <article className="media-card">
       <div className="media-preview">
         {url && item.file_type === "image" && (
-          <img src={url} alt={`Archive image ${shortId}`} loading="lazy" />
+          canOpenOriginal ? (
+            <button
+              type="button"
+              className="media-preview-action"
+              onClick={() => onOpenOriginal(item)}
+              aria-label={`Open full-size image ${shortId} in a new tab`}
+            >
+              <img src={url} alt={`Archive image ${shortId}`} loading="lazy" />
+            </button>
+          ) : <img src={url} alt={`Archive image ${shortId}`} loading="lazy" />
         )}
         {url && item.file_type === "video" && (
           <video
@@ -75,7 +85,7 @@ export default function MediaCard({ item, assetStates, selected, onToggle, onOpe
               {item.file_type === "video" ? "Open video" : "Open preview"}
             </a>
           )}
-          {canOpenFullImage(item) && (
+          {canOpenOriginal && (
             <button
               type="button"
               className="link-button"

@@ -33,6 +33,8 @@ RUN pip install --no-cache-dir --prefer-binary -r requirements-model-runtime.txt
 COPY app ./app
 COPY config ./config
 COPY models ./models
+COPY scripts/validate_model_weights.py /tmp/validate_model_weights.py
+RUN python /tmp/validate_model_weights.py /app/models && rm /tmp/validate_model_weights.py
 
 EXPOSE 9000
 

@@ -139,11 +139,17 @@ export default function ExplorePanel({
           <button type="submit" className="btn btn-secondary" disabled={!queryFile || loading}>Match image</button>
         </form>
         <details className="advanced-lookup">
-          <summary>Advanced lookup (thumbnail key)</summary>
+          <summary>Advanced thumbnail lookup</summary>
           <form className="stack" onSubmit={submitThumbnail}>
-            <Field label="Thumbnail key">
-              <input value={thumbnailKey} onChange={(event) => setThumbnailKey(event.target.value)} />
+            <Field label="Thumbnail key or signed thumbnail URL">
+              <input
+                value={thumbnailKey}
+                onChange={(event) => setThumbnailKey(event.target.value)}
+                placeholder="thumbnails/... or https://…"
+                aria-describedby="thumbnail-lookup-help"
+              />
             </Field>
+            <p id="thumbnail-lookup-help" className="field-help">Use a thumbnail object key or a trusted signed HTTPS thumbnail URL.</p>
             <button type="submit" className="btn btn-secondary" disabled={!thumbnailKey.trim() || loading}>Find original</button>
           </form>
         </details>

@@ -17,7 +17,7 @@ from urllib.parse import urlparse
 from PIL import UnidentifiedImageError
 
 from .backends.mock import MockInferenceBackend
-from .backends.speciesnet import SpeciesNetBackend
+from .backends.speciesnet import SpeciesNetBackend, UnsupportedSourceFormatError
 from .config import Settings
 from .inference import (
     InferenceInputError,
@@ -60,7 +60,8 @@ def build_backend(settings: Settings):
             detector_model_path=settings.detector_model_path,
             labels_path=settings.labels_path,
             model_version=settings.model_version,
-            confidence_threshold=settings.confidence_threshold,
+            detection_threshold=settings.detection_threshold,
+            species_confidence_threshold=settings.species_confidence_threshold,
         )
     raise ValueError("INFERENCE_BACKEND must be either 'speciesnet' or 'mock'")
 
@@ -190,7 +191,7 @@ class InferenceHandler(BaseHTTPRequestHandler):
                 return None
             return HTTPStatus.SERVICE_UNAVAILABLE
         provided = self.headers.get("X-Internal-Api-Key", "")
-        if hmac.compare_digest(provided, expected):
+        if hmac.compare_digest(provided.encode("utf-8"), expected.encode("utf-8")):
             return None
         return HTTPStatus.UNAUTHORIZED
 
@@ -260,7 +261,11 @@ class InferenceHandler(BaseHTTPRequestHandler):
         except RequestValidationError as exc:
             response = {"error": "validation_error", "detail": str(exc)}
             status = HTTPStatus.UNPROCESSABLE_ENTITY
-        except (InferenceInputError, UnidentifiedImageError) as exc:
+        except (
+            InferenceInputError,
+            UnidentifiedImageError,
+            UnsupportedSourceFormatError,
+        ) as exc:
             response = {"error": "invalid_source", "detail": str(exc)}
             status = HTTPStatus.UNPROCESSABLE_ENTITY
         except SourceUnavailableError as exc:

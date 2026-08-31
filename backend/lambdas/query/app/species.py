@@ -22,6 +22,9 @@ from functools import lru_cache
 from pathlib import Path
 
 
+GENUS_SHORT_NAME_OVERRIDES = {"rattus": "rat"}
+
+
 def _load_mapping(labels_path: Path) -> dict[str, str]:
     mapping: dict[str, str] = {}
     for line in labels_path.read_text(encoding="utf-8").splitlines():
@@ -35,7 +38,7 @@ def _load_mapping(labels_path: Path) -> dict[str, str]:
         species = parts[5].strip().lower()
         common = parts[6].strip()
         key = f"{genus}_{species}" if species else genus
-        full = common or genus  # fall back to genus when common is empty
+        full = common or GENUS_SHORT_NAME_OVERRIDES.get(genus, genus)
         mapping[key] = full.split()[-1]  # team short name = last word
     return mapping
 

@@ -84,6 +84,12 @@ and 6 of `labels.txt` to the final word in column 7, case-insensitively (for
 example `Canis_familiaris` and `Canis_dingo` both become `dingo`). Labels not
 present in the file pass through unchanged.
 
+The genus-only model class `Rattus` is normalized to `rat`, matching the two
+specific `Rattus` classes and the database query vocabulary. MegaDetector uses
+the course `0.05` animal threshold. Species classification has a separate
+`0.45` minimum confidence; a crop below it is omitted from both `tags` and
+`detections` instead of being stored as a definite species.
+
 ## Runtime limits
 
 - The JSON request body is at most 26,214,400 bytes.

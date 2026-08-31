@@ -92,7 +92,56 @@ def _file_repo(table: _PagedTable) -> DynamoDBRepository:
     return repository
 
 
-def test_repository_reuses_the_resources_low_level_client_for_transactions(monkeypatch):
+def test_repository_transactions_preserve_manual_attribute_values_on_the_wire(
+    monkeypatch,
+):
+    """Typed transaction payloads must bypass the resource serializer."""
+    pytest.importorskip("boto3")
+
+    class _WireCaptured(Exception):
+        pass
+
+    monkeypatch.setenv("AWS_ACCESS_KEY_ID", "testing")
+    monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "testing")
+    monkeypatch.setenv("AWS_EC2_METADATA_DISABLED", "true")
+
+    repository = DynamoDBRepository(
+        "files", region="us-east-1", reservations_table="reservations"
+    )
+    captured = {}
+
+    def capture(request, **_kwargs):
+        captured["body"] = json.loads(request.body)
+        raise _WireCaptured()
+
+    repository._client.meta.events.register_first(
+        "before-send.dynamodb.TransactWriteItems", capture
+    )
+    repository.find_by_user_checksum = lambda *_args: None
+    record = FileRecord(
+        file_id="f1",
+        user_id="u1",
+        file_type="image",
+        object_key="originals/u1/f1.jpg",
+        checksum="sha256:shared",
+        status="pending_upload",
+    )
+
+    with pytest.raises(_WireCaptured):
+        repository.reserve(record)
+
+    assert captured["body"]["TransactItems"][0]["Put"]["Item"] == {
+        "reservation_key": {
+            "S": DynamoDBRepository._reservation_key("u1", "sha256:shared")
+        },
+        "file_id": {"S": "f1"},
+        "user_id": {"S": "u1"},
+        "checksum": {"S": "sha256:shared"},
+    }
+    assert repository._client is not repository._table.meta.client
+
+
+def test_repository_constructs_a_standalone_transaction_client(monkeypatch):
     resource_client = object()
     files = _PagedTable()
     files.name = "files"
@@ -115,8 +164,8 @@ def test_repository_reuses_the_resources_low_level_client_for_transactions(monke
 
     repository = DynamoDBRepository("files", reservations_table="reservations")
 
-    assert repository._client is resource_client
-    assert client_calls == []
+    assert repository._client is not resource_client
+    assert client_calls == [("dynamodb", {"region_name": "ap-southeast-2"})]
 
 
 def test_botocore_serializes_manual_attribute_values_exactly_once():

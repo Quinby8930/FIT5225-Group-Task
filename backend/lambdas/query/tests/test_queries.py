@@ -1817,6 +1817,31 @@ class TestMetadataEndpoints:
             assert detail["code"] == expected_code
             assert isinstance(detail["message"], str) and detail["message"]
 
+    def test_internal_route_rejects_wrong_key_when_configured_key_is_non_ascii(
+        self, client
+    ):
+        main.app.dependency_overrides[main.get_settings] = lambda: SimpleNamespace(
+            internal_api_key="秘密"
+        )
+
+        response = client.post(
+            "/internal/uploads/reserve",
+            headers={"X-Internal-Api-Key": "wrong-key"},
+            json={
+                "file_id": "auth-unicode",
+                "user_id": "u1",
+                "checksum": "sha256:auth-unicode",
+                "filename": "a.jpg",
+                "file_type": "image",
+                "content_type": "image/jpeg",
+                "size_bytes": 100,
+                "object_key": "originals/auth-unicode",
+            },
+        )
+
+        assert response.status_code == 401
+        assert response.json()["detail"]["code"] == "INVALID_INTERNAL_API_KEY"
+
     @pytest.mark.parametrize(
         ("route", "payload"),
         [

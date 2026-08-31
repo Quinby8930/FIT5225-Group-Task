@@ -533,6 +533,7 @@ input[type="checkbox"] { min-height: 0; width: 17px; height: 17px; accent-color:
 .advanced-lookup { border-top: 1px solid var(--hair); margin-top: 18px; padding-top: 6px; }
 .advanced-lookup summary { color: var(--pine); cursor: pointer; font-weight: 600; min-height: 44px; padding: 10px 0; }
 .advanced-lookup form { margin-top: 4px; }
+.advanced-lookup .field-help { color: var(--ink2); font-size: 0.82rem; margin: -8px 0 0; }
 
 .results-panel { min-height: 320px; }
 
@@ -642,7 +643,17 @@ input[type="checkbox"] { min-height: 0; width: 17px; height: 17px; accent-color:
   text-align: center;
 }
 
-.media-preview img, .media-preview video { height: 100%; object-fit: cover; width: 100%; }
+.media-preview img, .media-preview video { height: 100%; object-fit: contain; width: 100%; }
+
+.media-preview-action {
+  background: transparent;
+  border: 0;
+  cursor: pointer;
+  display: block;
+  height: 100%;
+  padding: 0;
+  width: 100%;
+}
 
 .media-card-body { display: grid; gap: 10px; padding: 14px 16px 16px; }
 
@@ -689,7 +700,7 @@ input[type="checkbox"] { min-height: 0; width: 17px; height: 17px; accent-color:
 .upload-guide > p { font-size: 0.82rem; margin: 12px 0 0; }
 
 .local-preview { background: var(--mat); max-height: 320px; overflow: hidden; }
-.local-preview img, .local-preview video { height: 100%; max-height: 320px; object-fit: cover; width: 100%; }
+.local-preview img, .local-preview video { height: 100%; max-height: 320px; object-fit: contain; width: 100%; }
 
 .metadata-grid, .upload-receipt {
   display: grid;

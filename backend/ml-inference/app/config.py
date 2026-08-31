@@ -16,6 +16,24 @@ def _positive_int(name: str, default: int) -> int:
     return value
 
 
+def _probability(
+    name: str,
+    default: float,
+    *,
+    fallback_name: str | None = None,
+) -> float:
+    raw = os.getenv(name)
+    if raw is None and fallback_name is not None:
+        raw = os.getenv(fallback_name)
+    try:
+        value = float(str(default) if raw is None else raw)
+    except ValueError as exc:
+        raise ValueError(f"{name} must be a number") from exc
+    if not 0.0 <= value <= 1.0:
+        raise ValueError(f"{name} must be between 0 and 1")
+    return value
+
+
 def _source_hosts() -> tuple[str, ...]:
     raw = os.getenv(
         "ALLOWED_SOURCE_HOSTS",
@@ -45,7 +63,8 @@ class Settings:
     max_image_bytes: int
     max_detections: int
     request_timeout_seconds: int
-    confidence_threshold: float
+    detection_threshold: float
+    species_confidence_threshold: float
     allow_remote_urls: bool
     remote_url_timeout_seconds: int
     allow_unauthenticated_inference: bool = False
@@ -59,9 +78,15 @@ class Settings:
     def from_env(cls) -> "Settings":
         root = Path(os.getenv("ML_SERVICE_ROOT", Path(__file__).resolve().parents[1]))
         model_dir = Path(os.getenv("MODEL_DIR", root / "models"))
-        confidence = float(os.getenv("CONFIDENCE_THRESHOLD", "0.05"))
-        if not 0.0 <= confidence <= 1.0:
-            raise ValueError("CONFIDENCE_THRESHOLD must be between 0 and 1")
+        detection_threshold = _probability(
+            "DETECTION_THRESHOLD",
+            0.05,
+            fallback_name="CONFIDENCE_THRESHOLD",
+        )
+        species_confidence_threshold = _probability(
+            "SPECIES_CONFIDENCE_THRESHOLD",
+            0.45,
+        )
 
         key = os.getenv("INTERNAL_API_KEY")
         if key == "":
@@ -81,7 +106,8 @@ class Settings:
             max_image_pixels=_positive_int("MAX_IMAGE_PIXELS", 40_000_000),
             max_detections=_positive_int("MAX_DETECTIONS", 1000),
             request_timeout_seconds=_positive_int("INFER_TIMEOUT_SECONDS", 45),
-            confidence_threshold=confidence,
+            detection_threshold=detection_threshold,
+            species_confidence_threshold=species_confidence_threshold,
             allow_remote_urls=os.getenv("ALLOW_REMOTE_URLS", "true").lower()
             in {"1", "true", "yes"},
             remote_url_timeout_seconds=_positive_int("REMOTE_URL_TIMEOUT_SECONDS", 20),

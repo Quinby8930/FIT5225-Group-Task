@@ -16,6 +16,8 @@ The service provides:
 - `/health` and `/ready` deployment probes;
 - configurable model path/version so model upgrades do not require caller code changes;
 - MegaDetector animal detection followed by fine-tuned SpeciesNet classification;
+- separate animal-detection and species-confidence thresholds so tuning one stage
+  cannot silently change the other;
 - Docker packaging, tests, API contract, handoff notes, and demo checklist.
 
 The AWS media member owns S3 upload and video frame extraction. The database
@@ -47,6 +49,13 @@ curl -sS http://127.0.0.1:8080/health
 For real model inference, install `requirements.txt` and then
 `requirements-model-runtime.txt`, place the model files in `models/`, and run
 with `INFERENCE_BACKEND=speciesnet`.
+
+The production adapter keeps the course MegaDetector threshold at `0.05` and
+uses `SPECIES_CONFIDENCE_THRESHOLD=0.45` for the classifier. The latter is the
+largest 0.05 increment that remains below the lowest correct confidence in the
+course test set after reproducing the course crop-to-600, source-format
+save/reopen, then resize-to-480 pipeline. A crop below that threshold produces
+no definite species tag; the model weights are not altered.
 
 The runtime requirements explicitly pin `onnx` and `onnx2torch` because the
 supplied `model.pt` pickle imports `onnx2torch` during `torch.load`.

@@ -90,7 +90,7 @@ class DynamoDBRepository(FileRepository):
         self._table = resource.Table(table_name)
         self._reservations = resource.Table(reservations_table)
         self._reservations_table_name = reservations_table
-        self._client = resource.meta.client
+        self._client = boto3.client("dynamodb", region_name=region)
 
     @staticmethod
     def _reservation_key(user_id: str, checksum: str) -> str:

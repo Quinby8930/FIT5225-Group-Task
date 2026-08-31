@@ -128,6 +128,13 @@ Resources:
       MemorySize: 3008
       EphemeralStorage:
         Size: 4096
+      EventInvokeConfig:
+        MaximumRetryAttempts: 2
+        MaximumEventAgeInSeconds: 21600
+        DestinationConfig:
+          OnFailure:
+            Type: SQS
+            Destination: !GetAtt MediaProcessingFailureQueue.Arn
       Layers:
         - !Ref FfmpegLayerArn
       Environment:
@@ -156,6 +163,15 @@ Resources:
               Resource:
                 - !Sub arn:${AWS::Partition}:s3:::pacificbioarchive-media-${AWS::AccountId}-${AWS::Region}/processing/*
                 - !Sub arn:${AWS::Partition}:s3:::pacificbioarchive-media-${AWS::AccountId}-${AWS::Region}/thumbnails/*
+            - Effect: Allow
+              Action: sqs:SendMessage
+              Resource: !GetAtt MediaProcessingFailureQueue.Arn
+
+  MediaProcessingFailureQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      MessageRetentionPeriod: 1209600
+      SqsManagedSseEnabled: true
 
   MediaProcessingInvokePermission:
     Type: AWS::Lambda::Permission
