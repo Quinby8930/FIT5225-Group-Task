@@ -1523,8 +1523,9 @@ def _parser() -> argparse.ArgumentParser:
     policy_validator.add_argument("--function", required=True)
     policy_validator.add_argument("--workdir", default=".work")
     policy_validator.add_argument(
-        "--expect-legacy",
-        choices=("present", "absent"),
+        "--removed-legacy-count",
+        type=int,
+        choices=range(4),
         required=True,
     )
     policy_validator.add_argument("--emit-revision", action="store_true")
@@ -1601,22 +1602,25 @@ def main(argv: list[str] | None = None) -> int:
         live_policy = _decode_json_document(raw_policy, "live Lambda policy")
         if not isinstance(live_policy, Mapping):
             raise AdoptionError("live Lambda policy is malformed")
-        legacy_sid = validate_lambda_policy_after_update(
+        next_legacy_sid = validate_lambda_policy_after_update(
             live_policy,
             audited,
-            expect_legacy=args.expect_legacy == "present",
+            removed_legacy_count=args.removed_legacy_count,
         )
         if args.emit_revision:
-            if args.expect_legacy != "present":
+            if next_legacy_sid is None:
                 raise AdoptionError(
-                    "revision guard can only be emitted for a present legacy permission"
+                    "revision guard cannot be emitted after all historical permissions are removed"
                 )
             revision = response.get("RevisionId")
             if not isinstance(revision, str) or not revision:
                 raise AdoptionError("live Lambda policy revision is unavailable")
             print(
                 json.dumps(
-                    {"legacy_sid": legacy_sid, "revision_id": revision},
+                    {
+                        "next_legacy_sid": next_legacy_sid,
+                        "revision_id": revision,
+                    },
                     sort_keys=True,
                     separators=(",", ":"),
                 )

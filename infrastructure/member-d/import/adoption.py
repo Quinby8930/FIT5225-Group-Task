@@ -105,6 +105,11 @@ _ADOPTED_LOGICAL_IDS = {
 }
 _INTEGRATION_KEYS = {"IntegrationId", "IntegrationType", "IntegrationSubtype", "IntegrationMethod", "PayloadFormatVersion", "IntegrationUri", "ConnectionType", "ConnectionId", "ContentHandlingStrategy", "CredentialsArn", "Description", "PassthroughBehavior", "RequestParameters", "RequestTemplates", "ResponseParameters", "TemplateSelectionExpression", "TlsConfig", "TimeoutInMillis"}
 _ROUTE_KEYS = {"RouteId", "RouteKey", "Target", "AuthorizationType", "AuthorizerId", "ApiKeyRequired", "AuthorizationScopes", "ModelSelectionExpression", "OperationName", "RequestModels", "RequestParameters", "RouteResponseSelectionExpression"}
+_HISTORICAL_LAMBDA_PERMISSIONS = (
+    ("apigateway-query-lambda", "/*/*/*"),
+    ("AllowAuthTestInvoke", "/*/GET/auth-test"),
+    ("AllowApiGatewayInvokeAllRoutes-20260829030023", "/*/*"),
+)
 
 
 def _require(condition: bool, message: str) -> None:
@@ -138,6 +143,31 @@ def _is_unconfigured_function_property(key: str, value: Any) -> bool:
     if key == "VpcConfig":
         return _is_unconfigured_vpc(value)
     return value is None
+
+
+def _expected_historical_lambda_permissions(
+    account: str,
+    region: str,
+    api_id: str,
+) -> list[dict[str, Any]]:
+    function_arn = (
+        f"arn:aws:lambda:{region}:{account}:"
+        "function:PacificBioArchive-QueryLambda"
+    )
+    source_prefix = f"arn:aws:execute-api:{region}:{account}:{api_id}"
+    return [
+        {
+            "Sid": sid,
+            "Effect": "Allow",
+            "Principal": {"Service": "apigateway.amazonaws.com"},
+            "Action": "lambda:InvokeFunction",
+            "Resource": function_arn,
+            "Condition": {
+                "ArnLike": {"AWS:SourceArn": f"{source_prefix}{suffix}"}
+            },
+        }
+        for sid, suffix in _HISTORICAL_LAMBDA_PERMISSIONS
+    ]
 
 
 def _stack_parameter_names(stack: Mapping[str, Any]) -> set[str]:
@@ -477,7 +507,12 @@ def _validate_reservations_table(
     )
 
 
-def _validate_function(function: Mapping[str, Any], account: str) -> None:
+def _validate_function(
+    function: Mapping[str, Any],
+    account: str,
+    region: str,
+    api_id: str,
+) -> None:
     _require(function.get("FunctionName") == "PacificBioArchive-QueryLambda", "function name mismatch")
     _require(function.get("PackageType") == "Zip", "package type is not Zip")
     _require(function.get("Runtime") == "python3.12", "function runtime mismatch")
@@ -499,25 +534,41 @@ def _validate_function(function: Mapping[str, Any], account: str) -> None:
     policy = function.get("resource_policy")
     _require(isinstance(policy, Mapping) and policy.get("Statement"), "function resource policy missing")
     statements = policy.get("Statement")
-    _require(isinstance(statements, list) and len(statements) == 1, "function resource policy cannot be preserved")
-    statement = statements[0]
-    _require(isinstance(statement, Mapping) and set(statement) == {"Sid", "Effect", "Principal", "Action", "Resource"}, "function resource policy cannot be preserved")
+    expected = {
+        statement["Sid"]: statement
+        for statement in _expected_historical_lambda_permissions(
+            account,
+            region,
+            api_id,
+        )
+    }
     _require(
-        isinstance(statement.get("Sid"), str)
-        and re.fullmatch(r"[A-Za-z0-9-_]{1,100}", statement["Sid"]),
-        "function resource policy Sid cannot be preserved",
+        isinstance(statements, list) and len(statements) == len(expected),
+        "function resource policy cannot be preserved",
     )
-    _require(statement.get("Effect") == "Allow" and statement.get("Principal") == {"Service": "apigateway.amazonaws.com"} and statement.get("Action") == "lambda:InvokeFunction", "function resource policy cannot be preserved")
-    _require(isinstance(statement.get("Resource"), str) and statement["Resource"].endswith(":function:PacificBioArchive-QueryLambda"), "function resource policy cannot be preserved")
+    actual: dict[str, Mapping[str, Any]] = {}
+    for statement in statements:
+        _require(
+            isinstance(statement, Mapping)
+            and isinstance(statement.get("Sid"), str)
+            and statement["Sid"] not in actual,
+            "function resource policy Sid cannot be preserved",
+        )
+        actual[statement["Sid"]] = statement
+    _require(
+        set(actual) == set(expected)
+        and all(actual[sid] == expected[sid] for sid in expected),
+        "function resource policy cannot be preserved",
+    )
 
 
 def validate_lambda_policy_after_update(
     live_policy: Mapping[str, Any],
     audited: Mapping[str, Any],
     *,
-    expect_legacy: bool,
-) -> str:
-    """Prove all route-scoped permissions and the exact legacy statement state."""
+    removed_legacy_count: int,
+) -> str | None:
+    """Prove route permissions plus the exact remaining audited history."""
     validate_snapshot(audited)
     account = audited["caller"]["Account"]
     region = audited["region"]
@@ -526,9 +577,17 @@ def validate_lambda_policy_after_update(
         f"arn:aws:lambda:{region}:{account}:"
         "function:PacificBioArchive-QueryLambda"
     )
+    _require(
+        type(removed_legacy_count) is int
+        and 0 <= removed_legacy_count <= len(_HISTORICAL_LAMBDA_PERMISSIONS),
+        "removed legacy permission count is invalid",
+    )
     audited_statements = audited["function"]["resource_policy"]["Statement"]
-    legacy = audited_statements[0]
-    legacy_sid = legacy["Sid"]
+    audited_by_sid = {
+        statement["Sid"]: statement for statement in audited_statements
+    }
+    ordered_sids = [sid for sid, _suffix in _HISTORICAL_LAMBDA_PERMISSIONS]
+    remaining_sids = set(ordered_sids[removed_legacy_count:])
 
     expected_source_arns: set[str] = set()
     for contract in (
@@ -547,7 +606,7 @@ def validate_lambda_policy_after_update(
         isinstance(statements, list),
         "live Lambda resource policy is malformed",
     )
-    broad: list[Mapping[str, Any]] = []
+    remaining_history: dict[str, Mapping[str, Any]] = {}
     scoped_source_arns: set[str] = set()
     seen_sids: set[str] = set()
     for statement in statements:
@@ -567,18 +626,14 @@ def validate_lambda_policy_after_update(
             and statement.get("Resource") == function_arn,
             "live Lambda resource policy contains an unapproved statement",
         )
-        if "Condition" not in statement:
+        sid = statement["Sid"]
+        if sid in audited_by_sid:
             _require(
-                set(statement) == {
-                    "Sid",
-                    "Effect",
-                    "Principal",
-                    "Action",
-                    "Resource",
-                },
-                "live Lambda resource policy contains an unscoped statement",
+                sid in remaining_sids
+                and statement == audited_by_sid[sid],
+                "live Lambda historical permission differs from the audited state",
             )
-            broad.append(statement)
+            remaining_history[sid] = statement
             continue
         _require(
             set(statement)
@@ -612,17 +667,15 @@ def validate_lambda_policy_after_update(
         scoped_source_arns == expected_source_arns,
         "live Lambda policy does not contain the exact route-scoped permissions",
     )
-    if expect_legacy:
-        _require(
-            broad == [legacy],
-            "live Lambda legacy permission differs from the audited statement",
-        )
-    else:
-        _require(
-            broad == [],
-            "live Lambda policy still contains an unscoped permission",
-        )
-    return legacy_sid
+    _require(
+        set(remaining_history) == remaining_sids,
+        "live Lambda policy does not contain the exact remaining historical permissions",
+    )
+    return (
+        ordered_sids[removed_legacy_count]
+        if removed_legacy_count < len(ordered_sids)
+        else None
+    )
 
 
 def validate_snapshot(snapshot: Mapping[str, Any]) -> None:
@@ -684,7 +737,7 @@ def validate_snapshot(snapshot: Mapping[str, Any]) -> None:
     _require(isinstance(uri, str) and uri.endswith(expected_suffix) and ":function:PacificBioArchive-QueryLambda:" not in uri, "integration URI is not bound to the unqualified Query Lambda account and region")
     function = snapshot.get("function", {})
     _require(isinstance(function, Mapping), "function missing")
-    _validate_function(function, account)
+    _validate_function(function, account, snapshot.get("region"), api["id"])
     routes = _route_lookup(snapshot)
     for contract in ROUTES_BY_LOGICAL_ID.values():
         route = routes.get(contract.route_key)

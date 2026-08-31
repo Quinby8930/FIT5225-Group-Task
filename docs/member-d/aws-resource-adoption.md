@@ -430,44 +430,101 @@ CloudFormation 的 `PhysicalId` 必须仍为 `PacificBioArchiveUploadReservation
 `TableStatus`。任一条件不满足时，不得恢复流量或开始迁移。
 
 首次 UPDATE 会新增 26 条由 CloudFormation 管理的逐路由 invoke permissions，但不会自动
-删除 IMPORT 前审计到的那一条 stack 外宽泛 permission。先用仓库验证器证明在线 policy
-恰好是“26 条 scoped + 原审计的 1 条 legacy”。验证器从同一次在线 policy 响应原子输出
-已经验证过的 Sid 与 RevisionId；禁止再从 snapshot 或第二次查询重取 Sid：
+删除 IMPORT 前审计到的以下 3 条 stack 外历史 permissions：
+
+1. `apigateway-query-lambda`：`/*/*/*`
+2. `AllowAuthTestInvoke`：`/*/GET/auth-test`
+3. `AllowApiGatewayInvokeAllRoutes-20260829030023`：`/*/*`
+
+先用仓库验证器证明在线 policy 恰好是“26 条 scoped + 尚未删除的历史 permissions”。每次
+删除前都必须重新调用验证器。验证器从同一次最新在线 policy 响应原子输出固定顺序中的
+下一条 Sid 与该响应的 RevisionId；禁止从 snapshot、旧 shell 变量或第二次查询重取或复用
+Sid/RevisionId。
+
+### STOP 3A — 删除第一条已审计历史 permission
+
+只有用户明确批准精确删除 `apigateway-query-lambda` 后，才能执行本段：
 
 ```bash
 POLICY_GUARD=$(python infrastructure/member-d/import/prepare_import.py validate-lambda-policy \
   --region "$AWS_REGION" --function "$FUNCTION_NAME" \
-  --workdir "$WORK_DIR" --expect-legacy present --emit-revision)
+  --workdir "$WORK_DIR" --removed-legacy-count 0 --emit-revision)
 readarray -t POLICY_GUARD_FIELDS < <(
   printf '%s' "$POLICY_GUARD" | python -c \
-    'import json,sys; value=json.load(sys.stdin); print(value["legacy_sid"]); print(value["revision_id"])'
+    'import json,sys; value=json.load(sys.stdin); print(value["next_legacy_sid"]); print(value["revision_id"])'
 )
 unset POLICY_GUARD
 test "${#POLICY_GUARD_FIELDS[@]}" -eq 2
 LEGACY_STATEMENT_ID="${POLICY_GUARD_FIELDS[0]}"
 POLICY_REVISION_ID="${POLICY_GUARD_FIELDS[1]}"
-test -n "$LEGACY_STATEMENT_ID"
+test "$LEGACY_STATEMENT_ID" = "apigateway-query-lambda"
 test -n "$POLICY_REVISION_ID"
-```
-
-> **STOP 3 — 单独批准 permission 收窄：** 只有用户明确批准“精确移除已审计的 legacy
-> Lambda statement `$LEGACY_STATEMENT_ID`”后，才能运行下一条命令。不能按前缀、模糊匹配
-> 或批量删除其他 statement。
-
-```bash
-# WRITE — 只移除上一步审计并验证过的单一 legacy Sid。
 aws lambda remove-permission \
   --region "$AWS_REGION" --function-name "$FUNCTION_NAME" \
   --statement-id "$LEGACY_STATEMENT_ID" \
   --revision-id "$POLICY_REVISION_ID"
+unset LEGACY_STATEMENT_ID POLICY_REVISION_ID POLICY_GUARD_FIELDS
+```
+
+### STOP 3B — 删除第二条已审计历史 permission
+
+只有用户明确批准精确删除 `AllowAuthTestInvoke` 后，才能执行本段。此处再次读取 policy，
+并只使用这次响应的新 RevisionId：
+
+```bash
+POLICY_GUARD=$(python infrastructure/member-d/import/prepare_import.py validate-lambda-policy \
+  --region "$AWS_REGION" --function "$FUNCTION_NAME" \
+  --workdir "$WORK_DIR" --removed-legacy-count 1 --emit-revision)
+readarray -t POLICY_GUARD_FIELDS < <(
+  printf '%s' "$POLICY_GUARD" | python -c \
+    'import json,sys; value=json.load(sys.stdin); print(value["next_legacy_sid"]); print(value["revision_id"])'
+)
+unset POLICY_GUARD
+test "${#POLICY_GUARD_FIELDS[@]}" -eq 2
+LEGACY_STATEMENT_ID="${POLICY_GUARD_FIELDS[0]}"
+POLICY_REVISION_ID="${POLICY_GUARD_FIELDS[1]}"
+test "$LEGACY_STATEMENT_ID" = "AllowAuthTestInvoke"
+test -n "$POLICY_REVISION_ID"
+aws lambda remove-permission \
+  --region "$AWS_REGION" --function-name "$FUNCTION_NAME" \
+  --statement-id "$LEGACY_STATEMENT_ID" \
+  --revision-id "$POLICY_REVISION_ID"
+unset LEGACY_STATEMENT_ID POLICY_REVISION_ID POLICY_GUARD_FIELDS
+```
+
+### STOP 3C — 删除第三条已审计历史 permission
+
+只有用户明确批准精确删除 `AllowApiGatewayInvokeAllRoutes-20260829030023` 后，才能执行本段。
+它仍会重新读取并严格验证此刻的完整 policy：
+
+```bash
+POLICY_GUARD=$(python infrastructure/member-d/import/prepare_import.py validate-lambda-policy \
+  --region "$AWS_REGION" --function "$FUNCTION_NAME" \
+  --workdir "$WORK_DIR" --removed-legacy-count 2 --emit-revision)
+readarray -t POLICY_GUARD_FIELDS < <(
+  printf '%s' "$POLICY_GUARD" | python -c \
+    'import json,sys; value=json.load(sys.stdin); print(value["next_legacy_sid"]); print(value["revision_id"])'
+)
+unset POLICY_GUARD
+test "${#POLICY_GUARD_FIELDS[@]}" -eq 2
+LEGACY_STATEMENT_ID="${POLICY_GUARD_FIELDS[0]}"
+POLICY_REVISION_ID="${POLICY_GUARD_FIELDS[1]}"
+test "$LEGACY_STATEMENT_ID" = "AllowApiGatewayInvokeAllRoutes-20260829030023"
+test -n "$POLICY_REVISION_ID"
+aws lambda remove-permission \
+  --region "$AWS_REGION" --function-name "$FUNCTION_NAME" \
+  --statement-id "$LEGACY_STATEMENT_ID" \
+  --revision-id "$POLICY_REVISION_ID"
+unset LEGACY_STATEMENT_ID POLICY_REVISION_ID POLICY_GUARD_FIELDS
 
 python infrastructure/member-d/import/prepare_import.py validate-lambda-policy \
   --region "$AWS_REGION" --function "$FUNCTION_NAME" \
-  --workdir "$WORK_DIR" --expect-legacy absent
+  --workdir "$WORK_DIR" --removed-legacy-count 3
 ```
 
-第二次验证必须证明没有任何无 `SourceArn` 的宽泛 statement，并且 26 条 scoped permissions
-与模板的 16 条业务路由和 10 条 OPTIONS 路由逐一完全对应；否则停止。
+最终验证必须证明 3 条历史 permissions 已全部删除，在线 policy 只剩模板管理的 26 条 scoped
+permissions，并与 16 条业务路由和 10 条 OPTIONS 路由逐一完全对应；不得存在额外 permission
+或任何 wildcard 历史权限，否则停止。
 
 在浏览器中用 Cognito 已登录会话验证公开路由、上传、查询、编辑、删除和通知；不要把
 JWT 或内部 key 复制到 shell。公开路由必须有 JWT，internal 路由在无/错 key 时必须 401，
@@ -606,7 +663,7 @@ aws cloudformation wait stack-update-complete \
 
 python infrastructure/member-d/import/prepare_import.py validate-lambda-policy \
   --region "$AWS_REGION" --function "$FUNCTION_NAME" \
-  --workdir "$WORK_DIR" --expect-legacy absent
+  --workdir "$WORK_DIR" --removed-legacy-count 3
 ```
 
 最后再测试：无 token 的 complete/failed 必须被拒绝，带当前 lease token 的回调成功；公开

@@ -22,6 +22,52 @@ from adoption import (
 )
 
 
+def _historical_lambda_permissions(
+    account="111122223333",
+    region="ap-southeast-2",
+    api_id="2dd2aqb32j",
+):
+    function_arn = (
+        f"arn:aws:lambda:{region}:{account}:"
+        "function:PacificBioArchive-QueryLambda"
+    )
+    source_prefix = f"arn:aws:execute-api:{region}:{account}:{api_id}"
+    return [
+        {
+            "Sid": "apigateway-query-lambda",
+            "Effect": "Allow",
+            "Principal": {"Service": "apigateway.amazonaws.com"},
+            "Action": "lambda:InvokeFunction",
+            "Resource": function_arn,
+            "Condition": {
+                "ArnLike": {"AWS:SourceArn": f"{source_prefix}/*/*/*"}
+            },
+        },
+        {
+            "Sid": "AllowAuthTestInvoke",
+            "Effect": "Allow",
+            "Principal": {"Service": "apigateway.amazonaws.com"},
+            "Action": "lambda:InvokeFunction",
+            "Resource": function_arn,
+            "Condition": {
+                "ArnLike": {
+                    "AWS:SourceArn": f"{source_prefix}/*/GET/auth-test"
+                }
+            },
+        },
+        {
+            "Sid": "AllowApiGatewayInvokeAllRoutes-20260829030023",
+            "Effect": "Allow",
+            "Principal": {"Service": "apigateway.amazonaws.com"},
+            "Action": "lambda:InvokeFunction",
+            "Resource": function_arn,
+            "Condition": {
+                "ArnLike": {"AWS:SourceArn": f"{source_prefix}/*/*"}
+            },
+        },
+    ]
+
+
 def valid_snapshot():
     routes = []
     for index, (_logical_id, contract) in enumerate(
@@ -105,12 +151,9 @@ def valid_snapshot():
                 "NOTIFICATIONS_TABLE": "PacificBioArchiveNotifications",
                 "CORS_ORIGINS": "http://localhost:3000", "TAG_DETECTOR_BACKEND": "remote",
             },
-            "resource_policy": {"Statement": [{
-                "Sid": "AllowExecutionFromAPIGateway",
-                "Effect": "Allow", "Principal": {"Service": "apigateway.amazonaws.com"},
-                "Action": "lambda:InvokeFunction",
-                "Resource": "arn:aws:lambda:ap-southeast-2:111122223333:function:PacificBioArchive-QueryLambda",
-            }]},
+            "resource_policy": {
+                "Statement": _historical_lambda_permissions()
+            },
         },
         "integration": {
             "IntegrationId": "fbjojun", "IntegrationType": "AWS_PROXY",
@@ -171,7 +214,7 @@ def valid_snapshot():
     }
 
 
-def _route_scoped_lambda_policy(snapshot, *, include_legacy):
+def _route_scoped_lambda_policy(snapshot, *, removed_legacy_count):
     account = snapshot["caller"]["Account"]
     region = snapshot["region"]
     api_id = snapshot["api"]["id"]
@@ -202,46 +245,116 @@ def _route_scoped_lambda_policy(snapshot, *, include_legacy):
                 }
             },
         })
-    if include_legacy:
-        statements.append(
-            deepcopy(snapshot["function"]["resource_policy"]["Statement"][0])
+    statements.extend(
+        deepcopy(
+            snapshot["function"]["resource_policy"]["Statement"][
+                removed_legacy_count:
+            ]
         )
+    )
     return {"Version": "2012-10-17", "Statement": statements}
 
 
-@pytest.mark.parametrize("expect_legacy", [True, False])
-def test_post_update_lambda_policy_requires_exact_26_scoped_permissions(
-    expect_legacy,
+@pytest.mark.parametrize(
+    ("removed_legacy_count", "next_sid"),
+    [
+        (0, "apigateway-query-lambda"),
+        (1, "AllowAuthTestInvoke"),
+        (2, "AllowApiGatewayInvokeAllRoutes-20260829030023"),
+        (3, None),
+    ],
+)
+def test_post_update_lambda_policy_requires_exact_scoped_and_remaining_history(
+    removed_legacy_count,
+    next_sid,
 ):
     snapshot = valid_snapshot()
     policy = _route_scoped_lambda_policy(
         snapshot,
-        include_legacy=expect_legacy,
+        removed_legacy_count=removed_legacy_count,
     )
 
-    scoped = [
-        statement
-        for statement in policy["Statement"]
-        if "Condition" in statement
-    ]
-    assert len(scoped) == 26
     assert validate_lambda_policy_after_update(
         policy,
         snapshot,
-        expect_legacy=expect_legacy,
-    ) == "AllowExecutionFromAPIGateway"
+        removed_legacy_count=removed_legacy_count,
+    ) == next_sid
+    assert len(policy["Statement"]) == 29 - removed_legacy_count
+
+    if removed_legacy_count == 3:
+        historical_sources = {
+            statement["Condition"]["ArnLike"]["AWS:SourceArn"]
+            for statement in snapshot["function"]["resource_policy"]["Statement"]
+        }
+        live_sources = {
+            statement["Condition"]["ArnLike"]["AWS:SourceArn"]
+            for statement in policy["Statement"]
+        }
+        assert live_sources.isdisjoint(historical_sources - {
+            "arn:aws:execute-api:ap-southeast-2:111122223333:"
+            "2dd2aqb32j/*/GET/auth-test"
+        })
 
 
 def test_post_update_lambda_policy_rejects_missing_scoped_permission():
     snapshot = valid_snapshot()
-    policy = _route_scoped_lambda_policy(snapshot, include_legacy=False)
+    policy = _route_scoped_lambda_policy(snapshot, removed_legacy_count=3)
     policy["Statement"].pop(0)
 
     with pytest.raises(AdoptionError, match="exact route-scoped permissions"):
         validate_lambda_policy_after_update(
             policy,
             snapshot,
-            expect_legacy=False,
+            removed_legacy_count=3,
+        )
+
+
+def test_post_update_lambda_policy_rejects_any_extra_permission():
+    snapshot = valid_snapshot()
+    policy = _route_scoped_lambda_policy(snapshot, removed_legacy_count=0)
+    extra = deepcopy(policy["Statement"][0])
+    extra["Sid"] = "UnexpectedExtraPermission"
+    extra["Condition"]["ArnLike"]["AWS:SourceArn"] = (
+        "arn:aws:execute-api:ap-southeast-2:111122223333:"
+        "2dd2aqb32j/*/POST/unverified"
+    )
+    policy["Statement"].append(extra)
+
+    with pytest.raises(AdoptionError, match="unapproved|exact|permission"):
+        validate_lambda_policy_after_update(
+            policy,
+            snapshot,
+            removed_legacy_count=0,
+        )
+
+
+def test_final_lambda_policy_rejects_a_restored_historical_wildcard():
+    snapshot = valid_snapshot()
+    policy = _route_scoped_lambda_policy(snapshot, removed_legacy_count=3)
+    policy["Statement"].append(
+        deepcopy(snapshot["function"]["resource_policy"]["Statement"][0])
+    )
+
+    with pytest.raises(AdoptionError, match="historical permission"):
+        validate_lambda_policy_after_update(
+            policy,
+            snapshot,
+            removed_legacy_count=3,
+        )
+
+
+def test_cleanup_stage_rejects_a_previously_removed_historical_permission():
+    snapshot = valid_snapshot()
+    policy = _route_scoped_lambda_policy(snapshot, removed_legacy_count=1)
+    policy["Statement"].append(
+        deepcopy(snapshot["function"]["resource_policy"]["Statement"][0])
+    )
+
+    with pytest.raises(AdoptionError, match="historical permission"):
+        validate_lambda_policy_after_update(
+            policy,
+            snapshot,
+            removed_legacy_count=1,
         )
 
 
@@ -459,7 +572,7 @@ def test_reservations_table_rejects_unmanaged_new_dynamodb_features(
         validate_snapshot(snapshot)
 
 
-def test_lambda_broad_gateway_policy_requires_a_nonempty_statement_sid():
+def test_historical_gateway_policy_requires_a_nonempty_statement_sid():
     validate_snapshot(valid_snapshot())
 
     for invalid_sid in (None, "", "   "):
@@ -472,6 +585,66 @@ def test_lambda_broad_gateway_policy_requires_a_nonempty_statement_sid():
 
         with pytest.raises(AdoptionError, match="resource policy|Sid"):
             validate_snapshot(snapshot)
+
+
+def test_audit_accepts_verified_historical_permissions_in_any_statement_order():
+    snapshot = valid_snapshot()
+    snapshot["function"]["resource_policy"]["Statement"].reverse()
+
+    validate_snapshot(snapshot)
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        lambda statement: statement.update({
+            "Principal": {"Service": "events.amazonaws.com"}
+        }),
+        lambda statement: statement.update({"Action": "lambda:GetFunction"}),
+        lambda statement: statement.update({
+            "Resource": (
+                "arn:aws:lambda:ap-southeast-2:999988887777:"
+                "function:PacificBioArchive-QueryLambda"
+            )
+        }),
+        lambda statement: statement["Condition"]["ArnLike"].update({
+            "AWS:SourceArn": (
+                "arn:aws:execute-api:ap-southeast-2:999988887777:"
+                "2dd2aqb32j/*/*/*"
+            )
+        }),
+        lambda statement: statement["Condition"]["ArnLike"].update({
+            "AWS:SourceArn": (
+                "arn:aws:execute-api:ap-southeast-2:111122223333:"
+                "otherapi/*/*/*"
+            )
+        }),
+        lambda statement: statement["Condition"]["ArnLike"].update({
+            "AWS:SourceArn": (
+                "arn:aws:execute-api:ap-southeast-2:111122223333:"
+                "2dd2aqb32j/*/POST/unverified"
+            )
+        }),
+        lambda statement: statement.update({"Sid": "UnknownHistoricalSid"}),
+        lambda statement: statement.update({"UnknownField": "not-allowed"}),
+    ],
+)
+def test_audit_rejects_any_unverified_historical_permission_change(mutation):
+    snapshot = valid_snapshot()
+    mutation(snapshot["function"]["resource_policy"]["Statement"][0])
+
+    with pytest.raises(AdoptionError, match="resource policy"):
+        validate_snapshot(snapshot)
+
+
+def test_audit_rejects_an_extra_lambda_permission():
+    snapshot = valid_snapshot()
+    extra = deepcopy(snapshot["function"]["resource_policy"]["Statement"][0])
+    extra["Sid"] = "UnexpectedExtraPermission"
+    snapshot["function"]["resource_policy"]["Statement"].append(extra)
+
+    with pytest.raises(AdoptionError, match="resource policy"):
+        validate_snapshot(snapshot)
 
 
 def test_root_caller_is_rejected():
@@ -623,7 +796,9 @@ def test_import_manifest_contains_reservations_table_lambda_integration_and_sixt
 
 
 def test_import_template_retains_every_imported_resource_without_secret_value():
-    template = build_import_template(valid_snapshot(), CodeArtifact("private-artifacts", "backups/code.zip", "version-1"))
+    snapshot = valid_snapshot()
+    audited_policy = deepcopy(snapshot["function"]["resource_policy"])
+    template = build_import_template(snapshot, CodeArtifact("private-artifacts", "backups/code.zip", "version-1"))
     imported = {"ReservationsTable", "QueryFunction", "QueryIntegration", *ROUTES_BY_LOGICAL_ID}
     for logical_id in imported:
         assert template["Resources"][logical_id]["DeletionPolicy"] == "Retain"
@@ -632,6 +807,11 @@ def test_import_template_retains_every_imported_resource_without_secret_value():
     rendered = str(template)
     assert "fixture-secret" not in rendered
     assert "POST /upload-url" not in rendered
+    assert all(
+        resource.get("Type") != "AWS::Lambda::Permission"
+        for resource in template["Resources"].values()
+    )
+    assert snapshot["function"]["resource_policy"] == audited_policy
 
 
 def test_import_template_describes_exact_live_reservations_table():

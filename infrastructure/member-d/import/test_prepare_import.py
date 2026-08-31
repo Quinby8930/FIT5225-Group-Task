@@ -1759,7 +1759,7 @@ def test_lambda_policy_revision_output_requires_nonempty_revision(
                 "Policy": json.dumps(
                     _route_scoped_lambda_policy(
                         snapshot,
-                        include_legacy=True,
+                        removed_legacy_count=0,
                     )
                 ),
                 "RevisionId": revision_id,
@@ -1773,7 +1773,7 @@ def test_lambda_policy_revision_output_requires_nonempty_revision(
             "--region", "ap-southeast-2",
             "--function", "PacificBioArchive-QueryLambda",
             "--workdir", str(tmp_path),
-            "--expect-legacy", "present",
+            "--removed-legacy-count", "0",
             "--emit-revision",
         ])
 
@@ -1799,33 +1799,91 @@ def test_lambda_policy_revision_is_emitted_from_same_validated_response(
                 "Policy": json.dumps(
                     _route_scoped_lambda_policy(
                         snapshot,
-                        include_legacy=True,
+                        removed_legacy_count=0,
                     )
                 ),
                 "RevisionId": "policy-revision-42",
             }
 
     monkeypatch.setattr(prepare_import, "AwsCli", lambda: PolicyCli())
-    monkeypatch.setattr(
-        prepare_import,
-        "validate_lambda_policy_after_update",
-        lambda *_args, **_kwargs: "SidFromValidatedLivePolicy",
+    assert prepare_import.main([
+        "validate-lambda-policy",
+        "--region", "ap-southeast-2",
+        "--function", "PacificBioArchive-QueryLambda",
+        "--workdir", str(tmp_path),
+        "--removed-legacy-count", "0",
+        "--emit-revision",
+    ]) == 0
+    emitted = json.loads(capsys.readouterr().out)
+    assert emitted == {
+        "next_legacy_sid": "apigateway-query-lambda",
+        "revision_id": "policy-revision-42",
+    }
+    assert len(calls) == 1
+
+
+def test_each_legacy_cleanup_guard_rereads_policy_and_emits_fresh_revision(
+    tmp_path,
+    monkeypatch,
+    capsys,
+):
+    import prepare_import
+
+    snapshot = valid_snapshot()
+    (tmp_path / "sanitized-snapshot.json").write_text(
+        json.dumps(_json_safe_snapshot(snapshot)),
+        encoding="utf-8",
     )
+
+    class SequentialPolicyCli:
+        def __init__(self):
+            self.calls = 0
+
+        def json(self, *args):
+            assert args[:2] == ("lambda", "get-policy")
+            removed = self.calls
+            self.calls += 1
+            return {
+                "Policy": json.dumps(
+                    _route_scoped_lambda_policy(
+                        snapshot,
+                        removed_legacy_count=removed,
+                    )
+                ),
+                "RevisionId": f"policy-revision-{removed + 1}",
+            }
+
+    cli = SequentialPolicyCli()
+    monkeypatch.setattr(prepare_import, "AwsCli", lambda: cli)
+    expected_sids = [
+        "apigateway-query-lambda",
+        "AllowAuthTestInvoke",
+        "AllowApiGatewayInvokeAllRoutes-20260829030023",
+    ]
+
+    for removed, expected_sid in enumerate(expected_sids):
+        assert prepare_import.main([
+            "validate-lambda-policy",
+            "--region", "ap-southeast-2",
+            "--function", "PacificBioArchive-QueryLambda",
+            "--workdir", str(tmp_path),
+            "--removed-legacy-count", str(removed),
+            "--emit-revision",
+        ]) == 0
+        assert json.loads(capsys.readouterr().out) == {
+            "next_legacy_sid": expected_sid,
+            "revision_id": f"policy-revision-{removed + 1}",
+        }
 
     assert prepare_import.main([
         "validate-lambda-policy",
         "--region", "ap-southeast-2",
         "--function", "PacificBioArchive-QueryLambda",
         "--workdir", str(tmp_path),
-        "--expect-legacy", "present",
-        "--emit-revision",
+        "--removed-legacy-count", "3",
     ]) == 0
-    emitted = json.loads(capsys.readouterr().out)
-    assert emitted == {
-        "legacy_sid": "SidFromValidatedLivePolicy",
-        "revision_id": "policy-revision-42",
-    }
-    assert len(calls) == 1
+    assert "all route-scoped permissions" in capsys.readouterr().out
+    assert cli.calls == 4
 
 
 def test_collection_rejects_reservations_table_kinesis_destination(tmp_path):
