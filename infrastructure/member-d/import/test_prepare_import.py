@@ -1379,6 +1379,67 @@ def test_prepare_rejects_unsafe_artifact_bucket(bucket_state):
         verify_artifact_bucket(FakeAwsCli(bucket_state=bucket_state), "artifacts", "ap-southeast-2")
 
 
+class ArtifactBucketPolicyCli(FakeAwsCli):
+    def __init__(self, policy_status=None, policy_error=None):
+        super().__init__()
+        self.policy_status = policy_status
+        self.policy_error = policy_error
+        self.policy_status_calls = 0
+
+    def json(self, *args):
+        if "get-bucket-policy-status" in " ".join(args):
+            raise AssertionError(
+                "bucket policy status must use optional_json"
+            )
+        return super().json(*args)
+
+    def optional_json(self, expected_error_code, *args):
+        assert expected_error_code == "NoSuchBucketPolicy"
+        assert "get-bucket-policy-status" in " ".join(args)
+        self.policy_status_calls += 1
+        if self.policy_error is not None:
+            raise self.policy_error
+        return self.policy_status
+
+
+def test_artifact_bucket_without_policy_is_accepted_when_other_controls_are_safe():
+    cli = ArtifactBucketPolicyCli(policy_status=None)
+
+    verify_artifact_bucket(cli, "private-artifacts", "ap-southeast-2")
+
+    assert cli.policy_status_calls == 1
+
+
+def test_artifact_bucket_with_public_policy_status_is_rejected():
+    cli = ArtifactBucketPolicyCli(
+        policy_status={"PolicyStatus": {"IsPublic": True}}
+    )
+
+    with pytest.raises(AdoptionError, match="artifact bucket"):
+        verify_artifact_bucket(
+            cli,
+            "private-artifacts",
+            "ap-southeast-2",
+        )
+
+    assert cli.policy_status_calls == 1
+
+
+def test_artifact_bucket_policy_query_fails_closed_for_other_aws_errors():
+    cli = ArtifactBucketPolicyCli(
+        policy_error=AdoptionError("AWS CLI query failed")
+    )
+
+    with pytest.raises(AdoptionError, match="AWS CLI query failed"):
+        verify_artifact_bucket(
+            cli,
+            "private-artifacts",
+            "ap-southeast-2",
+        )
+
+    assert cli.policy_status_calls == 1
+
+
 def test_backup_rejects_non_zip():
     digest = base64.b64encode(hashlib.sha256(b"not-a-zip").digest()).decode()
     with pytest.raises(AdoptionError, match="zip"):

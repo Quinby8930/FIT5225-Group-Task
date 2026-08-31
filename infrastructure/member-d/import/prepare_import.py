@@ -850,9 +850,15 @@ def verify_artifact_bucket(cli: AwsCli, artifact_bucket: str, region: str = "ap-
         encryption = cli.json("s3api", "get-bucket-encryption", "--bucket", artifact_bucket)
         versioning = cli.json("s3api", "get-bucket-versioning", "--bucket", artifact_bucket)
         cli.json("s3api", "get-bucket-ownership-controls", "--bucket", artifact_bucket)
-        policy_status = cli.json("s3api", "get-bucket-policy-status", "--bucket", artifact_bucket)
+        policy_status = cli.optional_json(
+            "NoSuchBucketPolicy",
+            "s3api",
+            "get-bucket-policy-status",
+            "--bucket",
+            artifact_bucket,
+        )
         cli.json("s3api", "head-bucket", "--bucket", artifact_bucket)
-        if expected_location != region or policy_status.get("PolicyStatus", {}).get("IsPublic") is not False or not all(public.get(name) is True for name in ("BlockPublicAcls", "IgnorePublicAcls", "BlockPublicPolicy", "RestrictPublicBuckets")) or not encryption.get("ServerSideEncryptionConfiguration") or versioning.get("Status") != "Enabled":
+        if expected_location != region or (policy_status is not None and policy_status.get("PolicyStatus", {}).get("IsPublic") is not False) or not all(public.get(name) is True for name in ("BlockPublicAcls", "IgnorePublicAcls", "BlockPublicPolicy", "RestrictPublicBuckets")) or not encryption.get("ServerSideEncryptionConfiguration") or versioning.get("Status") != "Enabled":
             raise AdoptionError("artifact bucket is unsafe")
     except (KeyError, AdoptionError, Exception) as error:
         if isinstance(error, AdoptionError):
