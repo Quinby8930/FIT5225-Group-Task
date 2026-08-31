@@ -438,6 +438,7 @@ def _parser() -> argparse.ArgumentParser:
     validator.add_argument("--stack", required=True)
     validator.add_argument("--change-set", required=True)
     validator.add_argument("--expected-type", choices=("IMPORT", "UPDATE"), required=True)
+    validator.add_argument("--workdir", default=".work")
     return parser
 
 
@@ -460,12 +461,13 @@ def main(argv: list[str] | None = None) -> int:
         print("no CloudFormation change set was created")
         return 0
     change_set = cli.json("cloudformation", "describe-change-set", "--stack-name", args.stack, "--change-set-name", args.change_set, "--region", args.region)
+    snapshot_path = Path(args.workdir) / "sanitized-snapshot.json"
+    audited = json.loads(snapshot_path.read_text(encoding="utf-8"))
     if args.expected_type == "IMPORT":
-        expected = build_resources_to_import(json.loads(Path(".work/sanitized-snapshot.json").read_text(encoding="utf-8")))
+        expected = build_resources_to_import(audited)
         validate_import_change_set(change_set.get("Changes", []), expected)
     else:
-        processed = cli.json("cloudformation", "get-template", "--stack-name", args.stack, "--template-stage", "Processed", "--region", args.region).get("TemplateBody", {})
-        audited = json.loads(Path(".work/sanitized-snapshot.json").read_text(encoding="utf-8"))
+        processed = cli.json("cloudformation", "get-template", "--stack-name", args.stack, "--change-set-name", args.change_set, "--template-stage", "Processed", "--region", args.region).get("TemplateBody", {})
         validate_update_change_set(change_set.get("Changes", []), processed, audited.get("role"))
     print("change set validated; no CloudFormation change set was created or executed")
     return 0

@@ -457,3 +457,33 @@ def test_collection_rejects_api_gateway_managed_integration(tmp_path):
 
     with pytest.raises(AdoptionError, match="managed by API Gateway"):
         collect_snapshot(ManagedIntegrationCli(), fixture_config(tmp_path))
+
+
+@pytest.mark.parametrize("expected_type", ["IMPORT", "UPDATE"])
+def test_change_set_validator_uses_explicit_workdir_and_candidate_template(tmp_path, monkeypatch, expected_type):
+    import prepare_import
+
+    workdir = tmp_path / "explicit-work"
+    workdir.mkdir()
+    (workdir / "sanitized-snapshot.json").write_text(json.dumps({"role": {"processed_definition": {}}}), encoding="utf-8")
+    calls = []
+
+    class ValidatorCli:
+        def json(self, *args):
+            calls.append(args)
+            if args[:2] == ("cloudformation", "describe-change-set"):
+                return {"Changes": []}
+            if args[:2] == ("cloudformation", "get-template"):
+                return {"TemplateBody": {"Resources": {}}}
+            raise AssertionError(args)
+
+    monkeypatch.setattr(prepare_import, "AwsCli", lambda: ValidatorCli())
+    monkeypatch.setattr(prepare_import, "build_resources_to_import", lambda snapshot: [snapshot])
+    monkeypatch.setattr(prepare_import, "validate_import_change_set", lambda changes, expected: calls.append(("import", expected)))
+    monkeypatch.setattr(prepare_import, "validate_update_change_set", lambda changes, processed, role: calls.append(("update", role)))
+    assert prepare_import.main(["validate-change-set", "--region", "ap-southeast-2", "--stack", "stack", "--change-set", "candidate-update", "--expected-type", expected_type, "--workdir", str(workdir)]) == 0
+    if expected_type == "UPDATE":
+        get_template = next(call for call in calls if call[:2] == ("cloudformation", "get-template"))
+        assert ("--change-set-name", "candidate-update") == get_template[get_template.index("--change-set-name"):get_template.index("--change-set-name") + 2]
+    aws_calls = [call for call in calls if isinstance(call, tuple) and len(call) > 1 and call[0] == "cloudformation"]
+    assert not any("execute" in " ".join(call) or "create-change-set" in " ".join(call) for call in aws_calls)

@@ -77,6 +77,27 @@ OPTIONS_ROUTES = {
     "OPTIONS /notifications/subscriptions",
     "OPTIONS /notifications",
 }
+IMPORTED_ROUTE_LOGICAL_IDS = {
+    "AuthTestRoute", "QueryByTagsRoute", "QueryBySpeciesRoute", "QueryByThumbnailRoute", "QueryByFileRoute", "EditTagsRoute", "DeleteFilesRoute", "SubscribeRoute", "UnsubscribeRoute", "SubscriptionsRoute", "NotificationsRoute", "ReserveUploadRoute", "AcquireProcessingRoute", "CompleteFileRoute", "FailFileRoute", "AuthorizeAssetsRoute",
+}
+
+
+def test_query_function_reuses_imported_name_and_stack_owned_role(template):
+    function = template["Resources"]["QueryFunction"]
+    assert function["DeletionPolicy"] == function["UpdateReplacePolicy"] == "Retain"
+    assert function["Properties"]["FunctionName"] == "PacificBioArchive-QueryLambda"
+    assert function["Properties"]["Role"] == {"Fn::GetAtt": "QueryLambdaRole.Arn"}
+    assert "Policies" not in function["Properties"]
+    role = template["Resources"]["QueryLambdaRole"]
+    assert role["Type"] == "AWS::IAM::Role"
+    assert role["DeletionPolicy"] == role["UpdateReplacePolicy"] == "Retain"
+    assert role["Properties"]["RoleName"] == "PacificBioArchive-QueryLambdaRole"
+
+
+def test_imported_integration_and_routes_are_retained(template):
+    for logical_id in {"QueryIntegration", *IMPORTED_ROUTE_LOGICAL_IDS}:
+        assert template["Resources"][logical_id]["DeletionPolicy"] == "Retain"
+        assert template["Resources"][logical_id]["UpdateReplacePolicy"] == "Retain"
 
 
 def test_template_is_sam_and_requires_external_deployment_values(template):
@@ -217,9 +238,9 @@ def test_query_function_runtime_handler_and_production_environment(template):
 
 
 def test_query_function_policies_are_least_privilege(template):
-    policies = _properties(template, "QueryFunction")["Policies"]
-    assert policies[0] == "AWSLambdaBasicExecutionRole"
-    statements = policies[1]["Statement"]
+    role = _properties(template, "QueryLambdaRole")
+    assert role["ManagedPolicyArns"] == ["arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole"]
+    statements = role["Policies"][0]["PolicyDocument"]["Statement"]
     assert statements == [
         {
             "Effect": "Allow",

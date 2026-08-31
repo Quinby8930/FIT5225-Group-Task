@@ -269,6 +269,19 @@ def validate_import_change_set(changes: list[Mapping[str, Any]], expected: list[
     _require(len(changes) == 18 and actual_pairs == expected_pairs and len(actual_pairs) == 18, "change set must contain exactly 18 Import actions")
 
 
+def _role_continuity_with_retain(audited: Mapping[str, Any], current: Mapping[str, Any]) -> bool:
+    """Allow only the resource-level Retain delta needed by maintained SAM."""
+    if current.get("DeletionPolicy") != "Retain" or current.get("UpdateReplacePolicy") != "Retain":
+        return False
+    baseline = deepcopy(dict(audited))
+    target = deepcopy(dict(current))
+    for key in ("DeletionPolicy", "UpdateReplacePolicy"):
+        target.pop(key, None)
+        if baseline.get(key) == "Retain":
+            baseline.pop(key)
+    return baseline == target
+
+
 def validate_update_change_set(changes: list[Mapping[str, Any]], processed: Mapping[str, Any], audited_role: Mapping[str, Any] | None = None) -> None:
     resources = processed.get("Resources", {})
     _require(isinstance(resources, Mapping) and "QueryFunctionRole" not in resources, "implicit role QueryFunctionRole is forbidden")
@@ -286,4 +299,5 @@ def validate_update_change_set(changes: list[Mapping[str, Any]], processed: Mapp
         if logical_id == "QueryLambdaRole" and action not in (None, "Modify"):
             raise AdoptionError("QueryLambdaRole must be unchanged or an in-place modify")
         if logical_id == "QueryLambdaRole" and action == "Modify":
-            _require(isinstance(audited_role, Mapping) and audited_role.get("processed_definition") == resources.get("QueryLambdaRole"), "QueryLambdaRole Modify lacks audited role continuity")
+            definition = audited_role.get("processed_definition") if isinstance(audited_role, Mapping) else None
+            _require(isinstance(definition, Mapping) and _role_continuity_with_retain(definition, resources.get("QueryLambdaRole", {})), "QueryLambdaRole Modify lacks audited role continuity")

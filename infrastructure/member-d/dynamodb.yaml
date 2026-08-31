@@ -118,9 +118,57 @@ Resources:
       Endpoint: !Ref NotificationEmailEndpoint
       TopicArn: !Ref NotificationTopic
 
+  QueryLambdaRole:
+    Type: AWS::IAM::Role
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      RoleName: PacificBioArchive-QueryLambdaRole
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: QueryServiceAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:PutItem
+                  - dynamodb:GetItem
+                  - dynamodb:Scan
+                  - dynamodb:Query
+                  - dynamodb:UpdateItem
+                  - dynamodb:DeleteItem
+                  - dynamodb:TransactWriteItems
+                Resource:
+                  - !GetAtt FilesTable.Arn
+                  - !GetAtt ReservationsTable.Arn
+                  - !GetAtt SubscriptionsTable.Arn
+                  - !GetAtt NotificationsTable.Arn
+              - Effect: Allow
+                Action: [s3:PutObject, s3:GetObject, s3:DeleteObject]
+                Resource: !Sub arn:${AWS::Partition}:s3:::${QueryInputBucketName}/query-inputs/*
+              - Effect: Allow
+                Action: lambda:InvokeFunction
+                Resource: !Sub arn:${AWS::Partition}:lambda:${AWS::Region}:${AWS::AccountId}:function:${StorageDeleteFunctionName}
+              - Effect: Allow
+                Action: sns:Publish
+                Resource: !Ref NotificationTopic
+
   QueryFunction:
     Type: AWS::Serverless::Function
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
     Properties:
+      FunctionName: PacificBioArchive-QueryLambda
+      Role: !GetAtt QueryLambdaRole.Arn
       CodeUri: ../../backend/lambdas/query/
       Handler: lambda_function.handler
       Runtime: python3.12
@@ -143,38 +191,10 @@ Resources:
           NOTIFICATION_PUBLISHER: sns
           SNS_TOPIC_ARN: !Ref NotificationTopic
           CORS_ORIGINS: !Join [',', [!Ref AllowedOrigin, !Ref PublicAllowedOrigin]]
-      Policies:
-        - AWSLambdaBasicExecutionRole
-        - Statement:
-            - Effect: Allow
-              Action:
-                - dynamodb:PutItem
-                - dynamodb:GetItem
-                - dynamodb:Scan
-                - dynamodb:Query
-                - dynamodb:UpdateItem
-                - dynamodb:DeleteItem
-                - dynamodb:TransactWriteItems
-              Resource:
-                - !GetAtt FilesTable.Arn
-                - !GetAtt ReservationsTable.Arn
-                - !GetAtt SubscriptionsTable.Arn
-                - !GetAtt NotificationsTable.Arn
-            - Effect: Allow
-              Action:
-                - s3:PutObject
-                - s3:GetObject
-                - s3:DeleteObject
-              Resource: !Sub arn:${AWS::Partition}:s3:::${QueryInputBucketName}/query-inputs/*
-            - Effect: Allow
-              Action: lambda:InvokeFunction
-              Resource: !Sub arn:${AWS::Partition}:lambda:${AWS::Region}:${AWS::AccountId}:function:${StorageDeleteFunctionName}
-            - Effect: Allow
-              Action: sns:Publish
-              Resource: !Ref NotificationTopic
-
   QueryIntegration:
     Type: AWS::ApiGatewayV2::Integration
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
     Properties:
       ApiId: !Ref ExistingHttpApiId
       IntegrationType: AWS_PROXY
@@ -184,52 +204,84 @@ Resources:
 
   AuthTestRoute:
     Type: AWS::ApiGatewayV2::Route
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
     Properties: {ApiId: !Ref ExistingHttpApiId, RouteKey: 'GET /auth-test', AuthorizationType: JWT, AuthorizerId: !Ref ExistingJwtAuthorizerId, Target: !Sub 'integrations/${QueryIntegration}'}
   QueryByTagsRoute:
     Type: AWS::ApiGatewayV2::Route
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
     Properties: {ApiId: !Ref ExistingHttpApiId, RouteKey: 'POST /query/by-tags', AuthorizationType: JWT, AuthorizerId: !Ref ExistingJwtAuthorizerId, Target: !Sub 'integrations/${QueryIntegration}'}
   QueryBySpeciesRoute:
     Type: AWS::ApiGatewayV2::Route
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
     Properties: {ApiId: !Ref ExistingHttpApiId, RouteKey: 'POST /query/by-species', AuthorizationType: JWT, AuthorizerId: !Ref ExistingJwtAuthorizerId, Target: !Sub 'integrations/${QueryIntegration}'}
   QueryByThumbnailRoute:
     Type: AWS::ApiGatewayV2::Route
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
     Properties: {ApiId: !Ref ExistingHttpApiId, RouteKey: 'GET /query/by-thumbnail', AuthorizationType: JWT, AuthorizerId: !Ref ExistingJwtAuthorizerId, Target: !Sub 'integrations/${QueryIntegration}'}
   QueryByFileRoute:
     Type: AWS::ApiGatewayV2::Route
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
     Properties: {ApiId: !Ref ExistingHttpApiId, RouteKey: 'POST /query/by-file', AuthorizationType: JWT, AuthorizerId: !Ref ExistingJwtAuthorizerId, Target: !Sub 'integrations/${QueryIntegration}'}
   EditTagsRoute:
     Type: AWS::ApiGatewayV2::Route
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
     Properties: {ApiId: !Ref ExistingHttpApiId, RouteKey: 'POST /tags/edit', AuthorizationType: JWT, AuthorizerId: !Ref ExistingJwtAuthorizerId, Target: !Sub 'integrations/${QueryIntegration}'}
   DeleteFilesRoute:
     Type: AWS::ApiGatewayV2::Route
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
     Properties: {ApiId: !Ref ExistingHttpApiId, RouteKey: 'POST /files/delete', AuthorizationType: JWT, AuthorizerId: !Ref ExistingJwtAuthorizerId, Target: !Sub 'integrations/${QueryIntegration}'}
   SubscribeRoute:
     Type: AWS::ApiGatewayV2::Route
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
     Properties: {ApiId: !Ref ExistingHttpApiId, RouteKey: 'POST /notifications/subscribe', AuthorizationType: JWT, AuthorizerId: !Ref ExistingJwtAuthorizerId, Target: !Sub 'integrations/${QueryIntegration}'}
   UnsubscribeRoute:
     Type: AWS::ApiGatewayV2::Route
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
     Properties: {ApiId: !Ref ExistingHttpApiId, RouteKey: 'DELETE /notifications/subscribe', AuthorizationType: JWT, AuthorizerId: !Ref ExistingJwtAuthorizerId, Target: !Sub 'integrations/${QueryIntegration}'}
   SubscriptionsRoute:
     Type: AWS::ApiGatewayV2::Route
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
     Properties: {ApiId: !Ref ExistingHttpApiId, RouteKey: 'GET /notifications/subscriptions', AuthorizationType: JWT, AuthorizerId: !Ref ExistingJwtAuthorizerId, Target: !Sub 'integrations/${QueryIntegration}'}
   NotificationsRoute:
     Type: AWS::ApiGatewayV2::Route
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
     Properties: {ApiId: !Ref ExistingHttpApiId, RouteKey: 'GET /notifications', AuthorizationType: JWT, AuthorizerId: !Ref ExistingJwtAuthorizerId, Target: !Sub 'integrations/${QueryIntegration}'}
 
   ReserveUploadRoute:
     Type: AWS::ApiGatewayV2::Route
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
     Properties: {ApiId: !Ref ExistingHttpApiId, RouteKey: 'POST /internal/uploads/reserve', AuthorizationType: NONE, Target: !Sub 'integrations/${QueryIntegration}'}
   AcquireProcessingRoute:
     Type: AWS::ApiGatewayV2::Route
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
     Properties: {ApiId: !Ref ExistingHttpApiId, RouteKey: 'POST /internal/files/{file_id}/processing', AuthorizationType: NONE, Target: !Sub 'integrations/${QueryIntegration}'}
   CompleteFileRoute:
     Type: AWS::ApiGatewayV2::Route
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
     Properties: {ApiId: !Ref ExistingHttpApiId, RouteKey: 'PUT /internal/files/{file_id}/complete', AuthorizationType: NONE, Target: !Sub 'integrations/${QueryIntegration}'}
   FailFileRoute:
     Type: AWS::ApiGatewayV2::Route
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
     Properties: {ApiId: !Ref ExistingHttpApiId, RouteKey: 'PUT /internal/files/{file_id}/failed', AuthorizationType: NONE, Target: !Sub 'integrations/${QueryIntegration}'}
   AuthorizeAssetsRoute:
     Type: AWS::ApiGatewayV2::Route
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
     Properties: {ApiId: !Ref ExistingHttpApiId, RouteKey: 'POST /internal/assets/authorize', AuthorizationType: NONE, Target: !Sub 'integrations/${QueryIntegration}'}
 
   AuthTestOptionsRoute:

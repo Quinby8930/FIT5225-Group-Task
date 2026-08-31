@@ -240,6 +240,35 @@ def test_resource_policy_requires_exact_supported_mapping():
         validate_snapshot(snapshot)
 
 
+def _update_processed(role):
+    resources = {
+        "QueryLambdaRole": role,
+        "QueryFunction": {"Type": "AWS::Lambda::Function", "Properties": {"Role": {"Fn::GetAtt": ["QueryLambdaRole", "Arn"]}}},
+        "QueryIntegration": {"Type": "AWS::ApiGatewayV2::Integration"},
+    }
+    resources.update({logical_id: {"Type": "AWS::ApiGatewayV2::Route"} for logical_id in ROUTES_BY_LOGICAL_ID})
+    return {"Resources": resources}
+
+
+def test_role_modify_allows_only_new_retain_metadata():
+    audited = {"processed_definition": {"Type": "AWS::IAM::Role", "Properties": {"Path": "/", "Tags": []}}}
+    processed = _update_processed({**audited["processed_definition"], "DeletionPolicy": "Retain", "UpdateReplacePolicy": "Retain"})
+    changes = [{"ResourceChange": {"Action": "Modify", "LogicalResourceId": "QueryLambdaRole", "Replacement": "False"}}]
+    validate_update_change_set(changes, processed, audited)
+
+
+@pytest.mark.parametrize("role", [
+    {"Type": "AWS::IAM::Role", "Properties": {"Path": "/changed", "Tags": []}, "DeletionPolicy": "Retain", "UpdateReplacePolicy": "Retain"},
+    {"Type": "AWS::IAM::Role", "Properties": {"Path": "/", "Tags": []}, "DeletionPolicy": "Delete", "UpdateReplacePolicy": "Retain"},
+    {"Type": "AWS::IAM::Role", "Properties": {"Path": "/", "Tags": []}, "DeletionPolicy": "Retain", "UpdateReplacePolicy": "Retain", "Metadata": {"unexpected": True}},
+])
+def test_role_modify_rejects_any_non_retain_or_other_difference(role):
+    audited = {"processed_definition": {"Type": "AWS::IAM::Role", "Properties": {"Path": "/", "Tags": []}}}
+    changes = [{"ResourceChange": {"Action": "Modify", "LogicalResourceId": "QueryLambdaRole", "Replacement": "False"}}]
+    with pytest.raises(AdoptionError, match="QueryLambdaRole"):
+        validate_update_change_set(changes, _update_processed(role), audited)
+
+
 @pytest.mark.parametrize("resource", ["integration", "route"])
 def test_unknown_api_gateway_configuration_still_fails_closed(resource):
     snapshot = valid_snapshot()
