@@ -41,7 +41,7 @@ class AwsCli:
     def json(self, *args: str) -> Any:
         try:
             completed = subprocess.run(["aws", *args, "--output", "json", "--no-cli-pager"], check=True, capture_output=True, text=True)
-            return json.loads(completed.stdout)
+            return json.loads(completed.stdout or "{}")
         except (subprocess.SubprocessError, json.JSONDecodeError):
             raise AdoptionError("AWS CLI query failed") from None
 

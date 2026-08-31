@@ -1,6 +1,7 @@
 import base64
 import hashlib
 import json
+import subprocess
 import sys
 import traceback
 from copy import deepcopy
@@ -23,6 +24,7 @@ from adoption import (
 )
 from prepare_import import (
     AuditConfig,
+    AwsCli,
     backup_function_package,
     collect_snapshot,
     run_prepare,
@@ -30,6 +32,20 @@ from prepare_import import (
     verify_artifact_bucket,
 )
 from test_adoption import valid_snapshot
+
+
+def test_aws_cli_json_accepts_successful_empty_response(monkeypatch):
+    def successful_empty_run(command, **_kwargs):
+        return subprocess.CompletedProcess(
+            args=command,
+            returncode=0,
+            stdout="",
+            stderr="",
+        )
+
+    monkeypatch.setattr("prepare_import.subprocess.run", successful_empty_run)
+
+    assert AwsCli().json("lambda", "get-function-concurrency") == {}
 
 
 class FakeAwsCli:
