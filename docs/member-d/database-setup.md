@@ -42,7 +42,8 @@
 ### 2.1 全新普通 AWS 账号：正常 SAM 部署
 
 只有在目标账号中**不存在** Member D 的 Query Lambda、integration、16 条业务路由和
-对应 DynamoDB 资源时，才使用普通 SAM 部署：
+对应 DynamoDB 资源（包括 `PacificBioArchiveUploadReservations`）时，才使用普通 SAM
+部署：
 
 ```bash
 sam build --template-file infrastructure/member-d/dynamodb.yaml
@@ -51,29 +52,37 @@ sam deploy --guided
 
 在 guided prompts 中填入上表参数，并将区域设为 `ap-southeast-2`。密钥应通过团队
 认可的安全部署流程输入；不要把真实值写入 `samconfig.toml`、shell 脚本、文档、Git
-或群聊。C 只负责阿里云部署，不操作 AWS；B/D 不持有部署职责。
+或群聊。对 `Save arguments to configuration file` 明确回答 `N`，避免 NoEcho 值被保存。
+C 只负责阿里云部署，不操作 AWS；B/D 不持有部署职责。
 
 ### 2.2 当前账号：先纳管现有在线资源
 
-当前账号已经存在 `PacificBioArchive-QueryLambda`、单一 integration 和 16 条 Member D
-非 OPTIONS 路由，但这些资源不完全属于 `PacificBioArchive-Database` stack。这里禁止直接
-运行 `sam deploy --guided` 或重试失败的 UPDATE；必须完整执行
+当前账号已经存在 `PacificBioArchive-QueryLambda`、单一 integration、16 条 Member D
+非 OPTIONS 路由，以及未被 stack 管理的 `PacificBioArchiveUploadReservations` 表；
+`QueryLambdaRole` 还有已审计的 reservation-only 权限漂移。这里禁止直接运行
+`sam deploy --guided` 或重试失败的 UPDATE；必须完整执行
 [`aws-resource-adoption.md`](aws-resource-adoption.md)：
 
-1. 先创建并审查恰好 18 项的 IMPORT change set；
+1. 先创建并审查恰好 19 项的 IMPORT change set；
 2. 得到第一次明确批准后执行 IMPORT，并证明运行时未改变；
-3. 再创建并审查正常 UPDATE change set；
-4. 得到第二次明确批准后执行 UPDATE。
+3. 再创建并审查独立 UPDATE change set，以
+   `AllowLegacyProcessingCallbacks=true` 安全接住尚未证明已升级的旧 Member B，同时将角色
+   收敛到模板中的规范权限；
+4. 得到第二次明确批准后执行 UPDATE；精确移除旧宽泛 Lambda permission、数据 backfill、
+   Member B 部署和最终关闭兼容开关均各自单独审查、批准和验证。
 
 如果 stack 是 `UPDATE_ROLLBACK_COMPLETE`，事件包含 `RouteKey ... already exists`，不要
 重试同一模板，也不要删除在线 route/integration/Lambda/stack。该状态正说明要先纳管资源。
 
-**会创建：**
+**最终由 CloudFormation 管理的资源：**
+
+全新账号会创建这些资源；当前账号中的 `PacificBioArchiveUploadReservations` 由 IMPORT
+原样纳管，不会重新创建。
 
 | 资源 | 名称 | 说明 |
 |------|------|------|
 | DynamoDB 表 | `PacificBioArchiveFiles` | 文件元数据，主键 `file_id`（字符串），按需计费 |
-| DynamoDB 表 | `PacificBioArchiveUploadReservations` | checksum 原子预约，主键 `reservation_key` |
+| DynamoDB 表 | `PacificBioArchiveUploadReservations` | checksum 原子预约，主键 `reservation_key`；当前账号中为既有表，通过 IMPORT 纳管 |
 | DynamoDB 表 | `PacificBioArchiveSubscriptions` | 订阅，主键 `user_id` + 排序键 `species` |
 | DynamoDB 表 | `PacificBioArchiveNotifications` | 通知，主键 `user_id` + 排序键 `notification_id` |
 | SNS Topic | `NotificationTopic` | QueryFunction 发布通知；可条件订阅 email |
@@ -106,7 +115,8 @@ token，因此旧 worker 和新 worker 同处 processing 状态时仍缺少 gene
 
 ### 3.2 从旧 FilesTable 受控切换 reservation claims
 
-新 `ReservationsTable` 部署后，**不能只依赖运行时 fallback Scan 当作迁移**。fallback
+既有 `ReservationsTable` 完成 IMPORT 纳管且后续 UPDATE 成功后，**不能只依赖运行时
+fallback Scan 当作迁移**。fallback
 使用强一致 Scan 和条件 claim，只是 fail-closed 兼容保护。成员 A 必须：
 
 1. 暂停**所有会修改 FilesTable 或 ReservationsTable 的路径**，包括 reserve/上传、

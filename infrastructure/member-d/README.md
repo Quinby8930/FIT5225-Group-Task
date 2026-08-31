@@ -38,6 +38,9 @@ sam build --template-file infrastructure/member-d/dynamodb.yaml
 sam deploy --guided
 ```
 
+在 guided prompt 的 `Save arguments to configuration file` 处回答 `N`；不要把共享内部
+key 保存到 `samconfig.toml`。
+
 Member A performs the guided deployment for all AWS B/D resources. It requires
 the existing HTTP API and JWT authorizer IDs, the A-managed Member B private
 bucket and storage-delete function name, Member C's Alibaba Cloud HTTPS base
@@ -48,13 +51,19 @@ key in Git or use a fake/default endpoint.
 
 ### Existing project account
 
-The current account already has an unmanaged live Query Lambda, one integration,
-and sixteen Member D non-OPTIONS routes. Do **not** run `sam deploy --guided` in
-that account before adoption. Follow
+The current account already has an unmanaged live reservations table, Query
+Lambda, one integration, and sixteen Member D non-OPTIONS routes. The
+stack-managed Query Lambda role also has the narrowly audited reservation-only
+permission drift described in the runbook. Do **not** run `sam deploy --guided`
+in that account before adoption. Follow
 [`../../docs/member-d/aws-resource-adoption.md`](../../docs/member-d/aws-resource-adoption.md)
-to import exactly those eighteen resources, pass the first explicit execution
+to import exactly those nineteen resources, pass the first explicit execution
 approval, verify runtime continuity, then review and separately approve the
-normal UPDATE.
+normal UPDATE that reconciles the role. That first UPDATE keeps legacy callbacks
+temporarily enabled until the latest Member B deployment is proven to forward
+lease tokens. Legacy broad Lambda permission removal, reservations backfill,
+Member B deployment, and the final UPDATE to disable compatibility are separate
+reviewed and approved writes; see the runbook for the exact order.
 
 If the stack is `UPDATE_ROLLBACK_COMPLETE` because a RouteKey already exists,
 never retry the same template and never delete the live route, integration,

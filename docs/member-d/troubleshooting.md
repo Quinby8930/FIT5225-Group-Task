@@ -110,7 +110,7 @@ at-least-once；若消息已接受但 delivered
 
 ---
 
-## 7. 新 ReservationsTable 部署后 verify 报缺 claim 或冲突
+## 7. ReservationsTable 纳管/部署后 verify 报缺 claim 或冲突
 
 **原因**：旧 FilesTable 行没有对应 claim，或旧数据已违反 `(user_id, checksum)`
 唯一性。运行时 fallback 不是正式迁移完成证明。
@@ -177,5 +177,7 @@ rm -f data/pacific_bioarchive.db && python seed.py
 3. 按 [`aws-resource-adoption.md`](aws-resource-adoption.md) 从只读 audit 开始，先用
    IMPORT 纳管现有 Lambda、integration 和 16 条 Member D 非 OPTIONS 路由。
 4. IMPORT 验收完成后再审查正常 UPDATE；只有得到第二次明确审批，才执行 UPDATE。
+5. 首次 UPDATE 完成并不代表迁移结束；继续严格执行主手册的 STOP 3–6，分别审批旧宽泛
+   permission 移除、reservations backfill、Member B 部署和最终关闭兼容开关。
 
 全新账号没有这些在线资源，不需要 adoption，可按 `database-setup.md §2.1` 正常部署。

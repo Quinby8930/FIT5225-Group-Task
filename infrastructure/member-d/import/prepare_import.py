@@ -11,15 +11,20 @@ import base64
 import hashlib
 import hmac
 import json
+import re
+import stat
 import subprocess
+import time
 import yaml
+from copy import deepcopy
 from functools import wraps
+from urllib.parse import unquote
 from urllib.request import urlopen
 from dataclasses import dataclass
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from tempfile import TemporaryDirectory
 from typing import Any, Callable, Mapping
-from zipfile import BadZipFile, ZipFile
+from zipfile import BadZipFile, ZIP_DEFLATED, ZipFile, ZipInfo
 
 from adoption import (
     AdoptionError,
@@ -29,8 +34,14 @@ from adoption import (
     build_import_template,
     build_parameters_to_reuse,
     build_resources_to_import,
+    validate_import_artifacts,
     validate_import_change_set,
+    validate_built_template,
+    validate_hardening_function_transition,
+    validate_hardening_parameter_transition,
+    validate_lambda_policy_after_update,
     validate_snapshot,
+    validate_update_artifacts,
     validate_update_change_set,
 )
 
@@ -45,12 +56,36 @@ class AwsCli:
         except (subprocess.SubprocessError, json.JSONDecodeError):
             raise AdoptionError("AWS CLI query failed") from None
 
+    def optional_json(self, expected_error: str, *args: str) -> Any | None:
+        """Return None only for one explicitly approved AWS error code."""
+        try:
+            completed = subprocess.run(
+                ["aws", *args, "--output", "json", "--no-cli-pager"],
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+        except subprocess.SubprocessError:
+            raise AdoptionError("AWS CLI query failed") from None
+        if completed.returncode == 0:
+            try:
+                return json.loads(completed.stdout or "{}")
+            except json.JSONDecodeError:
+                raise AdoptionError("AWS CLI query failed") from None
+        if expected_error and expected_error in (completed.stderr or ""):
+            return None
+        raise AdoptionError("AWS CLI query failed") from None
+
     def run(self, *args: str) -> Any:
         try:
             completed = subprocess.run(["aws", *args, "--output", "json", "--no-cli-pager"], check=True, capture_output=True, text=True)
             return json.loads(completed.stdout or "{}")
         except (subprocess.SubprocessError, json.JSONDecodeError):
             raise AdoptionError("AWS CLI command failed") from None
+
+    def pause(self, seconds: float) -> None:
+        """Wait between eventually-consistent absence confirmations."""
+        time.sleep(seconds)
 
 
 @dataclass(frozen=True)
@@ -76,6 +111,44 @@ _API_GATEWAY_OUTPUT_ONLY_KEYS = {
     },
     "API Gateway route": {"ApiGatewayManaged"},
 }
+_RESERVATIONS_TABLE_NAME = "PacificBioArchiveUploadReservations"
+_HARDENING_ENVIRONMENT_NAMES = (
+    "REPO_BACKEND",
+    "DYNAMODB_TABLE",
+    "RESERVATIONS_TABLE",
+    "SUBSCRIPTIONS_TABLE",
+    "NOTIFICATIONS_TABLE",
+    "STORAGE_BACKEND",
+    "STORAGE_DELETE_FUNCTION_NAME",
+    "TAG_DETECTOR_BACKEND",
+    "QUERY_INPUT_BUCKET",
+    "INFERENCE_API_URL",
+    "ALLOW_LEGACY_PROCESSING_CALLBACKS",
+    "NOTIFICATION_PUBLISHER",
+    "SNS_TOPIC_ARN",
+    "CORS_ORIGINS",
+)
+_HARDENING_FUNCTION_FIELDS = (
+    "FunctionName",
+    "Runtime",
+    "Handler",
+    "Role",
+    "Timeout",
+    "MemorySize",
+    "Description",
+    "PackageType",
+    "Architectures",
+    "Layers",
+    "EphemeralStorage",
+    "VpcConfig",
+    "FileSystemConfigs",
+    "KmsKeyArn",
+    "DeadLetterConfig",
+    "TracingConfig",
+    "LoggingConfig",
+    "CodeSigningConfigArn",
+    "CodeSha256",
+)
 
 
 class _CloudFormationLoader(yaml.SafeLoader):
@@ -253,6 +326,254 @@ def _semantic_tags(tags: Any) -> set[tuple[str, str]]:
     return result
 
 
+def _decode_json_document(value: Any, description: str) -> Any:
+    if not isinstance(value, str):
+        return deepcopy(value)
+    candidates = (value, unquote(value))
+    for candidate in candidates:
+        try:
+            return json.loads(candidate)
+        except json.JSONDecodeError:
+            continue
+    raise AdoptionError(f"{description} is malformed")
+
+
+def _normalize_policy_response(value: Any, expected_name: str) -> dict[str, Any]:
+    if not isinstance(value, Mapping):
+        raise AdoptionError("QueryLambdaRole inline policy is malformed")
+    policy_name = value.get("PolicyName", expected_name)
+    if policy_name != expected_name or "PolicyDocument" not in value:
+        raise AdoptionError("QueryLambdaRole inline policy is malformed")
+    return {
+        "PolicyName": expected_name,
+        "PolicyDocument": _decode_json_document(
+            value.get("PolicyDocument"),
+            "QueryLambdaRole inline policy document",
+        ),
+    }
+
+
+def _normalize_drift_value(value: Any) -> Any:
+    if value is None:
+        return None
+    decoded = _decode_json_document(value, "QueryLambdaRole drift value")
+    if isinstance(decoded, Mapping) and "PolicyDocument" in decoded:
+        decoded = dict(decoded)
+        decoded["PolicyDocument"] = _decode_json_document(
+            decoded["PolicyDocument"],
+            "QueryLambdaRole drift policy document",
+        )
+    return decoded
+
+
+def _normalize_role_drift(value: Any) -> dict[str, Any]:
+    if not isinstance(value, Mapping):
+        raise AdoptionError("QueryLambdaRole drift evidence is unavailable")
+    raw = value.get("StackResourceDrift", value)
+    if not isinstance(raw, Mapping):
+        raise AdoptionError("QueryLambdaRole drift evidence is unavailable")
+    status = raw.get("StackResourceDriftStatus")
+    raw_differences = raw.get("PropertyDifferences", [])
+    if not isinstance(raw_differences, list):
+        raise AdoptionError("QueryLambdaRole drift evidence is malformed")
+    differences = []
+    for item in raw_differences:
+        if not isinstance(item, Mapping):
+            raise AdoptionError("QueryLambdaRole drift evidence is malformed")
+        differences.append(
+            {
+                "path": item.get("PropertyPath"),
+                "type": item.get("DifferenceType"),
+                "expected": _normalize_drift_value(item.get("ExpectedValue")),
+                "actual": _normalize_drift_value(item.get("ActualValue")),
+            }
+        )
+    return {"status": status, "differences": differences}
+
+
+def _collect_reservations_table(
+    cli: AwsCli,
+    config: AuditConfig,
+) -> dict[str, Any]:
+    response = cli.json(
+        "dynamodb",
+        "describe-table",
+        "--table-name",
+        _RESERVATIONS_TABLE_NAME,
+        "--region",
+        config.region,
+    )
+    raw = response.get("Table") if isinstance(response, Mapping) else None
+    if not isinstance(raw, Mapping):
+        raise AdoptionError("ReservationsTable is unavailable")
+    table_arn = raw.get("TableArn")
+    if not isinstance(table_arn, str):
+        raise AdoptionError("ReservationsTable ARN is unavailable")
+
+    ttl_response = cli.json(
+        "dynamodb",
+        "describe-time-to-live",
+        "--table-name",
+        _RESERVATIONS_TABLE_NAME,
+        "--region",
+        config.region,
+    )
+    ttl = (
+        ttl_response.get("TimeToLiveDescription", {})
+        if isinstance(ttl_response, Mapping)
+        else {}
+    )
+    backups_response = cli.json(
+        "dynamodb",
+        "describe-continuous-backups",
+        "--table-name",
+        _RESERVATIONS_TABLE_NAME,
+        "--region",
+        config.region,
+    )
+    continuous = (
+        backups_response.get("ContinuousBackupsDescription", {})
+        if isinstance(backups_response, Mapping)
+        else {}
+    )
+    recovery = (
+        continuous.get("PointInTimeRecoveryDescription", {})
+        if isinstance(continuous, Mapping)
+        else {}
+    )
+    tag_response = cli.json(
+        "dynamodb",
+        "list-tags-of-resource",
+        "--resource-arn",
+        table_arn,
+        "--region",
+        config.region,
+    )
+    tags = tag_response.get("Tags") if isinstance(tag_response, Mapping) else None
+    if not isinstance(tags, list):
+        raise AdoptionError("ReservationsTable tags are malformed")
+
+    policy_response = None
+    for attempt in range(3):
+        policy_response = cli.optional_json(
+            "PolicyNotFoundException",
+            "dynamodb",
+            "get-resource-policy",
+            "--resource-arn",
+            table_arn,
+            "--region",
+            config.region,
+        )
+        if policy_response is not None:
+            break
+        if attempt < 2:
+            cli.pause(15.0)
+    if policy_response is None:
+        resource_policy = None
+    else:
+        raw_policy = (
+            policy_response.get("Policy")
+            if isinstance(policy_response, Mapping)
+            else None
+        )
+        resource_policy = _decode_json_document(
+            raw_policy,
+            "ReservationsTable resource policy",
+        )
+        if not isinstance(resource_policy, Mapping):
+            raise AdoptionError("ReservationsTable resource policy is malformed")
+
+    kinesis_response = cli.json(
+        "dynamodb",
+        "describe-kinesis-streaming-destination",
+        "--table-name",
+        _RESERVATIONS_TABLE_NAME,
+        "--region",
+        config.region,
+    )
+    kinesis_destinations = (
+        kinesis_response.get("KinesisDataStreamDestinations")
+        if isinstance(kinesis_response, Mapping)
+        else None
+    )
+    if not isinstance(kinesis_destinations, list):
+        raise AdoptionError("ReservationsTable Kinesis destinations are malformed")
+
+    insights_response = cli.json(
+        "dynamodb",
+        "describe-contributor-insights",
+        "--table-name",
+        _RESERVATIONS_TABLE_NAME,
+        "--region",
+        config.region,
+    )
+    insights_status = (
+        insights_response.get("ContributorInsightsStatus")
+        if isinstance(insights_response, Mapping)
+        else None
+    )
+    if not isinstance(insights_status, str):
+        raise AdoptionError("ReservationsTable Contributor Insights is malformed")
+
+    sse = raw.get("SSEDescription")
+    if sse in (None, {}):
+        sse_mode = "AWS_OWNED"
+    elif (
+        isinstance(sse, Mapping)
+        and sse.get("Status") == "ENABLED"
+        and sse.get("SSEType") == "AES256"
+        and not sse.get("KMSMasterKeyArn")
+    ):
+        sse_mode = "AWS_OWNED"
+    else:
+        sse_mode = "NON_DEFAULT"
+    billing_summary = raw.get("BillingModeSummary", {})
+    billing_mode = (
+        billing_summary.get("BillingMode")
+        if isinstance(billing_summary, Mapping)
+        else None
+    )
+    if billing_mode is None:
+        billing_mode = raw.get("BillingMode")
+    table_class_summary = raw.get("TableClassSummary", {})
+    table_class = (
+        table_class_summary.get("TableClass", "STANDARD")
+        if isinstance(table_class_summary, Mapping)
+        else None
+    )
+    stream = raw.get("StreamSpecification")
+    if stream == {"StreamEnabled": False}:
+        stream = None
+    return {
+        "TableName": raw.get("TableName"),
+        "TableStatus": raw.get("TableStatus"),
+        "TableArn": table_arn,
+        "BillingMode": billing_mode,
+        "AttributeDefinitions": deepcopy(raw.get("AttributeDefinitions", [])),
+        "KeySchema": deepcopy(raw.get("KeySchema", [])),
+        "GlobalSecondaryIndexes": deepcopy(raw.get("GlobalSecondaryIndexes", [])),
+        "LocalSecondaryIndexes": deepcopy(raw.get("LocalSecondaryIndexes", [])),
+        "StreamSpecification": deepcopy(stream),
+        "DeletionProtectionEnabled": raw.get("DeletionProtectionEnabled", False),
+        "TableClass": table_class,
+        "Replicas": deepcopy(raw.get("Replicas", [])),
+        "Tags": deepcopy(tags),
+        "TimeToLiveStatus": ttl.get("TimeToLiveStatus"),
+        "PointInTimeRecoveryStatus": recovery.get(
+            "PointInTimeRecoveryStatus"
+        ),
+        "SSEMode": sse_mode,
+        "OnDemandThroughput": deepcopy(raw.get("OnDemandThroughput")),
+        "WarmThroughput": deepcopy(raw.get("WarmThroughput")),
+        "MultiRegionConsistency": raw.get("MultiRegionConsistency"),
+        "ResourcePolicy": deepcopy(resource_policy),
+        "KinesisDataStreamDestinations": deepcopy(kinesis_destinations),
+        "ContributorInsightsStatus": insights_status,
+        "VectorIndexes": deepcopy(raw.get("VectorIndexes", [])),
+        "GlobalTableWitnesses": deepcopy(raw.get("GlobalTableWitnesses", [])),
+    }
+
+
 @_sanitize_audit_errors
 def collect_snapshot(cli: AwsCli, config: AuditConfig) -> dict[str, Any]:
     caller = cli.json("sts", "get-caller-identity", "--region", config.region)
@@ -278,16 +599,32 @@ def collect_snapshot(cli: AwsCli, config: AuditConfig) -> dict[str, Any]:
     resource_summaries = summaries.get("StackResourceSummaries", []) if isinstance(summaries, Mapping) else []
     managed = {item.get("LogicalResourceId"): item.get("PhysicalResourceId") for item in resource_summaries if isinstance(item, Mapping)}
     expected_managed = {"FilesTable", "SubscriptionsTable", "NotificationsTable", "QueryLambdaRole"}
-    adopted_managed = expected_managed | {"QueryFunction", "QueryIntegration", *ROUTES_BY_LOGICAL_ID}
+    adopted_managed = expected_managed | {
+        "ReservationsTable",
+        "QueryFunction",
+        "QueryIntegration",
+        *ROUTES_BY_LOGICAL_ID,
+    }
     if set(managed) not in (expected_managed, adopted_managed) or any(not managed[key] for key in managed):
         raise AdoptionError("managed resource set mismatch")
-    active = cli.json("cloudformation", "list-stacks", "--stack-status-filter", "CREATE_COMPLETE", "UPDATE_COMPLETE", "UPDATE_ROLLBACK_COMPLETE", "IMPORT_COMPLETE", "--region", config.region)
+    active = cli.json(
+        "cloudformation",
+        "list-stacks",
+        "--region",
+        config.region,
+    )
     other_stack_physical_ids: set[str] = set()
     for other in active.get("StackSummaries", []) if isinstance(active, Mapping) else []:
         other_name = other.get("StackName") if isinstance(other, Mapping) else None
-        if other_name and other_name != config.stack:
+        other_status = other.get("StackStatus") if isinstance(other, Mapping) else None
+        if (
+            other_name
+            and other_name != config.stack
+            and other_status != "DELETE_COMPLETE"
+        ):
             other_resources = cli.json("cloudformation", "list-stack-resources", "--stack-name", other_name, "--region", config.region)
             other_stack_physical_ids.update(str(item.get("PhysicalResourceId")) for item in other_resources.get("StackResourceSummaries", []) if isinstance(item, Mapping) and item.get("PhysicalResourceId"))
+    reservations_table = _collect_reservations_table(cli, config)
     fields = ["FunctionName", "Runtime", "Handler", "Role", "Timeout", "MemorySize", "Description", "SnapStart", "PackageType", "Architectures", "Layers", "EphemeralStorage", "VpcConfig", "FileSystemConfigs", "KmsKeyArn", "DeadLetterConfig", "TracingConfig", "LoggingConfig", "CodeSigningConfigArn", "RuntimeManagementConfig", "ReservedConcurrentExecutions", "CodeSha256", "Environment"]
     query = "{" + ",".join([*(f"{field}: {field}" for field in fields), *(f"{name}: Environment.Variables.{name}" for name in _SAFE_ENVIRONMENT_NAMES)]) + "}"
     configuration = cli.json("lambda", "get-function-configuration", "--function-name", config.function, "--region", config.region, "--query", query)
@@ -323,9 +660,55 @@ def collect_snapshot(cli: AwsCli, config: AuditConfig) -> dict[str, Any]:
         raise AdoptionError("IAM role identity differs from Lambda role")
     attached = cli.json("iam", "list-attached-role-policies", "--role-name", role_name).get("AttachedPolicies", [])
     inline_names = cli.json("iam", "list-role-policies", "--role-name", role_name).get("PolicyNames", [])
-    inline = {name: cli.json("iam", "get-role-policy", "--role-name", role_name, "--policy-name", name) for name in inline_names}
+    if not isinstance(inline_names, list) or not all(
+        isinstance(name, str) and name for name in inline_names
+    ):
+        raise AdoptionError("QueryLambdaRole inline policy names are malformed")
+    inline = {
+        name: _normalize_policy_response(
+            cli.json(
+                "iam",
+                "get-role-policy",
+                "--role-name",
+                role_name,
+                "--policy-name",
+                name,
+            ),
+            name,
+        )
+        for name in inline_names
+    }
     tags = cli.json("iam", "list-role-tags", "--role-name", role_name).get("Tags", [])
-    role_view = {"role_name": role.get("RoleName"), "path": role.get("Path"), "trust_policy": role.get("AssumeRolePolicyDocument"), "permissions_boundary": role.get("PermissionsBoundary"), "managed_policies": attached, "inline_policies": inline, "tags": tags}
+    drift = _normalize_role_drift(
+        cli.json(
+            "cloudformation",
+            "detect-stack-resource-drift",
+            "--stack-name",
+            config.stack,
+            "--logical-resource-id",
+            "QueryLambdaRole",
+            "--region",
+            config.region,
+        )
+    )
+    trust_policy = _decode_json_document(
+        role.get("AssumeRolePolicyDocument"),
+        "QueryLambdaRole trust policy",
+    )
+    if not isinstance(trust_policy, Mapping):
+        raise AdoptionError("QueryLambdaRole trust policy is malformed")
+    role_view = {
+        "role_name": role.get("RoleName"),
+        "account": account,
+        "region": config.region,
+        "path": role.get("Path"),
+        "trust_policy": trust_policy,
+        "permissions_boundary": role.get("PermissionsBoundary"),
+        "managed_policies": attached,
+        "inline_policies": inline,
+        "tags": tags,
+        "drift": drift,
+    }
     processed_role = template.get("Resources", {}).get("QueryLambdaRole", {})
     processed_properties = processed_role.get("Properties", {}) if isinstance(processed_role, Mapping) else {}
     if processed_properties.get("RoleName") != role_name:
@@ -339,10 +722,6 @@ def collect_snapshot(cli: AwsCli, config: AuditConfig) -> dict[str, Any]:
     live_arns = {policy.get("PolicyArn") for policy in attached}
     if (live_arns and "ManagedPolicyArns" not in processed_properties) or ("ManagedPolicyArns" in processed_properties and {_canonical(value) for value in processed_properties["ManagedPolicyArns"]} != {_canonical(value) for value in live_arns}):
         raise AdoptionError("QueryLambdaRole managed policies differ from processed template")
-    live_inline = {(name, _canonical(value.get("PolicyDocument"))) for name, value in inline.items()}
-    processed_inline = {(item.get("PolicyName"), _canonical(item.get("PolicyDocument"))) for item in processed_properties.get("Policies", [])}
-    if live_inline != processed_inline:
-        raise AdoptionError("QueryLambdaRole inline policies differ from processed template")
     if _semantic_tags(processed_properties.get("Tags", [])) != _semantic_tags(tags):
         raise AdoptionError("QueryLambdaRole tags differ from processed template")
     role_view["processed_definition"] = processed_role
@@ -363,12 +742,21 @@ def collect_snapshot(cli: AwsCli, config: AuditConfig) -> dict[str, Any]:
     authorizer = next((item for item in authorizers if item.get("AuthorizerId") == config.authorizer), None)
     if not isinstance(authorizer, Mapping):
         raise AdoptionError("API authorizer is unavailable")
-    candidate_ids = {config.function, config.integration}
+    candidate_ids = {
+        _RESERVATIONS_TABLE_NAME,
+        config.function,
+        config.integration,
+    }
     contracted_keys = {contract.route_key for contract in ROUTES_BY_LOGICAL_ID.values()}
     candidate_ids.update(str(route.get("RouteId")) for route in routes if route.get("RouteKey") in contracted_keys and route.get("RouteId"))
     owned_physical_ids = other_stack_physical_ids & candidate_ids
     schemas: dict[str, Any] = {}
-    for resource_type in ("AWS::Lambda::Function", "AWS::ApiGatewayV2::Integration", "AWS::ApiGatewayV2::Route"):
+    for resource_type in (
+        "AWS::DynamoDB::Table",
+        "AWS::Lambda::Function",
+        "AWS::ApiGatewayV2::Integration",
+        "AWS::ApiGatewayV2::Route",
+    ):
         type_response = cli.json("cloudformation", "describe-type", "--type", "RESOURCE", "--type-name", resource_type, "--region", config.region)
         schema = type_response.get("Schema") if isinstance(type_response, Mapping) else None
         try:
@@ -379,7 +767,10 @@ def collect_snapshot(cli: AwsCli, config: AuditConfig) -> dict[str, Any]:
         "caller": {"Arn": arn, "Account": caller.get("Account")}, "region": config.region,
         "stack": {"name": config.stack, "status": stack_view.get("StackStatus"), "parameters": [parameter.get("ParameterKey") for parameter in stack_view.get("Parameters", []) if isinstance(parameter, Mapping)], "template": dict(template), "managed": managed},
         "api": {"id": config.api, "stage": dict(stage), "authorizer": dict(authorizer), "routes": routes},
-        "function": function, "integration": dict(integration), "type_schemas": schemas,
+        "function": function,
+        "integration": dict(integration),
+        "reservations_table": reservations_table,
+        "type_schemas": schemas,
         "owned_physical_ids": owned_physical_ids, "role": role_view,
     }
     validate_snapshot(snapshot)
@@ -414,7 +805,11 @@ def run_prepare(cli: AwsCli, config: AuditConfig, artifact_bucket: str, download
     """Create only deterministic, sanitized operator-review files."""
     snapshot = collect_snapshot(cli, config)
     code_response = cli.json("lambda", "get-function", "--function-name", config.function, "--region", config.region, "--query", "Code")
-    code = code_response.get("Code") if isinstance(code_response, Mapping) else None
+    code = code_response if isinstance(code_response, Mapping) else None
+    if isinstance(code, Mapping) and isinstance(code.get("Code"), Mapping):
+        # Accept old wrapper-shaped fakes/clients, while matching the real
+        # `--query Code` AWS CLI response (the Code object itself).
+        code = code["Code"]
     if not isinstance(code, Mapping):
         raise AdoptionError("Lambda package location is unavailable")
     artifact = backup_function_package(cli, {"Location": code.get("Location"), "CodeSha256": snapshot["function"]["CodeSha256"]}, artifact_bucket, downloader, config.region)
@@ -498,6 +893,598 @@ def backup_function_package(cli: AwsCli, code: Mapping[str, str], artifact_bucke
         return CodeArtifact(bucket=artifact_bucket, key=artifact_key, version_id=version_id)
 
 
+def _write_deterministic_zip(
+    source: Path,
+    destination: Path,
+    included_files: Mapping[str, Path] | None = None,
+) -> tuple[str, str]:
+    """Archive exactly one SAM build tree and return hex/base64 SHA-256."""
+    if not source.is_dir():
+        raise AdoptionError("SAM built QueryFunction directory is unavailable")
+    selected = (
+        dict(included_files)
+        if included_files is not None
+        else _regular_files(source, "SAM built QueryFunction directory")
+    )
+    files: list[tuple[Path, str]] = []
+    total_size = 0
+    try:
+        source_resolved = source.resolve()
+        for relative, path in selected.items():
+            if (
+                not relative
+                or relative.startswith("/")
+                or any(part in {"", ".", ".."} for part in relative.split("/"))
+                or path.is_symlink()
+                or not path.is_file()
+                or path.resolve().relative_to(source_resolved).as_posix() != relative
+            ):
+                raise AdoptionError("SAM built QueryFunction path is unsafe")
+            size = path.stat().st_size
+            total_size += size
+            if total_size > 250 * 1024 * 1024:
+                raise AdoptionError("SAM built QueryFunction exceeds Lambda size limit")
+            files.append((path, relative))
+    except (OSError, ValueError):
+        raise AdoptionError("SAM built QueryFunction cannot be read") from None
+    if not files:
+        raise AdoptionError("SAM built QueryFunction is empty")
+    files.sort(key=lambda item: item[1])
+    try:
+        with ZipFile(
+            destination,
+            "w",
+            compression=ZIP_DEFLATED,
+            compresslevel=9,
+        ) as archive:
+            for path, relative in files:
+                info = ZipInfo(relative, date_time=(1980, 1, 1, 0, 0, 0))
+                info.compress_type = ZIP_DEFLATED
+                info.external_attr = (stat.S_IFREG | 0o644) << 16
+                info.create_system = 3
+                archive.writestr(info, path.read_bytes(), compresslevel=9)
+        package = destination.read_bytes()
+    except OSError:
+        raise AdoptionError("SAM built QueryFunction cannot be packaged") from None
+    if len(package) > 50 * 1024 * 1024:
+        raise AdoptionError("SAM built QueryFunction zip exceeds direct upload limit")
+    raw_digest = hashlib.sha256(package).digest()
+    return raw_digest.hex(), base64.b64encode(raw_digest).decode("ascii")
+
+
+def _regular_files(root: Path, description: str) -> dict[str, Path]:
+    if not root.is_dir():
+        raise AdoptionError(f"{description} is unavailable")
+    result: dict[str, Path] = {}
+    try:
+        for path in root.rglob("*"):
+            if path.is_symlink():
+                raise AdoptionError(f"{description} contains a symlink")
+            if path.is_dir():
+                continue
+            if not path.is_file():
+                raise AdoptionError(f"{description} contains an unsafe entry")
+            relative = path.relative_to(root).as_posix()
+            if (
+                not relative
+                or relative.startswith("/")
+                or any(part in {"", ".", ".."} for part in relative.split("/"))
+            ):
+                raise AdoptionError(f"{description} path is unsafe")
+            result[relative] = path
+    except OSError:
+        raise AdoptionError(f"{description} cannot be read") from None
+    return result
+
+
+def _git_tracked_source_files(
+    source: Path, expected_commit: str
+) -> dict[str, Path]:
+    if not re.fullmatch(r"[0-9a-f]{40}", expected_commit):
+        raise AdoptionError("deployment commit is malformed")
+    try:
+        root_result = subprocess.run(
+            ["git", "-C", str(source), "rev-parse", "--show-toplevel"],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        repository = Path(root_result.stdout.strip()).resolve()
+        source_resolved = source.resolve()
+        source_relative = source_resolved.relative_to(repository).as_posix()
+        head = subprocess.run(
+            ["git", "-C", str(repository), "rev-parse", "HEAD"],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        status = subprocess.run(
+            [
+                "git",
+                "-C",
+                str(repository),
+                "status",
+                "--porcelain=v1",
+                "--untracked-files=all",
+                "--",
+                source_relative,
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout
+        tracked = subprocess.run(
+            [
+                "git",
+                "-C",
+                str(repository),
+                "ls-files",
+                "-z",
+                "--",
+                source_relative,
+            ],
+            check=True,
+            capture_output=True,
+        ).stdout.split(b"\0")
+    except (OSError, subprocess.SubprocessError, ValueError):
+        raise AdoptionError("repository source identity cannot be verified") from None
+    if head != expected_commit or status:
+        raise AdoptionError("repository source differs from the approved commit")
+    result: dict[str, Path] = {}
+    prefix = source_relative.rstrip("/") + "/"
+    for raw in tracked:
+        if not raw:
+            continue
+        try:
+            repository_relative = raw.decode("utf-8")
+        except UnicodeDecodeError:
+            raise AdoptionError("repository source path is malformed") from None
+        if not repository_relative.startswith(prefix):
+            raise AdoptionError("repository source path escaped its directory")
+        relative = repository_relative[len(prefix) :]
+        path = repository / PurePosixPath(repository_relative)
+        if path.is_symlink() or not path.is_file():
+            raise AdoptionError("repository source contains an unsafe entry")
+        result[relative] = path
+    if not result:
+        raise AdoptionError("repository source has no tracked files")
+    return result
+
+
+def _verify_committed_file(path: Path, expected_commit: str) -> None:
+    """Bind a repository file's bytes to one clean, full Git commit."""
+    if not re.fullmatch(r"[0-9a-f]{40}", expected_commit):
+        raise AdoptionError("deployment commit is malformed")
+    try:
+        resolved = path.resolve()
+        repository = Path(
+            subprocess.run(
+                ["git", "-C", str(resolved.parent), "rev-parse", "--show-toplevel"],
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout.strip()
+        ).resolve()
+        relative = resolved.relative_to(repository).as_posix()
+        head = subprocess.run(
+            ["git", "-C", str(repository), "rev-parse", "HEAD"],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        status = subprocess.run(
+            [
+                "git",
+                "-C",
+                str(repository),
+                "status",
+                "--porcelain=v1",
+                "--untracked-files=all",
+                "--",
+                relative,
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout
+        subprocess.run(
+            ["git", "-C", str(repository), "ls-files", "--error-unmatch", "--", relative],
+            check=True,
+            capture_output=True,
+        )
+        committed = subprocess.run(
+            ["git", "-C", str(repository), "show", f"{expected_commit}:{relative}"],
+            check=True,
+            capture_output=True,
+        ).stdout
+        working = resolved.read_bytes()
+    except (OSError, subprocess.SubprocessError, ValueError):
+        raise AdoptionError("repository file identity cannot be verified") from None
+    if head != expected_commit or status or not hmac.compare_digest(working, committed):
+        raise AdoptionError("repository file differs from the approved commit")
+
+
+_DEPENDENCY_GENERATED_EXCLUSIONS = (
+    "bin/**",
+    "*.dist-info/RECORD",
+    "*.dist-info/INSTALLER",
+    "*.dist-info/REQUESTED",
+    "**/__pycache__/**",
+    "**/*.pyc",
+    "**/*.pyo",
+    ".pytest_cache/**",
+    "data/pacific_bioarchive.db",
+)
+
+
+def _trusted_dependency_files(manifest: Mapping[str, Any]) -> dict[str, Mapping[str, Any]]:
+    if (
+        not isinstance(manifest, Mapping)
+        or set(manifest)
+        != {
+            "schema",
+            "runtime",
+            "architecture",
+            "generated_files_excluded",
+            "files",
+        }
+        or manifest.get("schema") != 1
+        or manifest.get("runtime") != "python3.12"
+        or manifest.get("architecture") != "x86_64"
+        or tuple(manifest.get("generated_files_excluded", ()))
+        != _DEPENDENCY_GENERATED_EXCLUSIONS
+        or not isinstance(manifest.get("files"), Mapping)
+    ):
+        raise AdoptionError("trusted dependency manifest is malformed")
+    result: dict[str, Mapping[str, Any]] = {}
+    for relative, evidence in manifest["files"].items():
+        if (
+            not isinstance(relative, str)
+            or not relative
+            or relative.startswith("/")
+            or any(part in {"", ".", ".."} for part in relative.split("/"))
+            or not isinstance(evidence, Mapping)
+            or set(evidence) != {"sha256", "size"}
+            or not isinstance(evidence.get("sha256"), str)
+            or not re.fullmatch(r"[0-9a-f]{64}", evidence["sha256"])
+            or not isinstance(evidence.get("size"), int)
+            or isinstance(evidence.get("size"), bool)
+            or evidence["size"] < 0
+            or relative in result
+        ):
+            raise AdoptionError("trusted dependency manifest entry is malformed")
+        result[relative] = evidence
+    if not result:
+        raise AdoptionError("trusted dependency manifest is empty")
+    return result
+
+
+def validate_built_code_tree(
+    source_code_dir: Path,
+    built_code_dir: Path,
+    expected_commit: str | None = None,
+    trusted_dependency_manifest: Mapping[str, Any] | None = None,
+) -> dict[str, Path]:
+    """Return the exact package set after binding Git source and locked dependencies."""
+    source_files = (
+        _git_tracked_source_files(source_code_dir, expected_commit)
+        if expected_commit is not None
+        else _regular_files(source_code_dir, "source QueryFunction directory")
+    )
+    built_files = _regular_files(
+        built_code_dir,
+        "SAM built QueryFunction directory",
+    )
+    for relative, source_path in source_files.items():
+        built_path = built_files.get(relative)
+        if built_path is None:
+            raise AdoptionError(f"SAM build omitted source file {relative}")
+        try:
+            if not hmac.compare_digest(
+                hashlib.sha256(source_path.read_bytes()).digest(),
+                hashlib.sha256(built_path.read_bytes()).digest(),
+            ):
+                raise AdoptionError(f"SAM build changed source file {relative}")
+        except OSError:
+            raise AdoptionError("source/build byte comparison failed") from None
+
+    if trusted_dependency_manifest is None:
+        raise AdoptionError("trusted dependency manifest is required")
+    dependencies = _trusted_dependency_files(trusted_dependency_manifest)
+    collision = set(source_files) & set(dependencies)
+    if collision:
+        raise AdoptionError("trusted dependency manifest overlaps repository source")
+
+    dist_info_directories = {
+        relative.split("/", 1)[0]
+        for relative in dependencies
+        if relative.split("/", 1)[0].endswith(".dist-info")
+    }
+    generated: set[str] = set()
+    for relative in built_files:
+        parts = relative.split("/")
+        if parts[0] == "bin" and len(parts) > 1:
+            generated.add(relative)
+            continue
+        if (
+            relative.endswith((".pyc", ".pyo"))
+            or parts[0] == ".pytest_cache"
+            or relative == "data/pacific_bioarchive.db"
+        ):
+            generated.add(relative)
+            continue
+        if (
+            len(parts) == 2
+            and parts[0].endswith(".dist-info")
+            and parts[1] in {"RECORD", "INSTALLER", "REQUESTED"}
+        ):
+            if parts[0] not in dist_info_directories:
+                raise AdoptionError("SAM build contains untrusted dependency metadata")
+            generated.add(relative)
+
+    packageable = set(built_files) - generated
+    expected = set(source_files) | set(dependencies)
+    if packageable != expected:
+        unexpected = sorted(packageable - expected)
+        missing = sorted(expected - packageable)
+        detail = unexpected[0] if unexpected else missing[0]
+        raise AdoptionError(f"SAM build dependency set differs from lock: {detail}")
+    for relative, evidence in dependencies.items():
+        try:
+            path = built_files[relative]
+            digest = hashlib.sha256(path.read_bytes()).hexdigest()
+            size = path.stat().st_size
+        except OSError:
+            raise AdoptionError("SAM dependency byte comparison failed") from None
+        if size != evidence["size"] or not hmac.compare_digest(
+            digest,
+            evidence["sha256"],
+        ):
+            raise AdoptionError(f"SAM dependency differs from trusted lock: {relative}")
+    return {relative: built_files[relative] for relative in sorted(expected)}
+
+
+def package_update_function(
+    cli: AwsCli,
+    built_code_dir: Path,
+    artifact_bucket: str,
+    output_template: Path,
+    built_template: Mapping[str, Any] | Path,
+    region: str,
+    maintained_template: Mapping[str, Any] | None = None,
+    source_code_dir: Path | None = None,
+    expected_commit: str | None = None,
+    trusted_dependency_manifest: Mapping[str, Any] | None = None,
+) -> CodeArtifact:
+    """Upload an immutable content-addressed SAM build and pin its version."""
+    if isinstance(built_template, Path):
+        try:
+            built_template = _parse_processed_template(
+                built_template.read_text(encoding="utf-8")
+            )
+        except OSError:
+            raise AdoptionError("SAM built UPDATE template is unavailable") from None
+    if maintained_template is None:
+        try:
+            maintained_template = _parse_processed_template(
+                (Path(__file__).resolve().parents[1] / "dynamodb.yaml").read_text(
+                    encoding="utf-8"
+                )
+            )
+        except OSError:
+            raise AdoptionError("maintained Member D template is unavailable") from None
+    validate_built_template(built_template, maintained_template)
+    package_files = validate_built_code_tree(
+        source_code_dir or built_code_dir,
+        built_code_dir,
+        expected_commit,
+        trusted_dependency_manifest,
+    )
+    verify_artifact_bucket(cli, artifact_bucket, region)
+    with TemporaryDirectory() as directory:
+        package_path = Path(directory) / "query-function.zip"
+        hex_digest, base64_digest = _write_deterministic_zip(
+            built_code_dir,
+            package_path,
+            package_files,
+        )
+        artifact_key = f"member-d/update/{hex_digest}.zip"
+        response = cli.run(
+            "s3api",
+            "put-object",
+            "--bucket",
+            artifact_bucket,
+            "--key",
+            artifact_key,
+            "--body",
+            str(package_path),
+            "--checksum-algorithm",
+            "SHA256",
+            "--checksum-sha256",
+            base64_digest,
+            "--server-side-encryption",
+            "AES256",
+            "--region",
+            region,
+        )
+        version_id = response.get("VersionId") if isinstance(response, Mapping) else None
+        if not isinstance(version_id, str) or not version_id:
+            raise AdoptionError("uploaded UPDATE artifact has no version ID")
+        uploaded = cli.json(
+            "s3api",
+            "head-object",
+            "--bucket",
+            artifact_bucket,
+            "--key",
+            artifact_key,
+            "--version-id",
+            version_id,
+            "--checksum-mode",
+            "ENABLED",
+            "--region",
+            region,
+        )
+        if (
+            not isinstance(uploaded, Mapping)
+            or uploaded.get("VersionId") != version_id
+            or not hmac.compare_digest(
+                str(uploaded.get("ChecksumSHA256", "")),
+                base64_digest,
+            )
+        ):
+            raise AdoptionError("uploaded UPDATE artifact checksum is unavailable or wrong")
+    pinned = deepcopy(dict(built_template))
+    pinned["Resources"]["QueryFunction"]["Properties"]["CodeUri"] = {
+        "Bucket": artifact_bucket,
+        "Key": artifact_key,
+        "Version": version_id,
+    }
+    try:
+        output_template.parent.mkdir(parents=True, exist_ok=True)
+        output_template.write_text(
+            json.dumps(_json_safe(pinned), sort_keys=True, indent=2) + "\n",
+            encoding="utf-8",
+        )
+    except OSError:
+        raise AdoptionError("pinned UPDATE template cannot be written") from None
+    return CodeArtifact(artifact_bucket, artifact_key, version_id, base64_digest)
+
+
+def verify_update_artifact(
+    cli: AwsCli,
+    built_code_dir: Path,
+    packaged_template: Mapping[str, Any],
+    artifact_bucket: str,
+    region: str,
+    source_code_dir: Path | None = None,
+    expected_commit: str | None = None,
+    trusted_dependency_manifest: Mapping[str, Any] | None = None,
+) -> CodeArtifact:
+    """Re-hash the build and prove the exact immutable S3 version still matches."""
+    code_uri = (
+        packaged_template.get("Resources", {})
+        .get("QueryFunction", {})
+        .get("Properties", {})
+        .get("CodeUri")
+        if isinstance(packaged_template, Mapping)
+        else None
+    )
+    if (
+        not isinstance(code_uri, Mapping)
+        or set(code_uri) != {"Bucket", "Key", "Version"}
+        or code_uri.get("Bucket") != artifact_bucket
+        or not isinstance(code_uri.get("Key"), str)
+        or not isinstance(code_uri.get("Version"), str)
+        or not code_uri["Version"]
+    ):
+        raise AdoptionError("pinned UPDATE artifact is malformed or uses another bucket")
+    package_files = validate_built_code_tree(
+        source_code_dir or built_code_dir,
+        built_code_dir,
+        expected_commit,
+        trusted_dependency_manifest,
+    )
+    with TemporaryDirectory() as directory:
+        package_path = Path(directory) / "query-function.zip"
+        hex_digest, base64_digest = _write_deterministic_zip(
+            built_code_dir,
+            package_path,
+            package_files,
+        )
+    expected_key = f"member-d/update/{hex_digest}.zip"
+    if code_uri["Key"] != expected_key:
+        raise AdoptionError("pinned UPDATE artifact key differs from built code bytes")
+    uploaded = cli.json(
+        "s3api",
+        "head-object",
+        "--bucket",
+        artifact_bucket,
+        "--key",
+        expected_key,
+        "--version-id",
+        code_uri["Version"],
+        "--checksum-mode",
+        "ENABLED",
+        "--region",
+        region,
+    )
+    if (
+        not isinstance(uploaded, Mapping)
+        or uploaded.get("VersionId") != code_uri["Version"]
+        or not hmac.compare_digest(
+            str(uploaded.get("ChecksumSHA256", "")),
+            base64_digest,
+        )
+    ):
+        raise AdoptionError("pinned UPDATE artifact version or checksum is wrong")
+    return CodeArtifact(
+        artifact_bucket,
+        expected_key,
+        code_uri["Version"],
+        base64_digest,
+    )
+
+
+def validate_hardening_runtime_evidence(
+    current_processed: Mapping[str, Any],
+    candidate_processed: Mapping[str, Any],
+    current_parameters: Any,
+    candidate_parameters: Any,
+    drift: Mapping[str, Any],
+    live_function: Mapping[str, Any],
+    artifact: CodeArtifact,
+    *,
+    expected_callback: str,
+) -> None:
+    """Bind the final UPDATE to one in-sync Lambda callback transition."""
+    if current_processed != candidate_processed:
+        raise AdoptionError(
+            "hardening candidate template differs from the currently deployed template"
+        )
+    validate_hardening_parameter_transition(
+        current_parameters,
+        candidate_parameters,
+    )
+    if (
+        not isinstance(drift, Mapping)
+        or drift.get("LogicalResourceId") != "QueryFunction"
+        or drift.get("Status") != "IN_SYNC"
+        or drift.get("Differences") not in (None, [])
+    ):
+        raise AdoptionError("QueryFunction must be IN_SYNC before hardening")
+    if (
+        not isinstance(artifact.checksum_sha256, str)
+        or not artifact.checksum_sha256
+        or not isinstance(live_function, Mapping)
+        or not hmac.compare_digest(
+            str(live_function.get("CodeSha256", "")),
+            artifact.checksum_sha256,
+        )
+    ):
+        raise AdoptionError("live QueryFunction code differs from the pinned artifact")
+    before = deepcopy(dict(live_function))
+    after = deepcopy(before)
+    try:
+        names = before["Environment"]["Names"]
+        before_variables = before["Environment"]["Variables"]
+        after_variables = after["Environment"]["Variables"]
+    except (KeyError, TypeError):
+        raise AdoptionError("live QueryFunction environment evidence is malformed") from None
+    expected_names = set(before_variables) | {"INTERNAL_API_KEY"}
+    if (
+        not isinstance(names, list)
+        or len(names) != len(expected_names)
+        or set(names) != expected_names
+    ):
+        raise AdoptionError("live QueryFunction environment names are unexpected")
+    after_variables["ALLOW_LEGACY_PROCESSING_CALLBACKS"] = "false"
+    validate_hardening_function_transition(
+        before,
+        after,
+        expected_callback=expected_callback,
+    )
+
+
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Audit and prepare Member D import without CloudFormation writes")
     subcommands = parser.add_subparsers(dest="command", required=True)
@@ -515,7 +1502,62 @@ def _parser() -> argparse.ArgumentParser:
     validator.add_argument("--change-set", required=True)
     validator.add_argument("--expected-type", choices=("IMPORT", "UPDATE"), required=True)
     validator.add_argument("--workdir", default=".work")
+    validator.add_argument("--artifact-bucket")
+    validator.add_argument("--built-template")
+    validator.add_argument("--packaged-template")
+    validator.add_argument("--expected-http-api-id")
+    validator.add_argument("--expected-jwt-authorizer-id")
+    validator.add_argument("--expected-query-input-bucket")
+    validator.add_argument("--expected-storage-delete-function")
+    validator.add_argument("--expected-inference-api-base-url")
+    validator.add_argument(
+        "--expected-allow-legacy-processing-callbacks",
+        choices=("true", "false"),
+    )
+    validator.add_argument(
+        "--expect-role-reconciliation",
+        choices=("true", "false"),
+    )
+    policy_validator = subcommands.add_parser("validate-lambda-policy")
+    policy_validator.add_argument("--region", required=True)
+    policy_validator.add_argument("--function", required=True)
+    policy_validator.add_argument("--workdir", default=".work")
+    policy_validator.add_argument(
+        "--expect-legacy",
+        choices=("present", "absent"),
+        required=True,
+    )
+    policy_validator.add_argument("--emit-revision", action="store_true")
+    packager = subcommands.add_parser("package-update")
+    packager.add_argument("--region", required=True)
+    packager.add_argument("--artifact-bucket", required=True)
+    packager.add_argument("--built-template", required=True)
+    packager.add_argument("--built-code-dir", required=True)
+    packager.add_argument("--source-code-dir", required=True)
+    packager.add_argument("--dependency-manifest", required=True)
+    packager.add_argument("--expected-commit", required=True)
+    packager.add_argument("--output-template", required=True)
+    for argument in ("api", "authorizer", "integration", "function"):
+        validator.add_argument(f"--{argument}")
+    validator.add_argument("--built-code-dir")
+    validator.add_argument("--source-code-dir")
+    validator.add_argument("--dependency-manifest")
+    validator.add_argument("--expected-commit")
     return parser
+
+
+def _read_template_file(path: Path, description: str) -> Mapping[str, Any]:
+    try:
+        return _parse_processed_template(path.read_text(encoding="utf-8"))
+    except OSError:
+        raise AdoptionError(f"{description} is unavailable") from None
+
+
+def _read_json_file(path: Path, description: str) -> Any:
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        raise AdoptionError(f"{description} is unavailable") from None
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -536,17 +1578,333 @@ def main(argv: list[str] | None = None) -> int:
         print(f"s3://{code['S3Bucket']}/{code['S3Key']}")
         print("no CloudFormation change set was created")
         return 0
+    if args.command == "validate-lambda-policy":
+        audited = _read_json_file(
+            Path(args.workdir) / "sanitized-snapshot.json",
+            "sanitized adoption snapshot",
+        )
+        if (
+            not isinstance(audited, Mapping)
+            or audited.get("region") != args.region
+            or audited.get("function", {}).get("FunctionName") != args.function
+        ):
+            raise AdoptionError("Lambda policy validation scope mismatch")
+        response = cli.json(
+            "lambda",
+            "get-policy",
+            "--region",
+            args.region,
+            "--function-name",
+            args.function,
+        )
+        raw_policy = response.get("Policy") if isinstance(response, Mapping) else None
+        live_policy = _decode_json_document(raw_policy, "live Lambda policy")
+        if not isinstance(live_policy, Mapping):
+            raise AdoptionError("live Lambda policy is malformed")
+        legacy_sid = validate_lambda_policy_after_update(
+            live_policy,
+            audited,
+            expect_legacy=args.expect_legacy == "present",
+        )
+        if args.emit_revision:
+            if args.expect_legacy != "present":
+                raise AdoptionError(
+                    "revision guard can only be emitted for a present legacy permission"
+                )
+            revision = response.get("RevisionId")
+            if not isinstance(revision, str) or not revision:
+                raise AdoptionError("live Lambda policy revision is unavailable")
+            print(
+                json.dumps(
+                    {"legacy_sid": legacy_sid, "revision_id": revision},
+                    sort_keys=True,
+                    separators=(",", ":"),
+                )
+            )
+        else:
+            print("Lambda policy validated against all route-scoped permissions")
+        return 0
+    if args.command == "package-update":
+        built = _read_template_file(
+            Path(args.built_template),
+            "SAM built UPDATE template",
+        )
+        maintained_path = Path(__file__).resolve().parents[1] / "dynamodb.yaml"
+        dependency_manifest_path = Path(args.dependency_manifest)
+        _verify_committed_file(maintained_path, args.expected_commit)
+        _verify_committed_file(dependency_manifest_path, args.expected_commit)
+        maintained = _read_template_file(
+            maintained_path,
+            "maintained Member D template",
+        )
+        dependency_manifest = _read_json_file(
+            dependency_manifest_path,
+            "trusted dependency manifest",
+        )
+        artifact = package_update_function(
+            cli,
+            Path(args.built_code_dir),
+            args.artifact_bucket,
+            Path(args.output_template),
+            built,
+            args.region,
+            maintained,
+            Path(args.source_code_dir),
+            args.expected_commit,
+            dependency_manifest,
+        )
+        print(args.output_template)
+        print(f"s3://{artifact.bucket}/{artifact.key}?versionId={artifact.version_id}")
+        print("no CloudFormation change set was created or executed")
+        return 0
     change_set = cli.json("cloudformation", "describe-change-set", "--stack-name", args.stack, "--change-set-name", args.change_set, "--region", args.region)
-    if change_set.get("ChangeSetType") != args.expected_type:
-        raise AdoptionError("change set type does not match --expected-type")
-    snapshot_path = Path(args.workdir) / "sanitized-snapshot.json"
+    if (
+        change_set.get("Status") != "CREATE_COMPLETE"
+        or change_set.get("ExecutionStatus") != "AVAILABLE"
+    ):
+        raise AdoptionError("change set is not CREATE_COMPLETE and AVAILABLE")
+    workdir = Path(args.workdir)
+    snapshot_path = workdir / "sanitized-snapshot.json"
     audited = json.loads(snapshot_path.read_text(encoding="utf-8"))
+    must_recollect = args.expected_type == "IMPORT" or (
+        args.expected_type == "UPDATE"
+        and args.expect_role_reconciliation == "true"
+    )
+    if must_recollect:
+        if not all(
+            isinstance(value, str) and value
+            for value in (
+                args.api,
+                args.authorizer,
+                args.integration,
+                args.function,
+            )
+        ):
+            raise AdoptionError(
+                "--api, --authorizer, --integration and --function are required for live recollection"
+            )
+        fresh = collect_snapshot(
+            cli,
+            AuditConfig(
+                args.region,
+                args.stack,
+                args.api,
+                args.authorizer,
+                args.integration,
+                args.function,
+                workdir,
+            ),
+        )
+        assert_runtime_unchanged(audited, fresh)
+        audited = fresh
+    processed_response = cli.json("cloudformation", "get-template", "--stack-name", args.stack, "--change-set-name", args.change_set, "--template-stage", "Processed", "--region", args.region)
+    processed = _parse_processed_template(
+        processed_response.get("TemplateBody")
+        if isinstance(processed_response, Mapping)
+        else None
+    )
     if args.expected_type == "IMPORT":
+        if not args.artifact_bucket:
+            raise AdoptionError("--artifact-bucket is required for IMPORT validation")
         expected = build_resources_to_import(audited)
+        artifact = validate_import_artifacts(
+            processed,
+            _read_template_file(
+                workdir / "import-template.json",
+                "generated import template",
+            ),
+            change_set.get("Parameters"),
+            _read_json_file(
+                workdir / "import-parameters.json",
+                "generated import parameters",
+            ),
+            audited,
+            args.artifact_bucket,
+        )
+        uploaded = cli.json(
+            "s3api",
+            "head-object",
+            "--bucket",
+            artifact.bucket,
+            "--key",
+            artifact.key,
+            "--version-id",
+            artifact.version_id,
+            "--checksum-mode",
+            "ENABLED",
+            "--region",
+            args.region,
+        )
+        expected_checksum = audited.get("function", {}).get("CodeSha256")
+        if (
+            not isinstance(uploaded, Mapping)
+            or uploaded.get("VersionId") != artifact.version_id
+            or not isinstance(expected_checksum, str)
+            or not hmac.compare_digest(
+                str(uploaded.get("ChecksumSHA256", "")),
+                expected_checksum,
+            )
+        ):
+            raise AdoptionError(
+                "IMPORT artifact version or checksum differs from audited Lambda code"
+            )
         validate_import_change_set(change_set.get("Changes", []), expected)
     else:
-        processed = cli.json("cloudformation", "get-template", "--stack-name", args.stack, "--change-set-name", args.change_set, "--template-stage", "Processed", "--region", args.region).get("TemplateBody", {})
-        validate_update_change_set(change_set.get("Changes", []), processed, audited.get("role"))
+        if not args.artifact_bucket:
+            raise AdoptionError("--artifact-bucket is required for UPDATE validation")
+        if not args.built_template:
+            raise AdoptionError("--built-template is required for UPDATE validation")
+        if not args.built_code_dir:
+            raise AdoptionError("--built-code-dir is required for UPDATE validation")
+        if not args.source_code_dir:
+            raise AdoptionError("--source-code-dir is required for UPDATE validation")
+        if not args.dependency_manifest:
+            raise AdoptionError("--dependency-manifest is required for UPDATE validation")
+        if not args.expected_commit:
+            raise AdoptionError("--expected-commit is required for UPDATE validation")
+        if not args.packaged_template:
+            raise AdoptionError("--packaged-template is required for UPDATE validation")
+        if args.expected_allow_legacy_processing_callbacks is None:
+            raise AdoptionError(
+                "--expected-allow-legacy-processing-callbacks is required for UPDATE validation"
+            )
+        if args.expect_role_reconciliation is None:
+            raise AdoptionError(
+                "--expect-role-reconciliation is required for UPDATE validation"
+            )
+        built = _read_template_file(
+            Path(args.built_template),
+            "SAM built UPDATE template",
+        )
+        packaged = _read_template_file(
+            Path(args.packaged_template),
+            "packaged UPDATE template",
+        )
+        maintained_path = Path(__file__).resolve().parents[1] / "dynamodb.yaml"
+        dependency_manifest_path = Path(args.dependency_manifest)
+        _verify_committed_file(maintained_path, args.expected_commit)
+        _verify_committed_file(dependency_manifest_path, args.expected_commit)
+        maintained = _read_template_file(
+            maintained_path,
+            "maintained Member D template",
+        )
+        dependency_manifest = _read_json_file(
+            dependency_manifest_path,
+            "trusted dependency manifest",
+        )
+        artifact = verify_update_artifact(
+            cli,
+            Path(args.built_code_dir),
+            packaged,
+            args.artifact_bucket,
+            args.region,
+            Path(args.source_code_dir),
+            args.expected_commit,
+            dependency_manifest,
+        )
+        validate_update_artifacts(
+            processed,
+            built,
+            packaged,
+            maintained,
+            change_set.get("Parameters"),
+            {
+                "ExistingHttpApiId": args.expected_http_api_id,
+                "ExistingJwtAuthorizerId": args.expected_jwt_authorizer_id,
+                "QueryInputBucketName": args.expected_query_input_bucket,
+                "StorageDeleteFunctionName": args.expected_storage_delete_function,
+                "InferenceApiBaseUrl": args.expected_inference_api_base_url,
+                "AllowLegacyProcessingCallbacks": (
+                    args.expected_allow_legacy_processing_callbacks
+                ),
+            },
+            artifact,
+        )
+        hardening_only = args.expect_role_reconciliation == "false"
+        if hardening_only:
+            if args.expected_allow_legacy_processing_callbacks != "false":
+                raise AdoptionError(
+                    "hardening UPDATE must set legacy processing callbacks to false"
+                )
+            current_template_response = cli.json(
+                "cloudformation",
+                "get-template",
+                "--stack-name",
+                args.stack,
+                "--template-stage",
+                "Processed",
+                "--region",
+                args.region,
+            )
+            current_processed = _parse_processed_template(
+                current_template_response.get("TemplateBody")
+                if isinstance(current_template_response, Mapping)
+                else None
+            )
+            current_parameters = cli.json(
+                "cloudformation",
+                "describe-stacks",
+                "--stack-name",
+                args.stack,
+                "--region",
+                args.region,
+                "--query",
+                "Stacks[0].Parameters",
+            )
+            drift = cli.json(
+                "cloudformation",
+                "detect-stack-resource-drift",
+                "--stack-name",
+                args.stack,
+                "--logical-resource-id",
+                "QueryFunction",
+                "--region",
+                args.region,
+                "--query",
+                "StackResourceDrift.{LogicalResourceId:LogicalResourceId,"
+                "Status:StackResourceDriftStatus,Differences:PropertyDifferences}",
+            )
+            field_query = ",".join(
+                f"{field}:{field}" for field in _HARDENING_FUNCTION_FIELDS
+            )
+            environment_query = ",".join(
+                f"{name}:Environment.Variables.{name}"
+                for name in _HARDENING_ENVIRONMENT_NAMES
+            )
+            live_function = cli.json(
+                "lambda",
+                "get-function-configuration",
+                "--function-name",
+                "PacificBioArchive-QueryLambda",
+                "--region",
+                args.region,
+                "--query",
+                "{"
+                + field_query
+                + ",Environment:{Names:keys(Environment.Variables),Variables:{"
+                + environment_query
+                + "}}}",
+            )
+            validate_hardening_runtime_evidence(
+                current_processed,
+                processed,
+                current_parameters,
+                change_set.get("Parameters"),
+                drift,
+                live_function,
+                artifact,
+                expected_callback=(
+                    args.expected_allow_legacy_processing_callbacks
+                ),
+            )
+        validate_update_change_set(
+            change_set.get("Changes", []),
+            processed,
+            audited.get("role")
+            if args.expect_role_reconciliation == "true"
+            else None,
+            hardening_only=hardening_only,
+        )
     print("change set validated; no CloudFormation change set was created or executed")
     return 0
 
