@@ -240,6 +240,9 @@ def test_query_function_runtime_handler_and_production_environment(template):
 def test_query_function_policies_are_least_privilege(template):
     role = _properties(template, "QueryLambdaRole")
     assert role["ManagedPolicyArns"] == ["arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole"]
+    assert [policy["PolicyName"] for policy in role["Policies"]] == [
+        "DynamoDBFilesAccess"
+    ]
     statements = role["Policies"][0]["PolicyDocument"]["Statement"]
     assert statements == [
         {

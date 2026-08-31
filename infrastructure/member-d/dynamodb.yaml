@@ -134,7 +134,7 @@ Resources:
       ManagedPolicyArns:
         - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
       Policies:
-        - PolicyName: QueryServiceAccess
+        - PolicyName: DynamoDBFilesAccess
           PolicyDocument:
             Version: '2012-10-17'
             Statement:

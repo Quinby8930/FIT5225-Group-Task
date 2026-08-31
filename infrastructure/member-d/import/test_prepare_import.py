@@ -1523,7 +1523,7 @@ def test_collection_accepts_and_normalizes_only_exact_known_role_drift(tmp_path)
         "drift"
     ]
     assert set(snapshot["role"]["inline_policies"]) == {
-        "QueryServiceAccess",
+        "DynamoDBFilesAccess",
         "UploadReservationsAccess",
     }
 

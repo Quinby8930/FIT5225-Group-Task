@@ -120,7 +120,7 @@ HASH 主键 `reservation_key`；普通/向量索引、stream、replica/global wi
 标签、加密模式、删除保护、resource policy、有效 Kinesis streaming destination 或
 Contributor Insights 出现无法由当前模板原样
 表达的差异时必须停止。`QueryLambdaRole` 只允许 `IN_SYNC`，或精确
-匹配已知 reservation-only 漂移：`QueryServiceAccess` 仅增加
+匹配已知 reservation-only 漂移：`DynamoDBFilesAccess` 仅增加
 `dynamodb:TransactWriteItems` 和 reservation 表 ARN，并额外存在内容完全匹配的
 `UploadReservationsAccess`。任何其他 path、action、resource 或 policy 差异都必须失败关闭。
 工具不会选择 Member B 的 `/upload-url`、`/asset-urls`，也不会选择 OPTIONS 路由。
@@ -373,7 +373,7 @@ template 没有隐式 `QueryFunctionRole`，`QueryFunction` 仍绑定
 `QueryLambdaRole`，且 Lambda、integration、16 条已纳管路由、`ReservationsTable` 和
 `QueryLambdaRole` 都不会 replacement/remove。若 snapshot 记录了允许的 reservation-only
 漂移，UPDATE 对 `QueryLambdaRole` 只能是 `Modify / Replacement=False`，并且目标必须精确
-收敛为模板中的单一规范 `QueryServiceAccess`；不得接受其他 IAM action、resource、policy、
+收敛为模板中的单一规范 `DynamoDBFilesAccess`；不得接受其他 IAM action、resource、policy、
 boundary、tag 或 role 属性变化。此次 UPDATE 不只是修角色：它还更新 Lambda code/config，
 新增 SNS Topic、OPTIONS routes、逐路由 invoke permissions 等模板资源，因此必须逐项审查。
 

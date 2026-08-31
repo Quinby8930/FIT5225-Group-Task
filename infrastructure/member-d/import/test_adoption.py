@@ -313,7 +313,7 @@ def approved_role_drift_snapshot():
                 "AWSLambdaBasicExecutionRole"
             ],
             "Policies": [{
-                "PolicyName": "QueryServiceAccess",
+                "PolicyName": "DynamoDBFilesAccess",
                 "PolicyDocument": _query_policy(),
             }],
         },
@@ -333,8 +333,8 @@ def approved_role_drift_snapshot():
         ),
     }]
     snapshot["role"]["inline_policies"] = {
-        "QueryServiceAccess": {
-            "PolicyName": "QueryServiceAccess",
+        "DynamoDBFilesAccess": {
+            "PolicyName": "DynamoDBFilesAccess",
             "PolicyDocument": _query_policy(include_reservations=True),
         },
         "UploadReservationsAccess": {
@@ -767,8 +767,8 @@ def test_post_import_runtime_comparison_rejects_role_drift_toctou_change():
     after = deepcopy(before)
     after["role"]["drift"] = {"status": "IN_SYNC", "differences": []}
     after["role"]["inline_policies"] = {
-        "QueryServiceAccess": deepcopy(
-            after["role"]["inline_policies"]["QueryServiceAccess"]
+        "DynamoDBFilesAccess": deepcopy(
+            after["role"]["inline_policies"]["DynamoDBFilesAccess"]
         )
     }
 
@@ -1080,7 +1080,7 @@ def _maintained_role_target():
                 "arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole"
             ],
             "Policies": [{
-                "PolicyName": "QueryServiceAccess",
+                "PolicyName": "DynamoDBFilesAccess",
                 "PolicyDocument": {
                     "Version": "2012-10-17",
                     "Statement": [

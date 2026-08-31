@@ -261,7 +261,7 @@ def _validate_role_drift(role: Mapping[str, Any], account: str, region: str) -> 
     policy_delta = by_path["/Policies/0/PolicyDocument"]
     _require(
         policy_delta.get("type") == "NOT_EQUAL",
-        "QueryLambdaRole QueryServiceAccess drift type is unapproved",
+        "QueryLambdaRole DynamoDBFilesAccess drift type is unapproved",
     )
     expected_actions, expected_resources = _policy_signature(
         policy_delta.get("expected")
@@ -274,7 +274,7 @@ def _validate_role_drift(role: Mapping[str, Any], account: str, region: str) -> 
         and expected_resources == baseline_tables
         and actual_actions == _RESERVATION_DYNAMODB_ACTIONS
         and actual_resources == baseline_tables | {reservation_table},
-        "QueryLambdaRole QueryServiceAccess drift is unapproved",
+        "QueryLambdaRole DynamoDBFilesAccess drift is unapproved",
     )
 
     added = by_path["/Policies/1"]
@@ -297,18 +297,18 @@ def _validate_role_drift(role: Mapping[str, Any], account: str, region: str) -> 
     )
 
     _require(
-        processed_names == {"QueryServiceAccess"}
-        and set(inline) == {"QueryServiceAccess", "UploadReservationsAccess"},
+        processed_names == {"DynamoDBFilesAccess"}
+        and set(inline) == {"DynamoDBFilesAccess", "UploadReservationsAccess"},
         "QueryLambdaRole inline policy set is unapproved",
     )
-    live_query = inline.get("QueryServiceAccess")
+    live_files_policy = inline.get("DynamoDBFilesAccess")
     live_added = inline.get("UploadReservationsAccess")
     _require(
-        isinstance(live_query, Mapping)
-        and live_query.get("PolicyName") in (None, "QueryServiceAccess")
-        and _policy_signature(live_query.get("PolicyDocument"))
+        isinstance(live_files_policy, Mapping)
+        and live_files_policy.get("PolicyName") in (None, "DynamoDBFilesAccess")
+        and _policy_signature(live_files_policy.get("PolicyDocument"))
         == (_RESERVATION_DYNAMODB_ACTIONS, baseline_tables | {reservation_table}),
-        "QueryLambdaRole live QueryServiceAccess is unapproved",
+        "QueryLambdaRole live DynamoDBFilesAccess is unapproved",
     )
     _require(
         isinstance(live_added, Mapping)
@@ -901,7 +901,7 @@ def _maintained_role_target() -> dict[str, Any]:
             ],
             "Policies": [
                 {
-                    "PolicyName": "QueryServiceAccess",
+                    "PolicyName": "DynamoDBFilesAccess",
                     "PolicyDocument": {
                         "Version": "2012-10-17",
                         "Statement": [
