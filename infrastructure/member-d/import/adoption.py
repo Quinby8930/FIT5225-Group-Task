@@ -112,6 +112,34 @@ def _require(condition: bool, message: str) -> None:
         raise AdoptionError(message)
 
 
+def _is_unconfigured_vpc(value: Any) -> bool:
+    if value is None:
+        return True
+    if not isinstance(value, Mapping):
+        return False
+    if not set(value) <= {
+        "SubnetIds",
+        "SecurityGroupIds",
+        "VpcId",
+        "Ipv6AllowedForDualStack",
+    }:
+        return False
+    return (
+        value.get("SubnetIds", []) == []
+        and value.get("SecurityGroupIds", []) == []
+        and value.get("VpcId") in (None, "")
+        and value.get("Ipv6AllowedForDualStack", False) is False
+    )
+
+
+def _is_unconfigured_function_property(key: str, value: Any) -> bool:
+    if key in {"Layers", "FileSystemConfigs"}:
+        return value in (None, [])
+    if key == "VpcConfig":
+        return _is_unconfigured_vpc(value)
+    return value is None
+
+
 def _stack_parameter_names(stack: Mapping[str, Any]) -> set[str]:
     parameters = stack.get("parameters", [])
     if isinstance(parameters, Mapping):
@@ -459,9 +487,9 @@ def _validate_function(function: Mapping[str, Any], account: str) -> None:
     for key in _FUNCTION_PROPERTIES:
         _require(key in function, f"unsupported function configuration: {key}")
     _require(function.get("Architectures") == ["x86_64"], "function architectures mismatch")
-    _require(function.get("Layers") == [], "function layers cannot be preserved")
-    _require(function.get("VpcConfig") == {"SubnetIds": [], "SecurityGroupIds": [], "Ipv6AllowedForDualStack": False}, "function VPC configuration cannot be preserved")
-    _require(function.get("FileSystemConfigs") == [], "function file system configuration cannot be preserved")
+    _require(function.get("Layers") in (None, []), "function layers cannot be preserved")
+    _require(_is_unconfigured_vpc(function.get("VpcConfig")), "function VPC configuration cannot be preserved")
+    _require(function.get("FileSystemConfigs") in (None, []), "function file system configuration cannot be preserved")
     _require(function.get("CodeSha256"), "function code digest missing")
     names = function.get("environment_names")
     safe = function.get("safe_environment")
@@ -713,7 +741,7 @@ def _function_properties(function: Mapping[str, Any], artifact: CodeArtifact) ->
         "Environment": {"Variables": {**dict(function["safe_environment"]), "INTERNAL_API_KEY": {"Ref": "InternalApiKey"}}},
     }
     for key in _FUNCTION_PROPERTIES[4:]:
-        if function[key] is not None:
+        if not _is_unconfigured_function_property(key, function[key]):
             properties[key] = deepcopy(function[key])
     return properties
 

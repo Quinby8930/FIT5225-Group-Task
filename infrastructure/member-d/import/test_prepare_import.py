@@ -2007,6 +2007,43 @@ def test_sanitized_lambda_strips_output_only_runtime_and_snapstart_fields():
     assert result["SnapStart"] == {"ApplyOn": "None"}
 
 
+def test_collection_accepts_aws_null_optional_lambda_configuration_and_import_omits_it(
+    tmp_path,
+):
+    class AwsNullOptionalFunctionCli(FakeAwsCli):
+        def json(self, *args):
+            result = super().json(*args)
+            if "get-function-configuration" in " ".join(args):
+                result.update({
+                    "Layers": None,
+                    "FileSystemConfigs": None,
+                    "VpcConfig": None,
+                    "DeadLetterConfig": None,
+                    "Architectures": ["x86_64"],
+                    "EphemeralStorage": {"Size": 512},
+                })
+            return result
+
+    snapshot = collect_snapshot(
+        AwsNullOptionalFunctionCli(),
+        fixture_config(tmp_path),
+    )
+    template = build_import_template(
+        snapshot,
+        CodeArtifact("private-artifacts", "backups/code.zip", "version-1"),
+    )
+    properties = template["Resources"]["QueryFunction"]["Properties"]
+
+    assert {
+        "Layers",
+        "FileSystemConfigs",
+        "VpcConfig",
+        "DeadLetterConfig",
+    }.isdisjoint(properties)
+    assert properties["Architectures"] == ["x86_64"]
+    assert properties["EphemeralStorage"] == {"Size": 512}
+
+
 def test_collection_strips_runtime_management_function_arn(tmp_path):
     class RuntimeOutputCli(FakeAwsCli):
         def json(self, *args):

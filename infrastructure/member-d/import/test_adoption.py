@@ -575,6 +575,37 @@ def test_snapshot_mismatch_fails_closed(mutation, message):
         validate_snapshot(snapshot)
 
 
+@pytest.mark.parametrize(
+    ("field", "value", "message"),
+    [
+        ("Layers", ["arn:aws:lambda:ap-southeast-2:111122223333:layer:extra:1"], "layers"),
+        (
+            "FileSystemConfigs",
+            [{"Arn": "arn:aws:elasticfilesystem:ap-southeast-2:111122223333:access-point/fsap-example", "LocalMountPath": "/mnt/data"}],
+            "file system",
+        ),
+        (
+            "VpcConfig",
+            {
+                "SubnetIds": ["subnet-12345678"],
+                "SecurityGroupIds": ["sg-12345678"],
+                "VpcId": "vpc-12345678",
+                "Ipv6AllowedForDualStack": False,
+            },
+            "VPC",
+        ),
+    ],
+)
+def test_snapshot_rejects_nonempty_unmanaged_lambda_configuration(
+    field, value, message
+):
+    snapshot = valid_snapshot()
+    snapshot["function"][field] = value
+
+    with pytest.raises(AdoptionError, match=message):
+        validate_snapshot(snapshot)
+
+
 def test_import_manifest_contains_reservations_table_lambda_integration_and_sixteen_routes():
     manifest = build_resources_to_import(valid_snapshot())
     assert len(manifest) == 19
@@ -696,7 +727,14 @@ def test_import_template_omits_unset_optional_lambda_properties_but_keeps_set_va
     snapshot = valid_snapshot()
     template = build_import_template(snapshot, CodeArtifact("private-artifacts", "backups/code.zip", "version-1"))
     properties = template["Resources"]["QueryFunction"]["Properties"]
-    assert {"KmsKeyArn", "CodeSigningConfigArn", "ReservedConcurrentExecutions"}.isdisjoint(properties)
+    assert {
+        "KmsKeyArn",
+        "CodeSigningConfigArn",
+        "ReservedConcurrentExecutions",
+        "Layers",
+        "VpcConfig",
+        "FileSystemConfigs",
+    }.isdisjoint(properties)
     assert properties["RuntimeManagementConfig"] == {"UpdateRuntimeOn": "Auto"}
 
 
