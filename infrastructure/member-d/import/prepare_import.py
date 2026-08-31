@@ -12,6 +12,7 @@ import hashlib
 import hmac
 import json
 import subprocess
+import yaml
 from functools import wraps
 from urllib.request import urlopen
 from dataclasses import dataclass
@@ -75,6 +76,80 @@ _API_GATEWAY_OUTPUT_ONLY_KEYS = {
     },
     "API Gateway route": {"ApiGatewayManaged"},
 }
+
+
+class _CloudFormationLoader(yaml.SafeLoader):
+    """Load CloudFormation short-form intrinsic tags without executing code."""
+
+
+_INTRINSIC_NAMES = {
+    "And": "Fn::And",
+    "Base64": "Fn::Base64",
+    "Cidr": "Fn::Cidr",
+    "Equals": "Fn::Equals",
+    "FindInMap": "Fn::FindInMap",
+    "GetAtt": "Fn::GetAtt",
+    "GetAZs": "Fn::GetAZs",
+    "If": "Fn::If",
+    "ImportValue": "Fn::ImportValue",
+    "Join": "Fn::Join",
+    "Length": "Fn::Length",
+    "Not": "Fn::Not",
+    "Or": "Fn::Or",
+    "Select": "Fn::Select",
+    "Split": "Fn::Split",
+    "Sub": "Fn::Sub",
+    "ToJsonString": "Fn::ToJsonString",
+    "Transform": "Fn::Transform",
+}
+
+
+def _construct_cloudformation_intrinsic(
+    loader: yaml.SafeLoader,
+    tag_suffix: str,
+    node: yaml.Node,
+) -> dict[str, Any]:
+    if isinstance(node, yaml.ScalarNode):
+        value = loader.construct_scalar(node)
+        if tag_suffix == "GetAtt":
+            logical_id, separator, attribute = value.partition(".")
+            if not separator or not logical_id or not attribute:
+                raise yaml.constructor.ConstructorError(
+                    None,
+                    None,
+                    "!GetAtt scalar must use Resource.Attribute form",
+                    node.start_mark,
+                )
+            value = [logical_id, attribute]
+    elif isinstance(node, yaml.SequenceNode):
+        value = loader.construct_sequence(node)
+    else:
+        value = loader.construct_mapping(node)
+    return {_INTRINSIC_NAMES.get(tag_suffix, tag_suffix): value}
+
+
+_CloudFormationLoader.add_multi_constructor(
+    "!",
+    _construct_cloudformation_intrinsic,
+)
+
+
+def _parse_processed_template(value: Any) -> Mapping[str, Any]:
+    if isinstance(value, Mapping):
+        return value
+    if isinstance(value, str):
+        try:
+            parsed = json.loads(value)
+        except json.JSONDecodeError:
+            try:
+                parsed = yaml.load(value, Loader=_CloudFormationLoader)
+            except yaml.YAMLError:
+                raise AdoptionError(
+                    "processed template is not valid JSON or YAML"
+                ) from None
+        if isinstance(parsed, Mapping):
+            return parsed
+    raise AdoptionError("processed template is unavailable")
 
 
 def _sanitized_runtime_management(value: Any) -> Any:
@@ -193,14 +268,12 @@ def collect_snapshot(cli: AwsCli, config: AuditConfig) -> dict[str, Any]:
         raise AdoptionError("stack identity could not be verified")
     stack_view = stack_items[0]
     processed_response = cli.json("cloudformation", "get-template", "--stack-name", config.stack, "--template-stage", "Processed", "--region", config.region)
-    template = processed_response.get("TemplateBody") if isinstance(processed_response, Mapping) else None
-    if isinstance(template, str):
-        try:
-            template = json.loads(template)
-        except json.JSONDecodeError as error:
-            raise AdoptionError("processed template is not JSON") from None
-    if not isinstance(template, Mapping):
-        raise AdoptionError("processed template is unavailable")
+    template_body = (
+        processed_response.get("TemplateBody")
+        if isinstance(processed_response, Mapping)
+        else None
+    )
+    template = _parse_processed_template(template_body)
     summaries = cli.json("cloudformation", "list-stack-resources", "--stack-name", config.stack, "--region", config.region)
     resource_summaries = summaries.get("StackResourceSummaries", []) if isinstance(summaries, Mapping) else []
     managed = {item.get("LogicalResourceId"): item.get("PhysicalResourceId") for item in resource_summaries if isinstance(item, Mapping)}

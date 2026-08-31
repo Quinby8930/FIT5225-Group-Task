@@ -33,7 +33,7 @@ from test_adoption import valid_snapshot
 
 
 class FakeAwsCli:
-    def __init__(self, caller_arn="arn:aws:iam::111122223333:user/fit5225-cli-deployer", version_id="version-1", uploaded_checksum=None, bucket_state="safe", code_sha=None):
+    def __init__(self, caller_arn="arn:aws:iam::111122223333:user/fit5225-cli-deployer", version_id="version-1", uploaded_checksum=None, bucket_state="safe", code_sha=None, template_body=None):
         self.calls = []
         self.put_objects = []
         self.caller_arn = caller_arn
@@ -41,6 +41,7 @@ class FakeAwsCli:
         self.uploaded_checksum = uploaded_checksum
         self.bucket_state = bucket_state
         self.code_sha = code_sha
+        self.template_body = template_body
 
     def json(self, *args):
         self.calls.append(args)
@@ -50,7 +51,13 @@ class FakeAwsCli:
         if "describe-stacks" in command:
             return {"Stacks": [{"StackName": "PacificBioArchive-Database", "StackStatus": "UPDATE_ROLLBACK_COMPLETE", "Parameters": [{"ParameterKey": "InternalApiKey", "ParameterValue": "internal-secret"}]}]}
         if "get-template" in command:
-            return {"TemplateBody": valid_snapshot()["stack"]["template"]}
+            return {
+                "TemplateBody": (
+                    self.template_body
+                    if self.template_body is not None
+                    else valid_snapshot()["stack"]["template"]
+                )
+            }
         if "list-stack-resources" in command:
             return {"StackResourceSummaries": [{"LogicalResourceId": logical_id, "PhysicalResourceId": physical_id} for logical_id, physical_id in valid_snapshot()["stack"]["managed"].items()]}
         if "list-stacks" in command:
@@ -255,6 +262,43 @@ def test_collection_orchestrates_live_read_only_state_without_secrets(tmp_path):
     assert snapshot["role"]["path"] == "/"
     assert "internal-secret" not in str(snapshot)
     assert "X-Amz-Signature" not in str(snapshot)
+
+
+def test_collection_accepts_yaml_processed_template_with_intrinsic_tags(tmp_path):
+    yaml_template = """
+AWSTemplateFormatVersion: '2010-09-09'
+Resources:
+  FilesTable:
+    Type: AWS::DynamoDB::Table
+  SubscriptionsTable:
+    Type: AWS::DynamoDB::Table
+  NotificationsTable:
+    Type: AWS::DynamoDB::Table
+  QueryLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: PacificBioArchive-QueryLambdaRole
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement: []
+Outputs:
+  FilesTableReference:
+    Value: !Ref FilesTable
+  QueryLambdaRoleArn:
+    Value: !GetAtt QueryLambdaRole.Arn
+"""
+
+    snapshot = collect_snapshot(
+        FakeAwsCli(template_body=yaml_template),
+        fixture_config(tmp_path),
+    )
+
+    assert snapshot["stack"]["template"]["Outputs"]["FilesTableReference"] == {
+        "Value": {"Ref": "FilesTable"}
+    }
+    assert snapshot["stack"]["template"]["Outputs"]["QueryLambdaRoleArn"] == {
+        "Value": {"Fn::GetAtt": ["QueryLambdaRole", "Arn"]}
+    }
 
 
 def test_audit_baseline_compares_runtime_and_output_stays_sanitized(tmp_path, capsys):
