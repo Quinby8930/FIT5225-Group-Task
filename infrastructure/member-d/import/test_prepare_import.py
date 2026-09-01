@@ -151,7 +151,12 @@ class FakeAwsCli:
                 )
             }
         if "list-stack-resources" in command:
-            return {"StackResourceSummaries": [{"LogicalResourceId": logical_id, "PhysicalResourceId": physical_id} for logical_id, physical_id in valid_snapshot()["stack"]["managed"].items()]}
+            snapshot = valid_snapshot()
+            return {"StackResourceSummaries": [{
+                "LogicalResourceId": logical_id,
+                "PhysicalResourceId": physical_id,
+                "ResourceType": snapshot["stack"]["template"]["Resources"][logical_id]["Type"],
+            } for logical_id, physical_id in snapshot["stack"]["managed"].items()]}
         if "list-stacks" in command:
             return {"StackSummaries": [{"StackName": "PacificBioArchive-Database", "StackStatus": "UPDATE_ROLLBACK_COMPLETE"}]}
         if "detect-stack-resource-drift" in command:
@@ -4057,6 +4062,69 @@ class PostImportCli(FakeAwsCli):
         raise AssertionError(f"write boundary must not be called: {args}")
 
 
+_VERIFY_POST_IMPORT_READ_ONLY_OPERATIONS = {
+    ("sts", "get-caller-identity"),
+    ("cloudformation", "describe-stacks"),
+    ("cloudformation", "get-template"),
+    ("cloudformation", "list-stack-resources"),
+    ("cloudformation", "list-stacks"),
+    ("cloudformation", "detect-stack-resource-drift"),
+    ("cloudformation", "describe-type"),
+    ("dynamodb", "describe-table"),
+    ("dynamodb", "describe-time-to-live"),
+    ("dynamodb", "describe-continuous-backups"),
+    ("dynamodb", "list-tags-of-resource"),
+    ("dynamodb", "get-resource-policy"),
+    ("dynamodb", "describe-kinesis-streaming-destination"),
+    ("dynamodb", "describe-contributor-insights"),
+    ("lambda", "get-function-configuration"),
+    ("lambda", "list-tags"),
+    ("lambda", "get-policy"),
+    ("lambda", "get-function-concurrency"),
+    ("lambda", "list-provisioned-concurrency-configs"),
+    ("lambda", "get-runtime-management-config"),
+    ("iam", "get-role"),
+    ("iam", "list-attached-role-policies"),
+    ("iam", "list-role-policies"),
+    ("iam", "list-role-tags"),
+    ("apigatewayv2", "get-integration"),
+    ("apigatewayv2", "get-routes"),
+    ("apigatewayv2", "get-stage"),
+    ("apigatewayv2", "get-authorizers"),
+}
+_RECOVERY_REPORT_READ_ONLY_OPERATIONS = {
+    ("cloudformation", "list-stacks"),
+    ("cloudformation", "list-stack-resources"),
+}
+
+
+def _assert_exact_read_only_allowlist(calls, allowed):
+    pairs = {
+        (call[0], call[1])
+        for call in calls
+        if len(call) >= 2 and call[0] != "pause"
+    }
+    assert pairs
+    assert pairs <= allowed
+
+
+@pytest.mark.parametrize(
+    "unsafe_pair",
+    [
+        ("cloudformation", "create-change-set"),
+        ("cloudformation", "execute-change-set"),
+        ("cloudformation", "delete-stack"),
+        ("lambda", "update-function-configuration"),
+    ],
+)
+def test_read_only_allowlist_rejects_every_unapproved_operation(unsafe_pair):
+    with pytest.raises(AssertionError):
+        _assert_exact_read_only_allowlist(
+            [("cloudformation", "list-stacks"), unsafe_pair],
+            _RECOVERY_REPORT_READ_ONLY_OPERATIONS,
+        )
+
+
 def test_collection_preserves_policy_revision_separately(tmp_path):
     snapshot = collect_snapshot(FakeAwsCli(), fixture_config(tmp_path))
 
@@ -4236,10 +4304,9 @@ def test_verify_post_import_cli_writes_sanitized_evidence_after_read_only_gate(
         "PacificBioArchive-QueryAdoption"
     }
     assert "internal-secret" not in json.dumps(evidence)
-    assert all(
-        call[0] not in {"put-object", "create-change-set", "execute-change-set", "delete-stack"}
-        for call in cli.calls
-        if call
+    _assert_exact_read_only_allowlist(
+        cli.calls,
+        _VERIFY_POST_IMPORT_READ_ONLY_OPERATIONS,
     )
 
 
@@ -4272,8 +4339,29 @@ def test_recovery_report_cli_records_only_classification_and_ownership(
     assert set(report) == {"classification", "ownership"}
     assert report["classification"]["action"] == "post-import-evidence"
     assert report["ownership"]["target_stack"]["status"] == "IMPORT_COMPLETE"
+    assert report["ownership"]["source_stack"]["resources"] == {
+        "FilesTable": {
+            "physical_id": "PacificBioArchiveFiles",
+            "resource_type": "AWS::DynamoDB::Table",
+        },
+        "SubscriptionsTable": {
+            "physical_id": "PacificBioArchiveSubscriptions",
+            "resource_type": "AWS::DynamoDB::Table",
+        },
+        "NotificationsTable": {
+            "physical_id": "PacificBioArchiveNotifications",
+            "resource_type": "AWS::DynamoDB::Table",
+        },
+        "QueryLambdaRole": {
+            "physical_id": "PacificBioArchive-QueryLambdaRole",
+            "resource_type": "AWS::IAM::Role",
+        },
+    }
     assert json.loads(capsys.readouterr().out) == report
-    assert all(call[0] == "cloudformation" for call in cli.calls)
+    _assert_exact_read_only_allowlist(
+        cli.calls,
+        _RECOVERY_REPORT_READ_ONLY_OPERATIONS,
+    )
 
 
 def test_recovery_report_failed_creation_absent_target_discards_stale_artifacts(
@@ -4308,3 +4396,154 @@ def test_recovery_report_failed_creation_absent_target_discards_stale_artifacts(
         "deletion_requires_separate_approval": False,
         "discard_stale_artifacts": True,
     }
+
+
+def _run_recovery_report(tmp_path, monkeypatch, cli):
+    import prepare_import
+
+    monkeypatch.setattr(prepare_import, "AwsCli", lambda: cli)
+    (tmp_path / "sanitized-snapshot.json").write_text(
+        json.dumps(valid_snapshot()),
+        encoding="utf-8",
+    )
+    assert prepare_import.main(
+        [
+            "recovery-report",
+            "--region", "ap-southeast-2",
+            "--source-stack", "PacificBioArchive-Database",
+            "--target-stack", "PacificBioArchive-QueryAdoption",
+            "--workdir", str(tmp_path),
+        ]
+    ) == 0
+    return json.loads(
+        (tmp_path / "recovery-report.json").read_text(encoding="utf-8")
+    )
+
+
+@pytest.mark.parametrize("status", ["IMPORT_COMPLETE", "UPDATE_ROLLBACK_COMPLETE"])
+@pytest.mark.parametrize(
+    "mutation",
+    ["wrong-physical", "wrong-type", "partial", "extra", "mixed-owner"],
+)
+def test_recovery_requires_exact_target_mapping_and_owner_for_stable_actions(
+    tmp_path,
+    monkeypatch,
+    status,
+    mutation,
+):
+    class UnsafeTargetRecoveryCli(PostImportCli):
+        def json(self, *args):
+            if args[:2] == ("cloudformation", "list-stacks"):
+                response = super().json(*args)
+                target = next(
+                    item
+                    for item in response["StackSummaries"]
+                    if item["StackName"] == "PacificBioArchive-QueryAdoption"
+                )
+                target["StackStatus"] = status
+                if mutation == "mixed-owner":
+                    response["StackSummaries"].append(
+                        {"StackName": "ForeignStack", "StackStatus": "UPDATE_COMPLETE"}
+                    )
+                return response
+            if (
+                args[:2] == ("cloudformation", "list-stack-resources")
+                and "PacificBioArchive-QueryAdoption" in args
+            ):
+                response = super().json(*args)
+                resources = response["StackResourceSummaries"]
+                query_function = next(
+                    item for item in resources
+                    if item["LogicalResourceId"] == "QueryFunction"
+                )
+                if mutation == "wrong-physical":
+                    query_function["PhysicalResourceId"] = "wrong-function"
+                elif mutation == "wrong-type":
+                    query_function["ResourceType"] = "AWS::Lambda::Version"
+                elif mutation in {"partial", "mixed-owner"}:
+                    resources.remove(query_function)
+                elif mutation == "extra":
+                    resources.append(
+                        {
+                            "LogicalResourceId": "UnexpectedResource",
+                            "PhysicalResourceId": "unexpected",
+                            "ResourceType": "AWS::S3::Bucket",
+                        }
+                    )
+                return response
+            if (
+                mutation == "mixed-owner"
+                and args[:2] == ("cloudformation", "list-stack-resources")
+                and "ForeignStack" in args
+            ):
+                self.calls.append(args)
+                return {
+                    "StackResourceSummaries": [
+                        {
+                            "LogicalResourceId": "ForeignFunction",
+                            "PhysicalResourceId": "PacificBioArchive-QueryLambda",
+                            "ResourceType": "AWS::Lambda::Function",
+                        }
+                    ]
+                }
+            return super().json(*args)
+
+    report = _run_recovery_report(
+        tmp_path,
+        monkeypatch,
+        UnsafeTargetRecoveryCli(),
+    )
+
+    assert report["classification"]["action"] == "stop"
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    ["unstable-status", "wrong-physical", "wrong-type", "partial", "extra"],
+)
+def test_recovery_requires_exact_stable_source_evidence_even_when_target_absent(
+    tmp_path,
+    monkeypatch,
+    mutation,
+):
+    class UnsafeSourceRecoveryCli(FakeAwsCli):
+        def run(self, *args):
+            raise AssertionError(f"write boundary must not be called: {args}")
+
+        def json(self, *args):
+            response = super().json(*args)
+            if args[:2] == ("cloudformation", "list-stacks"):
+                if mutation == "unstable-status":
+                    response["StackSummaries"][0]["StackStatus"] = "UPDATE_IN_PROGRESS"
+                return response
+            if args[:2] == ("cloudformation", "list-stack-resources"):
+                resources = response["StackResourceSummaries"]
+                files = next(
+                    item for item in resources
+                    if item["LogicalResourceId"] == "FilesTable"
+                )
+                if mutation == "wrong-physical":
+                    files["PhysicalResourceId"] = "stale-files-table"
+                elif mutation == "wrong-type":
+                    files["ResourceType"] = "AWS::S3::Bucket"
+                elif mutation == "partial":
+                    resources.remove(files)
+                elif mutation == "extra":
+                    resources.append(
+                        {
+                            "LogicalResourceId": "UnexpectedResource",
+                            "PhysicalResourceId": "unexpected",
+                            "ResourceType": "AWS::S3::Bucket",
+                        }
+                    )
+                return response
+            return response
+
+    report = _run_recovery_report(
+        tmp_path,
+        monkeypatch,
+        UnsafeSourceRecoveryCli(),
+    )
+
+    assert report["classification"]["action"] == "stop"
+    assert "resources" in report["ownership"]["source_stack"]

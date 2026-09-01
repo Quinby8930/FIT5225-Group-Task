@@ -965,6 +965,56 @@ def expected_imported_physical_ids(
     return result
 
 
+def expected_source_stack_resources(
+    snapshot: Mapping[str, Any],
+) -> dict[str, dict[str, str]]:
+    """Return the trusted four-resource source ownership boundary."""
+    stack = snapshot.get("stack")
+    managed = stack.get("managed") if isinstance(stack, Mapping) else None
+    template = stack.get("template") if isinstance(stack, Mapping) else None
+    resources = (
+        template.get("Resources") if isinstance(template, Mapping) else None
+    )
+    _require(
+        isinstance(managed, Mapping)
+        and set(managed) == ORIGINAL_STACK_LOGICAL_IDS
+        and isinstance(resources, Mapping),
+        "trusted source stack ownership evidence is incomplete",
+    )
+    result: dict[str, dict[str, str]] = {}
+    for logical_id in ORIGINAL_STACK_LOGICAL_IDS:
+        physical_id = managed.get(logical_id)
+        resource = resources.get(logical_id)
+        resource_type = (
+            resource.get("Type") if isinstance(resource, Mapping) else None
+        )
+        _require(
+            isinstance(physical_id, str)
+            and bool(physical_id)
+            and isinstance(resource_type, str)
+            and bool(resource_type),
+            "trusted source stack ownership evidence is incomplete",
+        )
+        result[logical_id] = {
+            "physical_id": physical_id,
+            "resource_type": resource_type,
+        }
+    return result
+
+
+def source_recovery_evidence_is_exact(
+    baseline: Mapping[str, Any],
+    observed: Mapping[str, Any],
+) -> bool:
+    """Return whether recovery proved the stable four-resource source stack."""
+    return (
+        isinstance(observed, Mapping)
+        and observed.get("name") == SOURCE_STACK_NAME
+        and observed.get("status") in _STABLE_STACK_STATUSES
+        and observed.get("resources") == expected_source_stack_resources(baseline)
+    )
+
+
 def _validate_target_stack(
     snapshot: Mapping[str, Any],
     *,

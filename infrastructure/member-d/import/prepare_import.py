@@ -39,6 +39,7 @@ from adoption import (
     build_resources_to_import,
     classify_recovery_state,
     expected_imported_physical_ids,
+    source_recovery_evidence_is_exact,
     validate_import_artifacts,
     validate_import_change_set,
     validate_built_template,
@@ -1137,10 +1138,8 @@ def collect_recovery_ownership(
             raise AdoptionError("recovery stack evidence is malformed")
         if status != "DELETE_COMPLETE":
             active[name] = status
-    if source_stack not in active:
-        raise AdoptionError("source stack recovery evidence is unavailable")
-
     owners_by_physical_id: dict[str, set[str]] = {}
+    source_resources: dict[str, dict[str, str]] = {}
     target_resources: dict[str, dict[str, str]] = {}
     for stack_name in active:
         resources = _collect_paginated_items(
@@ -1166,16 +1165,20 @@ def collect_recovery_ownership(
                 raise AdoptionError("recovery resource evidence is malformed")
             seen_logical_ids.add(logical_id)
             owners_by_physical_id.setdefault(physical_id, set()).add(stack_name)
-            if stack_name == target_stack:
+            if stack_name in {source_stack, target_stack}:
                 resource_type = resource.get("ResourceType")
                 if not isinstance(resource_type, str) or not resource_type:
                     raise AdoptionError(
-                        "target recovery resource type evidence is malformed"
+                        "stack recovery resource type evidence is malformed"
                     )
-                target_resources[logical_id] = {
+                evidence = {
                     "physical_id": physical_id,
                     "resource_type": resource_type,
                 }
+                if stack_name == source_stack:
+                    source_resources[logical_id] = evidence
+                else:
+                    target_resources[logical_id] = evidence
 
     import_owners: dict[str, str | None] = {}
     for logical_id, evidence in adoption_expected.items():
@@ -1188,7 +1191,8 @@ def collect_recovery_ownership(
     return {
         "source_stack": {
             "name": source_stack,
-            "status": active[source_stack],
+            "status": active.get(source_stack),
+            "resources": source_resources,
         },
         "target_stack": {
             "name": target_stack,
@@ -2085,11 +2089,17 @@ def main(argv: list[str] | None = None) -> int:
         exact_target_owners = {
             logical_id: TARGET_STACK_NAME for logical_id in expected_target
         }
-        if ownership["target_stack"]["status"] == "IMPORT_COMPLETE" and (
-            ownership["target_stack"]["resources"] != expected_target
-            or ownership["import_owners"] != exact_target_owners
-        ):
-            managed.add("__unsafe_ownership_evidence__")
+        target_requires_exact_boundary = ownership["target_stack"][
+            "status"
+        ] in {"IMPORT_COMPLETE", "UPDATE_ROLLBACK_COMPLETE"}
+        exact_target_boundary = (
+            ownership["target_stack"]["resources"] == expected_target
+            and ownership["import_owners"] == exact_target_owners
+        )
+        source_is_exact = source_recovery_evidence_is_exact(
+            baseline,
+            ownership["source_stack"],
+        )
         classification = classify_recovery_state(
             ownership["target_stack"]["status"],
             managed,
@@ -2097,6 +2107,12 @@ def main(argv: list[str] | None = None) -> int:
                 args.import_change_set_creation_failed
             ),
         )
+        if not source_is_exact or (
+            target_requires_exact_boundary and not exact_target_boundary
+        ):
+            classification["action"] = "stop"
+            classification["empty_shell_cleanup_candidate"] = False
+            classification["deletion_requires_separate_approval"] = False
         report = {
             "classification": classification,
             "ownership": ownership,
