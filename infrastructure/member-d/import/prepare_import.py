@@ -1699,7 +1699,7 @@ def package_update_function(
     if maintained_template is None:
         try:
             maintained_template = _parse_processed_template(
-                (Path(__file__).resolve().parents[1] / "dynamodb.yaml").read_text(
+                (Path(__file__).resolve().parents[1] / "query-adoption.yaml").read_text(
                     encoding="utf-8"
                 )
             )
@@ -2195,7 +2195,7 @@ def main(argv: list[str] | None = None) -> int:
             Path(args.built_template),
             "SAM built UPDATE template",
         )
-        maintained_path = Path(__file__).resolve().parents[1] / "dynamodb.yaml"
+        maintained_path = Path(__file__).resolve().parents[1] / "query-adoption.yaml"
         dependency_manifest_path = Path(args.dependency_manifest)
         _verify_committed_file(maintained_path, args.expected_commit)
         _verify_committed_file(dependency_manifest_path, args.expected_commit)
@@ -2239,12 +2239,19 @@ def main(argv: list[str] | None = None) -> int:
     ):
         raise AdoptionError("change set is not CREATE_COMPLETE and AVAILABLE")
     workdir = Path(args.workdir)
-    snapshot_path = workdir / "sanitized-snapshot.json"
-    audited = json.loads(snapshot_path.read_text(encoding="utf-8"))
-    must_recollect = args.expected_type == "IMPORT" or (
-        args.expected_type == "UPDATE"
-        and args.expect_role_reconciliation == "true"
+    snapshot_path = workdir / (
+        "sanitized-snapshot.json"
+        if args.expected_type == "IMPORT"
+        else "post-import-evidence.json"
     )
+    audited = json.loads(snapshot_path.read_text(encoding="utf-8"))
+    if args.expected_type == "UPDATE":
+        validate_post_import_snapshot(audited)
+        if args.expect_role_reconciliation == "true":
+            raise AdoptionError(
+                "query-stack UPDATE role reconciliation is disabled"
+            )
+    must_recollect = args.expected_type == "IMPORT"
     if must_recollect:
         if not all(
             isinstance(value, str) and value
@@ -2347,10 +2354,6 @@ def main(argv: list[str] | None = None) -> int:
             raise AdoptionError(
                 "--expected-allow-legacy-processing-callbacks is required for UPDATE validation"
             )
-        if args.expect_role_reconciliation is None:
-            raise AdoptionError(
-                "--expect-role-reconciliation is required for UPDATE validation"
-            )
         built = _read_template_file(
             Path(args.built_template),
             "SAM built UPDATE template",
@@ -2359,7 +2362,7 @@ def main(argv: list[str] | None = None) -> int:
             Path(args.packaged_template),
             "packaged UPDATE template",
         )
-        maintained_path = Path(__file__).resolve().parents[1] / "dynamodb.yaml"
+        maintained_path = Path(__file__).resolve().parents[1] / "query-adoption.yaml"
         dependency_manifest_path = Path(args.dependency_manifest)
         _verify_committed_file(maintained_path, args.expected_commit)
         _verify_committed_file(dependency_manifest_path, args.expected_commit)
@@ -2386,11 +2389,27 @@ def main(argv: list[str] | None = None) -> int:
             args.stack,
             args.region,
         )
-        if must_recollect and current_parameter_names != set(
-            audited.get("stack", {}).get("parameters", [])
+        if current_parameter_names != {
+            "ExistingQueryLambdaRoleArn",
+            "ExistingHttpApiId",
+            "ExistingJwtAuthorizerId",
+        }:
+            raise AdoptionError(
+                "query stack parameter names differ from the exact IMPORT boundary"
+            )
+        safe_environment = audited.get("function", {}).get(
+            "safe_environment", {}
+        )
+        audited_api_id = audited.get("api", {}).get("id")
+        audited_authorizer_id = audited.get("api", {}).get(
+            "authorizer", {}
+        ).get("AuthorizerId")
+        if (
+            args.expected_http_api_id != audited_api_id
+            or args.expected_jwt_authorizer_id != audited_authorizer_id
         ):
             raise AdoptionError(
-                "stack parameter names changed during UPDATE validation"
+                "UPDATE API or authorizer parameter differs from post-import evidence"
             )
         validate_update_artifacts(
             processed,
@@ -2399,8 +2418,22 @@ def main(argv: list[str] | None = None) -> int:
             maintained,
             change_set.get("Parameters"),
             {
+                "ExistingQueryLambdaRoleArn": audited.get("function", {}).get(
+                    "Role"
+                ),
                 "ExistingHttpApiId": args.expected_http_api_id,
                 "ExistingJwtAuthorizerId": args.expected_jwt_authorizer_id,
+                "ExistingFilesTableName": safe_environment.get(
+                    "DYNAMODB_TABLE"
+                ),
+                "ExistingSubscriptionsTableName": safe_environment.get(
+                    "SUBSCRIPTIONS_TABLE"
+                ),
+                "ExistingNotificationsTableName": safe_environment.get(
+                    "NOTIFICATIONS_TABLE"
+                ),
+                "AllowedOrigin": "http://localhost:3000",
+                "PublicAllowedOrigin": "https://quinby8930.github.io",
                 "QueryInputBucketName": args.expected_query_input_bucket,
                 "StorageDeleteFunctionName": args.expected_storage_delete_function,
                 "InferenceApiBaseUrl": args.expected_inference_api_base_url,
@@ -2409,94 +2442,11 @@ def main(argv: list[str] | None = None) -> int:
                 ),
             },
             artifact,
-            internal_key_already_exists=(
-                "InternalApiKey" in current_parameter_names
-            ),
+            internal_key_already_exists=False,
         )
-        hardening_only = args.expect_role_reconciliation == "false"
-        if hardening_only:
-            if args.expected_allow_legacy_processing_callbacks != "false":
-                raise AdoptionError(
-                    "hardening UPDATE must set legacy processing callbacks to false"
-                )
-            current_template_response = cli.json(
-                "cloudformation",
-                "get-template",
-                "--stack-name",
-                args.stack,
-                "--template-stage",
-                "Processed",
-                "--region",
-                args.region,
-            )
-            current_processed = _parse_processed_template(
-                current_template_response.get("TemplateBody")
-                if isinstance(current_template_response, Mapping)
-                else None
-            )
-            current_parameters = cli.json(
-                "cloudformation",
-                "describe-stacks",
-                "--stack-name",
-                args.stack,
-                "--region",
-                args.region,
-                "--query",
-                "Stacks[0].Parameters",
-            )
-            drift = cli.json(
-                "cloudformation",
-                "detect-stack-resource-drift",
-                "--stack-name",
-                args.stack,
-                "--logical-resource-id",
-                "QueryFunction",
-                "--region",
-                args.region,
-                "--query",
-                "StackResourceDrift.{LogicalResourceId:LogicalResourceId,"
-                "Status:StackResourceDriftStatus,Differences:PropertyDifferences}",
-            )
-            field_query = ",".join(
-                f"{field}:{field}" for field in _HARDENING_FUNCTION_FIELDS
-            )
-            environment_query = ",".join(
-                f"{name}:Environment.Variables.{name}"
-                for name in _HARDENING_ENVIRONMENT_NAMES
-            )
-            live_function = cli.json(
-                "lambda",
-                "get-function-configuration",
-                "--function-name",
-                "PacificBioArchive-QueryLambda",
-                "--region",
-                args.region,
-                "--query",
-                "{"
-                + field_query
-                + ",Environment:{Names:keys(Environment.Variables),Variables:{"
-                + environment_query
-                + "}}}",
-            )
-            validate_hardening_runtime_evidence(
-                current_processed,
-                processed,
-                current_parameters,
-                change_set.get("Parameters"),
-                drift,
-                live_function,
-                artifact,
-                expected_callback=(
-                    args.expected_allow_legacy_processing_callbacks
-                ),
-            )
         validate_update_change_set(
             change_set.get("Changes", []),
             processed,
-            audited.get("role")
-            if args.expect_role_reconciliation == "true"
-            else None,
-            hardening_only=hardening_only,
         )
     print("change set validated; no CloudFormation change set was created or executed")
     return 0

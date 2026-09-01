@@ -40,6 +40,8 @@ from prepare_import import (
 )
 from test_adoption import (
     _EXPECTED_IMPORT_RESOURCES,
+    _first_query_update_changes,
+    _first_query_update_processed,
     _maintained_role_target,
     _route_scoped_lambda_policy,
     _update_processed,
@@ -139,7 +141,11 @@ class FakeAwsCli:
                     }
                 return {
                     "StackName": "PacificBioArchive-QueryAdoption",
-                    "ParameterNames": ["InternalApiKey"],
+                    "ParameterNames": [
+                        "ExistingQueryLambdaRoleArn",
+                        "ExistingHttpApiId",
+                        "ExistingJwtAuthorizerId",
+                    ],
                 }
             return {"Stacks": [{"StackName": "PacificBioArchive-Database", "StackStatus": "UPDATE_ROLLBACK_COMPLETE", "Parameters": [{"ParameterKey": "InternalApiKey", "ParameterValue": "internal-secret"}]}]}
         if "get-template" in command:
@@ -319,8 +325,16 @@ def fixture_config(tmp_path):
 
 
 _EXPECTED_UPDATE_PARAMETER_VALUES = {
+    "ExistingQueryLambdaRoleArn": (
+        "arn:aws:iam::111122223333:role/PacificBioArchive-QueryLambdaRole"
+    ),
     "ExistingHttpApiId": "2dd2aqb32j",
     "ExistingJwtAuthorizerId": "7ir7fs",
+    "ExistingFilesTableName": "PacificBioArchiveFiles",
+    "ExistingSubscriptionsTableName": "PacificBioArchiveSubscriptions",
+    "ExistingNotificationsTableName": "PacificBioArchiveNotifications",
+    "AllowedOrigin": "http://localhost:3000",
+    "PublicAllowedOrigin": "https://quinby8930.github.io",
     "QueryInputBucketName": "pacificbioarchive-media-test",
     "StorageDeleteFunctionName": "PacificBioArchive-StorageDeleteFunction",
     "InferenceApiBaseUrl": (
@@ -335,7 +349,7 @@ def _maintained_source_template():
         Path(__file__).parents[3]
         / "infrastructure"
         / "member-d"
-        / "dynamodb.yaml"
+        / "query-adoption.yaml"
     )
     return deepcopy(
         _parse_processed_template(source_path.read_text(encoding="utf-8"))
@@ -370,7 +384,7 @@ def _built_update_template():
 
 def _processed_update_template():
     maintained = _maintained_source_template()
-    processed = _update_processed(_maintained_role_target())
+    processed = _first_query_update_processed()
     for key, value in maintained.items():
         if key not in {"Resources", "Transform"}:
             processed[key] = deepcopy(value)
@@ -388,17 +402,14 @@ def _explicit_update_parameters():
         for key, value in _EXPECTED_UPDATE_PARAMETER_VALUES.items()
     ]
     parameters.append(
-        {"ParameterKey": "InternalApiKey", "UsePreviousValue": True}
+        {"ParameterKey": "InternalApiKey", "ParameterValue": "*****"}
     )
     return parameters
 
 
 def _first_update_parameters(mask="*****"):
     parameters = _explicit_update_parameters()
-    parameters[-1] = {
-        "ParameterKey": "InternalApiKey",
-        "ParameterValue": mask,
-    }
+    parameters[-1]["ParameterValue"] = mask
     return parameters
 
 
@@ -414,6 +425,15 @@ def _current_hardening_parameters():
     ] + [
         {"ParameterKey": "InternalApiKey", "ParameterValue": "not-exposed"}
     ]
+
+
+def _hardening_candidate_parameters():
+    parameters = _explicit_update_parameters()
+    parameters[-1] = {
+        "ParameterKey": "InternalApiKey",
+        "UsePreviousValue": True,
+    }
+    return parameters
 
 
 def _hardening_runtime_evidence():
@@ -456,7 +476,7 @@ def _hardening_runtime_evidence():
 def test_hardening_parameter_transition_accepts_only_callback_disable():
     adoption.validate_hardening_parameter_transition(
         _current_hardening_parameters(),
-        _explicit_update_parameters(),
+        _hardening_candidate_parameters(),
     )
 
 
@@ -478,7 +498,7 @@ def test_hardening_parameter_transition_accepts_only_callback_disable():
     ids=("non-callback", "callback-not-disabled", "secret-not-reused"),
 )
 def test_hardening_parameter_transition_rejects_any_other_change(mutation):
-    candidate = _explicit_update_parameters()
+    candidate = _hardening_candidate_parameters()
     mutation(candidate)
 
     with pytest.raises(AdoptionError, match="hardening|parameter|callback|reuse"):
@@ -496,7 +516,7 @@ def test_hardening_runtime_evidence_accepts_bound_in_sync_transition():
         processed,
         deepcopy(processed),
         _current_hardening_parameters(),
-        _explicit_update_parameters(),
+        _hardening_candidate_parameters(),
         drift,
         live_function,
         artifact,
@@ -536,7 +556,7 @@ def test_hardening_runtime_evidence_rejects_unbound_or_extra_change(mutation):
 
     current, drift, live_function, artifact = _hardening_runtime_evidence()
     candidate = deepcopy(current)
-    parameters = _explicit_update_parameters()
+    parameters = _hardening_candidate_parameters()
     mutation(current, candidate, parameters, drift, live_function, artifact)
 
     with pytest.raises(
@@ -556,14 +576,7 @@ def test_hardening_runtime_evidence_rejects_unbound_or_extra_change(mutation):
 
 
 def _update_changes():
-    return [{
-        "ResourceChange": {
-            "Action": "Modify",
-            "LogicalResourceId": "QueryLambdaRole",
-            "ResourceType": "AWS::IAM::Role",
-            "Replacement": "False",
-        }
-    }]
+    return _first_query_update_changes()
 
 
 def _import_changes(snapshot):
@@ -627,6 +640,11 @@ def _write_change_set_validation_files(workdir):
         json.dumps(_json_safe_snapshot(snapshot)),
         encoding="utf-8",
     )
+    imported = post_import_snapshot()
+    (workdir / "post-import-evidence.json").write_text(
+        json.dumps(_json_safe_snapshot(imported)),
+        encoding="utf-8",
+    )
     (workdir / "import-template.json").write_text(
         json.dumps(import_template),
         encoding="utf-8",
@@ -645,6 +663,7 @@ def _write_change_set_validation_files(workdir):
     )
     return {
         "snapshot": snapshot,
+        "post_import": imported,
         "import_template": import_template,
         "import_parameters": import_parameters,
         "packaged": packaged,
@@ -703,7 +722,11 @@ class CandidateChangeSetCli(FakeAwsCli):
         self.artifact_checksum = artifact_checksum
         self.artifact_version = artifact_version
         self.stack_parameter_names = (
-            ["InternalApiKey"]
+            [
+                "ExistingQueryLambdaRoleArn",
+                "ExistingHttpApiId",
+                "ExistingJwtAuthorizerId",
+            ]
             if stack_parameter_names is None
             else list(stack_parameter_names)
         )
@@ -751,7 +774,7 @@ def _validate_change_set_args(
     workdir,
     expected_type,
     *,
-    expect_role_reconciliation="true",
+    expect_role_reconciliation="false",
 ):
     args = [
         "validate-change-set",
@@ -940,15 +963,12 @@ def test_update_contracts_match_the_maintained_template_source():
         Path(__file__).parents[3]
         / "infrastructure"
         / "member-d"
-        / "dynamodb.yaml"
+        / "query-adoption.yaml"
     )
     template = _parse_processed_template(source_path.read_text(encoding="utf-8"))
 
     assert template["Resources"]["ReservationsTable"] == (
         adoption._maintained_reservations_table_target()
-    )
-    assert template["Resources"]["QueryLambdaRole"] == (
-        adoption._maintained_role_target()
     )
     plain_targets = adoption._maintained_plain_resource_targets()
     assert set(template["Resources"]) == set(plain_targets) | {"QueryFunction"}
@@ -1661,11 +1681,11 @@ def test_processed_update_reuses_function_and_has_no_implicit_role():
     assert route_import_ids == set(adoption.ROUTES_BY_LOGICAL_ID)
     assert "QueryIntegration" not in route_import_ids
     processed = _update_processed(_maintained_role_target())
-    validate_update_change_set([{"ResourceChange": {"Action": "Modify", "LogicalResourceId": "QueryFunction", "ResourceType": "AWS::Lambda::Function", "Replacement": "False"}}], processed)
+    validate_update_change_set(_update_changes(), processed)
 
 
 def test_processed_update_rejects_implicit_role_or_adopted_replacement():
-    with pytest.raises(AdoptionError, match="replacement|implicit role"):
+    with pytest.raises(AdoptionError, match="replacement|implicit role|contract"):
         validate_update_change_set([{"ResourceChange": {"Action": "Modify", "LogicalResourceId": "QueryFunction", "ResourceType": "AWS::Lambda::Function", "Replacement": "True"}}], {"Resources": {"QueryFunctionRole": {"Type": "AWS::IAM::Role"}, "QueryFunction": {"Type": "AWS::Lambda::Function"}}})
 
 
@@ -2738,7 +2758,7 @@ def test_update_artifacts_reject_built_template_not_bound_to_maintained_source()
 
 def test_update_artifacts_reject_processed_output_that_leaks_internal_key():
     processed = _processed_update_template()
-    processed["Outputs"]["LeakedInternalApiKey"] = {
+    processed.setdefault("Outputs", {})["LeakedInternalApiKey"] = {
         "Value": {"Ref": "InternalApiKey"}
     }
 
@@ -2760,7 +2780,7 @@ def test_update_artifacts_reject_processed_output_that_leaks_internal_key():
         lambda template: template["Parameters"]["InternalApiKey"].update(
             {"NoEcho": False}
         ),
-        lambda template: template["Conditions"].update(
+        lambda template: template.setdefault("Conditions", {}).update(
             {
                 "HasNotificationEmailEndpoint": {
                     "Fn::Equals": [
@@ -2770,8 +2790,8 @@ def test_update_artifacts_reject_processed_output_that_leaks_internal_key():
                 }
             }
         ),
-        lambda template: template["Outputs"]["QueryFunctionArn"].update(
-            {"Value": {"Ref": "InternalApiKey"}}
+        lambda template: template.setdefault("Outputs", {}).update(
+            {"QueryFunctionArn": {"Value": {"Ref": "InternalApiKey"}}}
         ),
     ],
     ids=("parameters", "conditions", "outputs"),
@@ -2801,10 +2821,10 @@ def test_update_artifacts_reject_processed_top_level_mismatch(mutation):
         lambda template: template["Parameters"]["AllowedOrigin"].update(
             {"Default": "https://attacker.invalid"}
         ),
-        lambda template: template["Conditions"].update(
+        lambda template: template.setdefault("Conditions", {}).update(
             {"HasNotificationEmailEndpoint": {"Fn::Equals": ["1", "1"]}}
         ),
-        lambda template: template["Outputs"].update(
+        lambda template: template.setdefault("Outputs", {}).update(
             {"LeakedInternalApiKey": {"Value": {"Ref": "InternalApiKey"}}}
         ),
     ],
@@ -3367,7 +3387,6 @@ def test_first_update_accepts_console_masked_noecho_when_parameter_was_missing(
         processed=files["processed_update"],
         artifact_checksum=files["update_checksum"],
         artifact_version=files["update_artifact"].version_id,
-        stack_parameter_names=[],
     )
     monkeypatch.setattr(prepare_import, "AwsCli", lambda: cli)
     _use_packaged_update_artifact(monkeypatch, prepare_import, files)
@@ -3421,7 +3440,7 @@ def test_first_update_rejects_parameter_state_change_during_validation(
         lambda _cli, _config: deepcopy(files["snapshot"]),
     )
 
-    with pytest.raises(AdoptionError, match="parameter names changed"):
+    with pytest.raises(AdoptionError, match="parameter names|IMPORT boundary"):
         prepare_import.main(_validate_change_set_args(workdir, "UPDATE"))
 
 
@@ -3448,7 +3467,6 @@ def test_first_update_plaintext_parameter_is_not_logged_or_persisted(
         processed=files["processed_update"],
         artifact_checksum=files["update_checksum"],
         artifact_version=files["update_artifact"].version_id,
-        stack_parameter_names=[],
     )
     monkeypatch.setattr(prepare_import, "AwsCli", lambda: cli)
     _use_packaged_update_artifact(monkeypatch, prepare_import, files)
@@ -3470,7 +3488,7 @@ def test_first_update_plaintext_parameter_is_not_logged_or_persisted(
     )
 
 
-def test_followup_update_does_not_reconcile_role_from_old_drift_snapshot(
+def test_first_update_rejects_query_function_only_preview_without_recollection(
     tmp_path,
     monkeypatch,
 ):
@@ -3503,25 +3521,17 @@ def test_followup_update_does_not_reconcile_role_from_old_drift_snapshot(
             AssertionError("hardening-only UPDATE must not recollect old role drift")
         ),
     )
-    hardening_evidence = []
-    monkeypatch.setattr(
-        prepare_import,
-        "validate_hardening_runtime_evidence",
-        lambda *args, **kwargs: hardening_evidence.append((args, kwargs)),
-    )
-
-    assert prepare_import.main(
-        _validate_change_set_args(
-            workdir,
-            "UPDATE",
-            expect_role_reconciliation="false",
+    with pytest.raises(AdoptionError, match="exact 37-action"):
+        prepare_import.main(
+            _validate_change_set_args(
+                workdir,
+                "UPDATE",
+                expect_role_reconciliation="false",
+            )
         )
-    ) == 0
-    assert len(hardening_evidence) == 1
-    assert hardening_evidence[0][1] == {"expected_callback": "false"}
 
 
-def test_followup_update_rejects_unexpected_role_change(tmp_path, monkeypatch):
+def test_first_update_rejects_legacy_role_reconciliation_mode(tmp_path, monkeypatch):
     import prepare_import
 
     workdir = tmp_path / "followup-update-work"
@@ -3539,13 +3549,13 @@ def test_followup_update_rejects_unexpected_role_change(tmp_path, monkeypatch):
 
     with pytest.raises(
         AdoptionError,
-        match="hardening|QueryFunction|QueryLambdaRole|role",
+        match="role reconciliation is disabled",
     ):
         prepare_import.main(
             _validate_change_set_args(
                 workdir,
                 "UPDATE",
-                expect_role_reconciliation="false",
+                expect_role_reconciliation="true",
             )
         )
 
@@ -3559,7 +3569,7 @@ def test_update_change_set_main_rejects_tampered_local_packaged_template(
     workdir = tmp_path / "update-work"
     files = _write_change_set_validation_files(workdir)
     tampered = deepcopy(files["packaged"])
-    tampered["Outputs"]["LeakedInternalApiKey"] = {
+    tampered.setdefault("Outputs", {})["LeakedInternalApiKey"] = {
         "Value": {"Ref": "InternalApiKey"}
     }
     (workdir / "packaged-template.yaml").write_text(
@@ -3859,7 +3869,11 @@ def test_change_set_validator_uses_explicit_workdir_and_candidate_template(tmp_p
             if args[:2] == ("cloudformation", "describe-stacks"):
                 return {
                     "StackName": "PacificBioArchive-QueryAdoption",
-                    "ParameterNames": ["InternalApiKey"],
+                    "ParameterNames": [
+                        "ExistingQueryLambdaRoleArn",
+                        "ExistingHttpApiId",
+                        "ExistingJwtAuthorizerId",
+                    ],
                 }
             if args[:2] == ("cloudformation", "describe-change-set"):
                 return {
@@ -3931,8 +3945,8 @@ def test_change_set_validator_uses_explicit_workdir_and_candidate_template(tmp_p
     monkeypatch.setattr(
         prepare_import,
         "validate_update_change_set",
-        lambda changes, processed, role, **kwargs: calls.append(
-            ("update", role, kwargs)
+        lambda changes, processed, **kwargs: calls.append(
+            ("update", kwargs)
         ),
     )
     args = _validate_change_set_args(workdir, expected_type)

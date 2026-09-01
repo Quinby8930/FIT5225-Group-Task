@@ -1375,19 +1375,6 @@ def classify_recovery_state(
     return result
 
 
-def _role_continuity_with_retain(audited: Mapping[str, Any], current: Mapping[str, Any]) -> bool:
-    """Allow only the resource-level Retain delta needed by maintained SAM."""
-    if current.get("DeletionPolicy") != "Retain" or current.get("UpdateReplacePolicy") != "Retain":
-        return False
-    baseline = deepcopy(dict(audited))
-    target = deepcopy(dict(current))
-    for key in ("DeletionPolicy", "UpdateReplacePolicy"):
-        target.pop(key, None)
-        if baseline.get(key) == "Retain":
-            baseline.pop(key)
-    return baseline == target
-
-
 def _maintained_reservations_table_target() -> dict[str, Any]:
     return {
         "Type": "AWS::DynamoDB::Table",
@@ -1401,139 +1388,6 @@ def _maintained_reservations_table_target() -> dict[str, Any]:
             ],
             "KeySchema": [
                 {"AttributeName": "reservation_key", "KeyType": "HASH"}
-            ],
-        },
-    }
-
-
-def _maintained_table_target(
-    table_name: str,
-    attribute_definitions: list[dict[str, str]],
-    key_schema: list[dict[str, str]],
-) -> dict[str, Any]:
-    return {
-        "Type": "AWS::DynamoDB::Table",
-        "DeletionPolicy": "Retain",
-        "UpdateReplacePolicy": "Retain",
-        "Properties": {
-            "TableName": table_name,
-            "BillingMode": "PAY_PER_REQUEST",
-            "AttributeDefinitions": deepcopy(attribute_definitions),
-            "KeySchema": deepcopy(key_schema),
-        },
-    }
-
-
-def _maintained_base_table_targets() -> dict[str, dict[str, Any]]:
-    return {
-        "FilesTable": _maintained_table_target(
-            "PacificBioArchiveFiles",
-            [{"AttributeName": "file_id", "AttributeType": "S"}],
-            [{"AttributeName": "file_id", "KeyType": "HASH"}],
-        ),
-        "SubscriptionsTable": _maintained_table_target(
-            "PacificBioArchiveSubscriptions",
-            [
-                {"AttributeName": "user_id", "AttributeType": "S"},
-                {"AttributeName": "species", "AttributeType": "S"},
-            ],
-            [
-                {"AttributeName": "user_id", "KeyType": "HASH"},
-                {"AttributeName": "species", "KeyType": "RANGE"},
-            ],
-        ),
-        "NotificationsTable": _maintained_table_target(
-            "PacificBioArchiveNotifications",
-            [
-                {"AttributeName": "user_id", "AttributeType": "S"},
-                {"AttributeName": "notification_id", "AttributeType": "S"},
-            ],
-            [
-                {"AttributeName": "user_id", "KeyType": "HASH"},
-                {"AttributeName": "notification_id", "KeyType": "RANGE"},
-            ],
-        ),
-    }
-
-
-def _maintained_role_target() -> dict[str, Any]:
-    """Exact processed role contract from the maintained Member D template."""
-    return {
-        "Type": "AWS::IAM::Role",
-        "DeletionPolicy": "Retain",
-        "UpdateReplacePolicy": "Retain",
-        "Properties": {
-            "RoleName": "PacificBioArchive-QueryLambdaRole",
-            "AssumeRolePolicyDocument": {
-                "Version": "2012-10-17",
-                "Statement": [
-                    {
-                        "Effect": "Allow",
-                        "Principal": {"Service": "lambda.amazonaws.com"},
-                        "Action": "sts:AssumeRole",
-                    }
-                ],
-            },
-            "ManagedPolicyArns": [
-                "arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole"
-            ],
-            "Policies": [
-                {
-                    "PolicyName": "DynamoDBFilesAccess",
-                    "PolicyDocument": {
-                        "Version": "2012-10-17",
-                        "Statement": [
-                            {
-                                "Effect": "Allow",
-                                "Action": [
-                                    "dynamodb:PutItem",
-                                    "dynamodb:GetItem",
-                                    "dynamodb:Scan",
-                                    "dynamodb:Query",
-                                    "dynamodb:UpdateItem",
-                                    "dynamodb:DeleteItem",
-                                    "dynamodb:TransactWriteItems",
-                                ],
-                                "Resource": [
-                                    {"Fn::GetAtt": ["FilesTable", "Arn"]},
-                                    {"Fn::GetAtt": ["ReservationsTable", "Arn"]},
-                                    {"Fn::GetAtt": ["SubscriptionsTable", "Arn"]},
-                                    {"Fn::GetAtt": ["NotificationsTable", "Arn"]},
-                                ],
-                            },
-                            {
-                                "Effect": "Allow",
-                                "Action": [
-                                    "s3:PutObject",
-                                    "s3:GetObject",
-                                    "s3:DeleteObject",
-                                ],
-                                "Resource": {
-                                    "Fn::Sub": (
-                                        "arn:${AWS::Partition}:s3:::"
-                                        "${QueryInputBucketName}/query-inputs/*"
-                                    )
-                                },
-                            },
-                            {
-                                "Effect": "Allow",
-                                "Action": "lambda:InvokeFunction",
-                                "Resource": {
-                                    "Fn::Sub": (
-                                        "arn:${AWS::Partition}:lambda:"
-                                        "${AWS::Region}:${AWS::AccountId}:"
-                                        "function:${StorageDeleteFunctionName}"
-                                    )
-                                },
-                            },
-                            {
-                                "Effect": "Allow",
-                                "Action": "sns:Publish",
-                                "Resource": {"Ref": "NotificationTopic"},
-                            },
-                        ],
-                    },
-                }
             ],
         },
     }
@@ -1568,7 +1422,12 @@ def _maintained_route_target(
             "ApiId": {"Ref": "ExistingHttpApiId"},
             "RouteKey": contract.route_key,
             "AuthorizationType": contract.authorization_type,
-            "Target": {"Fn::Sub": "integrations/${QueryIntegration}"},
+            "Target": {
+                "Fn::Join": [
+                    "",
+                    ["integrations/", {"Ref": "QueryIntegration"}],
+                ]
+            },
         },
     }
     if contract.authorization_type == "JWT":
@@ -1608,20 +1467,8 @@ def _maintained_permission_target(contract: RouteContract) -> dict[str, Any]:
 
 def _maintained_plain_resource_targets() -> dict[str, dict[str, Any]]:
     targets = {
-        **_maintained_base_table_targets(),
         "ReservationsTable": _maintained_reservations_table_target(),
-        "QueryLambdaRole": _maintained_role_target(),
         "QueryIntegration": _maintained_integration_target(),
-        "NotificationTopic": {"Type": "AWS::SNS::Topic"},
-        "NotificationEmailSubscription": {
-            "Type": "AWS::SNS::Subscription",
-            "Condition": "HasNotificationEmailEndpoint",
-            "Properties": {
-                "Protocol": "email",
-                "Endpoint": {"Ref": "NotificationEmailEndpoint"},
-                "TopicArn": {"Ref": "NotificationTopic"},
-            },
-        },
     }
     targets.update(
         {
@@ -1660,7 +1507,7 @@ def _validate_maintained_query_function(resource: Any) -> None:
     )
     expected = {
         "FunctionName": "PacificBioArchive-QueryLambda",
-        "Role": {"Fn::GetAtt": ["QueryLambdaRole", "Arn"]},
+        "Role": {"Ref": "ExistingQueryLambdaRoleArn"},
         "Handler": "lambda_function.handler",
         "Runtime": "python3.12",
         "Timeout": 30,
@@ -1668,10 +1515,14 @@ def _validate_maintained_query_function(resource: Any) -> None:
         "Environment": {
             "Variables": {
                 "REPO_BACKEND": "dynamodb",
-                "DYNAMODB_TABLE": {"Ref": "FilesTable"},
+                "DYNAMODB_TABLE": {"Ref": "ExistingFilesTableName"},
                 "RESERVATIONS_TABLE": {"Ref": "ReservationsTable"},
-                "SUBSCRIPTIONS_TABLE": {"Ref": "SubscriptionsTable"},
-                "NOTIFICATIONS_TABLE": {"Ref": "NotificationsTable"},
+                "SUBSCRIPTIONS_TABLE": {
+                    "Ref": "ExistingSubscriptionsTableName"
+                },
+                "NOTIFICATIONS_TABLE": {
+                    "Ref": "ExistingNotificationsTableName"
+                },
                 "STORAGE_BACKEND": "lambda",
                 "STORAGE_DELETE_FUNCTION_NAME": {
                     "Ref": "StorageDeleteFunctionName"
@@ -1683,8 +1534,6 @@ def _validate_maintained_query_function(resource: Any) -> None:
                 "ALLOW_LEGACY_PROCESSING_CALLBACKS": {
                     "Ref": "AllowLegacyProcessingCallbacks"
                 },
-                "NOTIFICATION_PUBLISHER": "sns",
-                "SNS_TOPIC_ARN": {"Ref": "NotificationTopic"},
                 "CORS_ORIGINS": {
                     "Fn::Join": [
                         ",",
@@ -1996,7 +1845,7 @@ def validate_update_artifacts(
     expected_values: Mapping[str, str],
     artifact: CodeArtifact,
     *,
-    internal_key_already_exists: bool = True,
+    internal_key_already_exists: bool = False,
 ) -> None:
     """Bind UPDATE source -> SAM build -> package -> processed evidence."""
     _require(
@@ -2099,8 +1948,14 @@ def validate_update_artifacts(
     )
 
     required_names = {
+        "ExistingQueryLambdaRoleArn",
         "ExistingHttpApiId",
         "ExistingJwtAuthorizerId",
+        "ExistingFilesTableName",
+        "ExistingSubscriptionsTableName",
+        "ExistingNotificationsTableName",
+        "AllowedOrigin",
+        "PublicAllowedOrigin",
         "QueryInputBucketName",
         "StorageDeleteFunctionName",
         "InferenceApiBaseUrl",
@@ -2114,8 +1969,8 @@ def validate_update_artifacts(
     )
     actual = _change_set_parameter_map(change_set_parameters)
     _require(
-        required_names | {"InternalApiKey"} <= set(actual),
-        "UPDATE change set is missing an explicit parameter",
+        set(actual) == required_names | {"InternalApiKey"},
+        "UPDATE change set parameters differ from the exact first-update contract",
     )
     for name, expected in expected_values.items():
         item = actual[name]
@@ -2125,68 +1980,19 @@ def validate_update_artifacts(
             f"UPDATE parameter {name} differs from the operator-approved value",
         )
     internal = actual["InternalApiKey"]
-    if internal_key_already_exists:
-        _require(
-            set(internal) == {"ParameterKey", "UsePreviousValue"}
-            and internal.get("UsePreviousValue") is True,
-            "InternalApiKey must use its previous NoEcho value",
-        )
-    else:
-        masked_value = internal.get("ParameterValue")
-        _require(
-            set(internal) == {"ParameterKey", "ParameterValue"}
-            and masked_value == "*****",
-            "missing InternalApiKey must be supplied only as a masked NoEcho console value",
-        )
+    _require(
+        internal_key_already_exists is False,
+        "first UPDATE requires InternalApiKey to be a new NoEcho parameter",
+    )
+    masked_value = internal.get("ParameterValue")
+    _require(
+        set(internal) == {"ParameterKey", "ParameterValue"}
+        and masked_value == "*****",
+        "InternalApiKey must be supplied only as a masked NoEcho console value",
+    )
     _require(
         expected_values["AllowLegacyProcessingCallbacks"] in {"true", "false"},
         "AllowLegacyProcessingCallbacks must be explicitly true or false",
-    )
-    optional_defaults = {
-        "AllowedOrigin": "http://localhost:3000",
-        "PublicAllowedOrigin": "https://quinby8930.github.io",
-        "NotificationEmailEndpoint": "",
-    }
-    _require(
-        set(actual)
-        <= required_names | {"InternalApiKey"} | set(optional_defaults),
-        "UPDATE change set contains an unexpected parameter",
-    )
-    for name in set(actual) & set(optional_defaults):
-        item = actual[name]
-        _require(
-            item.get("ParameterValue") == optional_defaults[name]
-            and item.get("UsePreviousValue") in (None, False),
-            f"UPDATE default parameter {name} is not maintained",
-        )
-
-
-def _approved_role_reconciliation(
-    audited_role: Mapping[str, Any], current: Mapping[str, Any]
-) -> bool:
-    account = audited_role.get("account")
-    region = audited_role.get("region")
-    if not isinstance(account, str) or not isinstance(region, str):
-        return False
-    try:
-        _validate_role_drift(audited_role, account, region)
-    except AdoptionError:
-        return False
-    baseline = deepcopy(audited_role.get("processed_definition"))
-    target = _maintained_role_target()
-    if not isinstance(baseline, dict):
-        return False
-    for resource in (baseline, target):
-        resource.pop("DeletionPolicy", None)
-        resource.pop("UpdateReplacePolicy", None)
-        properties = resource.get("Properties")
-        if not isinstance(properties, dict):
-            return False
-        properties.pop("Policies", None)
-    return (
-        audited_role.get("drift", {}).get("status") == "MODIFIED"
-        and baseline == target
-        and current == _maintained_role_target()
     )
 
 
@@ -2198,22 +2004,14 @@ def validate_update_change_set(
     hardening_only: bool = False,
 ) -> None:
     resources = processed.get("Resources", {})
-    _require(isinstance(resources, Mapping) and "QueryFunctionRole" not in resources, "implicit role QueryFunctionRole is forbidden")
-    audited_drift: Mapping[str, Any] | None = None
-    if isinstance(audited_role, Mapping) and "drift" in audited_role:
-        account = audited_role.get("account")
-        region = audited_role.get("region")
-        _require(
-            isinstance(account, str) and isinstance(region, str),
-            "QueryLambdaRole audited drift scope is malformed",
-        )
-        _validate_role_drift(audited_role, account, region)
-        candidate_drift = audited_role.get("drift")
-        _require(
-            isinstance(candidate_drift, Mapping),
-            "QueryLambdaRole audited drift is malformed",
-        )
-        audited_drift = candidate_drift
+    _require(
+        isinstance(resources, Mapping),
+        "processed UPDATE template resources are unavailable",
+    )
+    _require(
+        audited_role is None,
+        "query-stack UPDATE cannot reconcile database-owned QueryLambdaRole",
+    )
     plain_targets = _maintained_plain_resource_targets()
     expected_logical_ids = set(plain_targets) | {"QueryFunction"}
     _require(
@@ -2227,8 +2025,13 @@ def validate_update_change_set(
         )
     _validate_maintained_query_function(resources.get("QueryFunction"))
 
-    protected = _BASE_MANAGED | _ADOPTED_LOGICAL_IDS
-    additions = expected_logical_ids - protected
+    additions = set(OPTIONS_ROUTES_BY_LOGICAL_ID) | {
+        _permission_logical_id(logical_id)
+        for logical_id in {
+            *ROUTES_BY_LOGICAL_ID,
+            *OPTIONS_ROUTES_BY_LOGICAL_ID,
+        }
+    }
     expected_types = {
         logical_id: target["Type"]
         for logical_id, target in plain_targets.items()
@@ -2250,61 +2053,44 @@ def validate_update_change_set(
             in ("False", False),
             "hardening UPDATE must contain exactly one in-place QueryFunction Modify",
         )
-    role_changes: list[Mapping[str, Any]] = []
+        return
+    expected_changed_ids = additions | {"QueryFunction"}
+    _require(
+        len(changes) == len(expected_changed_ids),
+        "first UPDATE change set differs from the exact 37-action contract",
+    )
     changed_logical_ids: set[str] = set()
     for change in changes:
+        _require(
+            isinstance(change, Mapping),
+            "UPDATE change set contains a malformed change",
+        )
         resource_change = change.get("ResourceChange", {})
         logical_id = resource_change.get("LogicalResourceId")
         action = resource_change.get("Action")
         _require(
             isinstance(logical_id, str)
-            and logical_id in expected_logical_ids
+            and logical_id in expected_changed_ids
             and logical_id not in changed_logical_ids,
             "UPDATE change set contains an unexpected or duplicate resource",
         )
         changed_logical_ids.add(logical_id)
-        if logical_id in protected and (
-            action != "Modify"
-            or resource_change.get("Replacement") not in ("False", False)
-        ):
-            raise AdoptionError(f"replacement or removal of {logical_id} is forbidden")
-        if logical_id in additions and (
-            action != "Add"
-            or resource_change.get("Replacement") not in (None, "False", False)
-        ):
-            raise AdoptionError(f"non-Add change for {logical_id} is forbidden")
+        replacement = resource_change.get("Replacement")
+        if logical_id == "QueryFunction":
+            _require(
+                action == "Modify" and replacement in ("False", False),
+                "QueryFunction must be the sole non-replacing Modify",
+            )
+        else:
+            _require(
+                action == "Add" and replacement in (None, "False", False),
+                f"first UPDATE requires Add for {logical_id}",
+            )
         _require(
             resource_change.get("ResourceType") == expected_types[logical_id],
             f"resource type mismatch for {logical_id}",
         )
-        if logical_id == "QueryLambdaRole":
-            role_changes.append(resource_change)
-        if logical_id == "QueryLambdaRole" and action == "Modify":
-            definition = audited_role.get("processed_definition") if isinstance(audited_role, Mapping) else None
-            current_role = resources.get("QueryLambdaRole", {})
-            _require(
-                isinstance(definition, Mapping)
-                and (
-                    _role_continuity_with_retain(definition, current_role)
-                    or (
-                        isinstance(audited_role, Mapping)
-                        and _approved_role_reconciliation(
-                            audited_role,
-                            current_role,
-                        )
-                    )
-                ),
-                "QueryLambdaRole Modify lacks audited role continuity",
-            )
     _require(
-        len(role_changes) <= 1,
-        "QueryLambdaRole change is duplicated",
+        changed_logical_ids == expected_changed_ids,
+        "first UPDATE change set omits an exact required action",
     )
-    if audited_drift is not None and audited_drift.get("status") == "MODIFIED":
-        _require(
-            resources.get("QueryLambdaRole") == _maintained_role_target()
-            and len(role_changes) == 1
-            and role_changes[0].get("Action") == "Modify"
-            and role_changes[0].get("Replacement") in ("False", False),
-            "QueryLambdaRole approved drift must be reconciled by one in-place Modify",
-        )

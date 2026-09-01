@@ -1975,7 +1975,7 @@ def test_update_rejects_conditional_or_missing_protected_resource(replacement):
 def test_update_rejects_non_modify_action_for_protected_resource(action):
     processed = _update_processed(_maintained_role_target())
     changes = [{"ResourceChange": {"Action": action, "LogicalResourceId": "QueryFunction", "ResourceType": "AWS::Lambda::Function", "Replacement": "False"}}]
-    with pytest.raises(AdoptionError, match="forbidden"):
+    with pytest.raises(AdoptionError, match="forbidden|contract"):
         validate_update_change_set(changes, processed)
 
 
@@ -2224,6 +2224,35 @@ def _update_processed(role, *, include_additions=True):
             resources[_permission_logical_id(logical_id)] = (
                 _maintained_permission_target(route_key)
             )
+    for logical_id in {
+        "FilesTable",
+        "SubscriptionsTable",
+        "NotificationsTable",
+        "QueryLambdaRole",
+        "NotificationTopic",
+        "NotificationEmailSubscription",
+    }:
+        resources.pop(logical_id, None)
+    function = resources["QueryFunction"]["Properties"]
+    function["Role"] = {"Ref": "ExistingQueryLambdaRoleArn"}
+    variables = function["Environment"]["Variables"]
+    variables["DYNAMODB_TABLE"] = {"Ref": "ExistingFilesTableName"}
+    variables["SUBSCRIPTIONS_TABLE"] = {
+        "Ref": "ExistingSubscriptionsTableName"
+    }
+    variables["NOTIFICATIONS_TABLE"] = {
+        "Ref": "ExistingNotificationsTableName"
+    }
+    variables.pop("NOTIFICATION_PUBLISHER", None)
+    variables.pop("SNS_TOPIC_ARN", None)
+    for resource in resources.values():
+        if resource["Type"] == "AWS::ApiGatewayV2::Route":
+            resource["Properties"]["Target"] = {
+                "Fn::Join": [
+                    "",
+                    ["integrations/", {"Ref": "QueryIntegration"}],
+                ]
+            }
     return {"Resources": resources}
 
 
@@ -2323,7 +2352,7 @@ def _maintained_role_target():
     }
 
 
-def test_update_accepts_only_exact_maintained_role_reconciliation():
+def test_update_disables_database_owned_role_reconciliation():
     audited = approved_role_drift_snapshot()["role"]
     processed = _update_processed(_maintained_role_target())
     changes = [{
@@ -2335,7 +2364,8 @@ def test_update_accepts_only_exact_maintained_role_reconciliation():
         }
     }]
 
-    validate_update_change_set(changes, processed, audited)
+    with pytest.raises(AdoptionError, match="database-owned|reconcile"):
+        validate_update_change_set(changes, processed, audited)
 
 
 def test_update_with_known_role_drift_requires_explicit_in_place_role_modify():
@@ -2432,7 +2462,7 @@ def test_update_protects_imported_reservations_table_from_replacement():
         }
     }]
 
-    with pytest.raises(AdoptionError, match="ReservationsTable"):
+    with pytest.raises(AdoptionError, match="exact|ReservationsTable"):
         validate_update_change_set(changes, processed)
 
 
@@ -2446,7 +2476,7 @@ def test_update_rejects_removing_a_base_managed_table():
         }
     }]
 
-    with pytest.raises(AdoptionError, match="FilesTable|Remove|removal"):
+    with pytest.raises(AdoptionError, match="exact|FilesTable|Remove|removal"):
         validate_update_change_set(changes, processed)
 
 
@@ -2548,58 +2578,23 @@ def test_update_rejects_tampered_lambda_permission_source_arn():
 
 def test_update_rejects_change_set_resource_type_mismatch():
     processed = _update_processed(_maintained_role_target())
-    changes = [{
-        "ResourceChange": {
-            "Action": "Modify",
-            "LogicalResourceId": "QueryIntegration",
-            "ResourceType": "AWS::ApiGatewayV2::Route",
-            "Replacement": "False",
-        }
-    }]
+    changes = _first_query_update_changes()
+    next(
+        change
+        for change in changes
+        if change["ResourceChange"]["LogicalResourceId"]
+        == "AuthTestPermission"
+    )["ResourceChange"]["ResourceType"] = "AWS::ApiGatewayV2::Route"
 
     with pytest.raises(AdoptionError, match="resource type mismatch"):
         validate_update_change_set(changes, processed)
 
 
 def test_update_accepts_maintained_processed_template_and_allowed_changes():
-    processed = _update_processed(
-        _maintained_role_target(),
-        include_additions=True,
+    validate_update_change_set(
+        _first_query_update_changes(),
+        _first_query_update_processed(),
     )
-    audited = approved_role_drift_snapshot()["role"]
-    changes = [{
-        "ResourceChange": {
-            "Action": "Modify",
-            "LogicalResourceId": "QueryLambdaRole",
-            "ResourceType": "AWS::IAM::Role",
-            "Replacement": "False",
-        }
-    }]
-    changes.extend(
-        {
-            "ResourceChange": {
-                "Action": "Add",
-                "LogicalResourceId": logical_id,
-                "ResourceType": resource["Type"],
-            }
-        }
-        for logical_id, resource in processed["Resources"].items()
-        if logical_id
-        in {
-            "NotificationTopic",
-            "NotificationEmailSubscription",
-            *_MAINTAINED_OPTIONS_ROUTES,
-            *(
-                _permission_logical_id(route_id)
-                for route_id in (
-                    *_MAINTAINED_IMPORTED_ROUTES,
-                    *_MAINTAINED_OPTIONS_ROUTES,
-                )
-            ),
-        }
-    )
-
-    validate_update_change_set(changes, processed, audited)
 
 
 @pytest.mark.parametrize(
@@ -2625,14 +2620,15 @@ def test_update_requires_exact_maintained_reservations_table_contract(mutation):
         validate_update_change_set([], processed)
 
 
-def test_role_modify_allows_only_new_retain_metadata():
+def test_role_modify_is_rejected_even_for_retain_only_metadata():
     baseline = _maintained_role_target()
     baseline.pop("DeletionPolicy")
     baseline.pop("UpdateReplacePolicy")
     audited = {"processed_definition": baseline}
     processed = _update_processed(_maintained_role_target())
     changes = [{"ResourceChange": {"Action": "Modify", "LogicalResourceId": "QueryLambdaRole", "ResourceType": "AWS::IAM::Role", "Replacement": "False"}}]
-    validate_update_change_set(changes, processed, audited)
+    with pytest.raises(AdoptionError, match="database-owned|reconcile"):
+        validate_update_change_set(changes, processed, audited)
 
 
 def test_hardening_only_update_accepts_exact_query_function_modify():
@@ -2785,3 +2781,135 @@ def test_unknown_api_gateway_configuration_still_fails_closed(resource):
 
     with pytest.raises(AdoptionError, match="unsupported configuration"):
         validate_snapshot(snapshot)
+
+
+def _first_query_update_processed():
+    return _update_processed(
+        _maintained_role_target(),
+        include_additions=True,
+    )
+
+
+def _first_query_update_changes():
+    processed = _first_query_update_processed()
+    changes = [
+        {
+            "ResourceChange": {
+                "Action": "Modify",
+                "LogicalResourceId": "QueryFunction",
+                "ResourceType": "AWS::Lambda::Function",
+                "Replacement": "False",
+            }
+        }
+    ]
+    changes.extend(
+        {
+            "ResourceChange": {
+                "Action": "Add",
+                "LogicalResourceId": logical_id,
+                "ResourceType": resource["Type"],
+                "Replacement": "False",
+            }
+        }
+        for logical_id, resource in processed["Resources"].items()
+        if logical_id in _MAINTAINED_OPTIONS_ROUTES
+        or logical_id.endswith("Permission")
+    )
+    return changes
+
+
+def test_first_query_update_accepts_exact_query_function_and_36_additions():
+    changes = _first_query_update_changes()
+
+    assert len(changes) == 37
+    validate_update_change_set(changes, _first_query_update_processed())
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        lambda changes: changes.pop(),
+        lambda changes: changes.append(deepcopy(changes[-1])),
+        lambda changes: changes[0]["ResourceChange"].update(
+            {"Replacement": "True"}
+        ),
+        lambda changes: changes[1]["ResourceChange"].update(
+            {"Action": "Modify"}
+        ),
+        lambda changes: changes[1]["ResourceChange"].update(
+            {"LogicalResourceId": "FilesTable"}
+        ),
+        lambda changes: changes.append(
+            {
+                "ResourceChange": {
+                    "Action": "Remove",
+                    "LogicalResourceId": "QueryIntegration",
+                    "ResourceType": "AWS::ApiGatewayV2::Integration",
+                    "Replacement": "False",
+                }
+            }
+        ),
+    ],
+    ids=(
+        "missing-addition",
+        "duplicate",
+        "function-replacement",
+        "addition-modify",
+        "database-resource",
+        "remove-imported-resource",
+    ),
+)
+def test_first_query_update_rejects_any_non_exact_change_set(mutation):
+    changes = _first_query_update_changes()
+    mutation(changes)
+
+    with pytest.raises(
+        AdoptionError,
+        match=(
+            "UPDATE|change|exact|unexpected|duplicate|replacement|"
+            "non-replacing|forbidden"
+        ),
+    ):
+        validate_update_change_set(changes, _first_query_update_processed())
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        lambda resources: resources.update(
+            {"QueryLambdaRole": {"Type": "AWS::IAM::Role"}}
+        ),
+        lambda resources: resources.update(
+            {"NotificationTopic": {"Type": "AWS::SNS::Topic"}}
+        ),
+        lambda resources: resources["QueryFunction"]["Properties"].update(
+            {"Role": {"Fn::GetAtt": ["QueryLambdaRole", "Arn"]}}
+        ),
+        lambda resources: resources["AuthTestPermission"]["Properties"].update(
+            {
+                "SourceArn": {
+                    "Fn::Sub": "arn:${AWS::Partition}:execute-api:*:*:*/*/*/*"
+                }
+            }
+        ),
+        lambda resources: resources["AuthTestRoute"]["Properties"].update(
+            {"Target": {"Fn::Sub": "integrations/${QueryIntegration}"}}
+        ),
+    ],
+    ids=(
+        "iam-role",
+        "sns-topic",
+        "database-role-reference",
+        "wildcard-permission",
+        "imported-route-representation",
+    ),
+)
+def test_first_query_update_rejects_template_outside_55_resource_contract(mutation):
+    processed = _first_query_update_processed()
+    mutation(processed["Resources"])
+
+    with pytest.raises(
+        AdoptionError,
+        match="template|resource|contract|QueryFunction|permission|route",
+    ):
+        validate_update_change_set(_first_query_update_changes(), processed)
