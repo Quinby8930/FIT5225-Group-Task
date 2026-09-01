@@ -635,9 +635,19 @@ def test_query_adoption_contract_requires_exact_nineteen_owner_keys(mutation):
         adoption.validate_import_owners(owners)
 
 
-def test_query_adoption_contract_accepts_explicit_import_change_set_type():
+@pytest.mark.parametrize(
+    "replacement_mode",
+    ["explicit-false", "omitted"],
+)
+def test_query_adoption_contract_accepts_explicit_import_change_set_type(
+    replacement_mode,
+):
+    changes = _query_adoption_import_changes()
+    if replacement_mode == "omitted":
+        changes[0]["ResourceChange"].pop("Replacement")
+
     adoption.validate_import_change_set(
-        _query_adoption_import_changes(),
+        changes,
         build_resources_to_import(valid_snapshot()),
         change_set_type="IMPORT",
     )
@@ -707,10 +717,10 @@ def test_query_adoption_contract_rejects_change_set_resource_type_or_logical_id(
 
 @pytest.mark.parametrize(
     "replacement",
-    [None, True, "True", "Conditional"],
-    ids=("missing", "boolean-true", "string-true", "conditional"),
+    [False, True, "True", "Conditional"],
+    ids=("boolean-false", "boolean-true", "string-true", "conditional"),
 )
-def test_query_adoption_contract_rejects_every_non_false_replacement(
+def test_query_adoption_contract_rejects_invalid_import_replacement(
     replacement,
 ):
     expected = build_resources_to_import(valid_snapshot())
