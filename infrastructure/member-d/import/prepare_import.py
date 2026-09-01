@@ -1886,7 +1886,7 @@ def main(argv: list[str] | None = None) -> int:
             f"described change set type must be exactly {args.expected_type}"
         )
     described_stack = change_set.get("StackName")
-    if described_stack is not None and described_stack != args.stack:
+    if described_stack != args.stack:
         raise AdoptionError("described change set target stack differs")
     if (
         change_set.get("Status") != "CREATE_COMPLETE"

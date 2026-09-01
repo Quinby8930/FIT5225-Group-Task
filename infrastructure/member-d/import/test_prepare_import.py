@@ -3663,6 +3663,35 @@ def test_import_change_set_main_rejects_exposed_wrong_target_stack(
         prepare_import.main(_validate_change_set_args(workdir, "IMPORT"))
 
 
+def test_import_change_set_main_rejects_missing_target_stack(
+    tmp_path,
+    monkeypatch,
+):
+    import prepare_import
+
+    workdir = tmp_path / "import-missing-target-work"
+    files = _write_change_set_validation_files(workdir)
+
+    class MissingTargetCli(CandidateChangeSetCli):
+        def json(self, *args):
+            response = super().json(*args)
+            if args[:2] == ("cloudformation", "describe-change-set"):
+                response.pop("StackName")
+            return response
+
+    cli = MissingTargetCli(
+        change_set_type="IMPORT",
+        changes=_import_changes(files["snapshot"]),
+        parameters=files["import_parameters"],
+        processed=files["import_template"],
+    )
+    monkeypatch.setattr(prepare_import, "AwsCli", lambda: cli)
+    _use_stored_snapshot_as_fresh(monkeypatch, prepare_import, files)
+
+    with pytest.raises(AdoptionError, match="target|stack"):
+        prepare_import.main(_validate_change_set_args(workdir, "IMPORT"))
+
+
 @pytest.mark.parametrize(
     ("candidate_kwargs", "error_pattern"),
     [
