@@ -25,6 +25,8 @@ from tempfile import TemporaryDirectory
 from typing import Any, Callable, Mapping
 from zipfile import BadZipFile, ZIP_DEFLATED, ZipFile, ZipInfo
 
+import yaml_audit
+from yaml_audit import YamlAuditError
 from adoption import (
     AdoptionError,
     CodeArtifact,
@@ -164,83 +166,25 @@ _HARDENING_FUNCTION_FIELDS = (
 )
 
 
-_INTRINSIC_NAMES = {
-    "And": "Fn::And",
-    "Base64": "Fn::Base64",
-    "Cidr": "Fn::Cidr",
-    "Equals": "Fn::Equals",
-    "FindInMap": "Fn::FindInMap",
-    "GetAtt": "Fn::GetAtt",
-    "GetAZs": "Fn::GetAZs",
-    "If": "Fn::If",
-    "ImportValue": "Fn::ImportValue",
-    "Join": "Fn::Join",
-    "Length": "Fn::Length",
-    "Not": "Fn::Not",
-    "Or": "Fn::Or",
-    "Select": "Fn::Select",
-    "Split": "Fn::Split",
-    "Sub": "Fn::Sub",
-    "ToJsonString": "Fn::ToJsonString",
-    "Transform": "Fn::Transform",
-}
-
-
 def _parse_cloudformation_yaml(value: str) -> Any:
-    """Parse YAML only on template paths that explicitly need PyYAML."""
+    """Parse YAML with the committed, supply-chain-pinned audit parser."""
     try:
-        import yaml
-    except ImportError:
-        raise AdoptionError("YAML parser dependency is unavailable") from None
-
-    class CloudFormationLoader(yaml.SafeLoader):
-        """Load short-form intrinsic tags without executing code."""
-
-    def construct_cloudformation_intrinsic(
-        loader: Any,
-        tag_suffix: str,
-        node: Any,
-    ) -> dict[str, Any]:
-        if isinstance(node, yaml.ScalarNode):
-            parsed_value = loader.construct_scalar(node)
-            if tag_suffix == "GetAtt":
-                logical_id, separator, attribute = parsed_value.partition(".")
-                if not separator or not logical_id or not attribute:
-                    raise yaml.constructor.ConstructorError(
-                        None,
-                        None,
-                        "!GetAtt scalar must use Resource.Attribute form",
-                        node.start_mark,
-                    )
-                parsed_value = [logical_id, attribute]
-        elif isinstance(node, yaml.SequenceNode):
-            parsed_value = loader.construct_sequence(node)
-        else:
-            parsed_value = loader.construct_mapping(node)
-        return {_INTRINSIC_NAMES.get(tag_suffix, tag_suffix): parsed_value}
-
-    CloudFormationLoader.add_multi_constructor(
-        "!",
-        construct_cloudformation_intrinsic,
-    )
-    try:
-        return yaml.load(value, Loader=CloudFormationLoader)
-    except yaml.YAMLError:
+        return yaml_audit.parse_cloudformation_yaml(value)
+    except YamlAuditError:
         raise AdoptionError(
-            "processed template is not valid JSON or YAML"
+            "processed template is not valid controlled JSON or YAML"
         ) from None
 
 
 def _parse_processed_template(value: Any) -> Mapping[str, Any]:
-    if isinstance(value, Mapping):
-        return value
-    if isinstance(value, str):
-        try:
-            parsed = json.loads(value)
-        except json.JSONDecodeError:
-            parsed = _parse_cloudformation_yaml(value)
-        if isinstance(parsed, Mapping):
-            return parsed
+    try:
+        parsed = yaml_audit.parse_cloudformation_template(value)
+    except YamlAuditError:
+        raise AdoptionError(
+            "processed template is not valid controlled JSON or YAML"
+        ) from None
+    if isinstance(parsed, Mapping):
+        return parsed
     raise AdoptionError("processed template is unavailable")
 
 
@@ -1433,7 +1377,7 @@ def _regular_files(root: Path, description: str) -> dict[str, Path]:
 
 
 def verify_repository_identity(source: Path, expected_commit: str) -> None:
-    """Require one clean repository at the approved full commit before audit."""
+    """Require one clean repository at the approved full commit before reads."""
     if not re.fullmatch(r"[0-9a-f]{40}", expected_commit):
         raise AdoptionError("approved commit is malformed")
     try:
@@ -2025,8 +1969,7 @@ def _parser() -> argparse.ArgumentParser:
             command.add_argument(f"--{argument}", required=True)
         command.add_argument("--workdir", default=".work")
         command.add_argument("--baseline")
-        if name == "audit":
-            command.add_argument("--expected-commit", required=True)
+        command.add_argument("--expected-commit", required=True)
         if name == "prepare":
             command.add_argument("--artifact-bucket", required=True)
     for verifier_name in ("verify-post-import", "verify-update-rollback"):
@@ -2046,6 +1989,7 @@ def _parser() -> argparse.ArgumentParser:
     recovery = subcommands.add_parser("recovery-report")
     for argument in ("region", "source-stack", "target-stack", "workdir"):
         recovery.add_argument(f"--{argument}", required=True)
+    recovery.add_argument("--expected-commit", required=True)
     recovery.add_argument(
         "--import-change-set-creation-failed",
         action="store_true",
@@ -2098,7 +2042,7 @@ def _parser() -> argparse.ArgumentParser:
     validator.add_argument("--built-code-dir")
     validator.add_argument("--source-code-dir")
     validator.add_argument("--dependency-manifest")
-    validator.add_argument("--expected-commit")
+    validator.add_argument("--expected-commit", required=True)
     return parser
 
 
@@ -2118,8 +2062,20 @@ def _read_json_file(path: Path, description: str) -> Any:
 
 def main(argv: list[str] | None = None) -> int:
     args = _parser().parse_args(argv)
-    if args.command == "audit":
+    if args.command in {
+        "audit",
+        "prepare",
+        "recovery-report",
+        "validate-change-set",
+    }:
         verify_repository_identity(Path(__file__), args.expected_commit)
+    try:
+        yaml_audit.verify_isolated_interpreter()
+        yaml_audit.verify_controlled_archive()
+    except YamlAuditError:
+        raise AdoptionError(
+            "controlled YAML audit archive is invalid"
+        ) from None
     cli = AwsCli()
     if args.command in {"verify-post-import", "verify-update-rollback"}:
         validate_stack_names(args.source_stack, args.target_stack)

@@ -39,6 +39,42 @@ from prepare_import import (
     verify_artifact_bucket,
     _parse_processed_template,
 )
+
+
+@pytest.fixture(autouse=True)
+def _controlled_runtime_gate_for_cli_unit_tests(monkeypatch):
+    """Black-box runtime-gate behavior lives in test_runtime_gate.py."""
+    import prepare_import
+
+    real_archive_verifier = prepare_import.yaml_audit.verify_controlled_archive
+    real_repository_verifier = prepare_import.verify_repository_identity
+
+    def verify_archive_for_unit_test(*args, **kwargs):
+        if args or kwargs:
+            return real_archive_verifier(*args, **kwargs)
+        return None
+
+    monkeypatch.setattr(
+        prepare_import.yaml_audit,
+        "verify_isolated_interpreter",
+        lambda: None,
+    )
+    monkeypatch.setattr(
+        prepare_import.yaml_audit,
+        "verify_controlled_archive",
+        verify_archive_for_unit_test,
+    )
+
+    def verify_repository_for_unit_test(path, expected_commit):
+        if expected_commit == _EXPECTED_COMMIT:
+            return None
+        return real_repository_verifier(path, expected_commit)
+
+    monkeypatch.setattr(
+        prepare_import,
+        "verify_repository_identity",
+        verify_repository_for_unit_test,
+    )
 from test_adoption import (
     _EXPECTED_IMPORT_RESOURCES,
     _first_query_update_changes,
@@ -163,6 +199,49 @@ def test_audit_rejects_commit_mismatch_before_aws_client(monkeypatch):
             "--function", "PacificBioArchive-QueryLambda",
             "--expected-commit", "b" * 40,
         ])
+
+
+@pytest.mark.parametrize("command", ["prepare", "validate-change-set"])
+def test_prepare_and_import_validation_reject_dirty_checkout_before_aws(
+    tmp_path,
+    monkeypatch,
+    command,
+):
+    import prepare_import
+
+    _repository, tracked, commit = _create_clean_git_repository(tmp_path)
+    tracked.write_text("print('dirty')\n", encoding="utf-8")
+    monkeypatch.setattr(prepare_import, "__file__", str(tracked))
+
+    class ForbiddenAwsCli:
+        def __init__(self):
+            raise AssertionError("AWS client must not be constructed")
+
+    monkeypatch.setattr(prepare_import, "AwsCli", ForbiddenAwsCli)
+    if command == "prepare":
+        args = [
+            "prepare",
+            "--region", "ap-southeast-2",
+            "--stack", "PacificBioArchive-Database",
+            "--api", "2dd2aqb32j",
+            "--authorizer", "7ir7fs",
+            "--integration", "fbjojun",
+            "--function", "PacificBioArchive-QueryLambda",
+            "--artifact-bucket", "private-artifacts",
+            "--expected-commit", commit,
+        ]
+    else:
+        args = [
+            "validate-change-set",
+            "--region", "ap-southeast-2",
+            "--stack", "PacificBioArchive-QueryAdoption",
+            "--change-set", "member-d-import",
+            "--expected-type", "IMPORT",
+            "--expected-commit", commit,
+        ]
+
+    with pytest.raises(AdoptionError, match="worktree|repository"):
+        prepare_import.main(args)
 
 
 def test_aws_cli_json_accepts_successful_empty_response(monkeypatch):
@@ -428,6 +507,24 @@ class FakeAwsCli:
 
 def fixture_config(tmp_path):
     return AuditConfig(region="ap-southeast-2", stack="PacificBioArchive-Database", api="2dd2aqb32j", authorizer="7ir7fs", integration="fbjojun", function="PacificBioArchive-QueryLambda", workdir=tmp_path)
+
+
+def _allow_recovery_runtime_gate(monkeypatch, prepare_import):
+    monkeypatch.setattr(
+        prepare_import,
+        "verify_repository_identity",
+        lambda *_args: None,
+    )
+    monkeypatch.setattr(
+        prepare_import.yaml_audit,
+        "verify_isolated_interpreter",
+        lambda: None,
+    )
+    monkeypatch.setattr(
+        prepare_import.yaml_audit,
+        "verify_controlled_archive",
+        lambda: None,
+    )
 
 
 _EXPECTED_UPDATE_PARAMETER_VALUES = {
@@ -932,6 +1029,8 @@ def _validate_change_set_args(
         "PacificBioArchive-QueryLambda",
         "--expected-type",
         expected_type,
+        "--expected-commit",
+        _EXPECTED_COMMIT,
         "--workdir",
         str(workdir),
     ]
@@ -950,8 +1049,6 @@ def _validate_change_set_args(
                 str(workdir / "dependency-manifest.json"),
                 "--artifact-bucket",
                 "private-artifacts",
-                "--expected-commit",
-                _EXPECTED_COMMIT,
                 "--expected-http-api-id",
                 _EXPECTED_UPDATE_PARAMETER_VALUES["ExistingHttpApiId"],
                 "--expected-jwt-authorizer-id",
@@ -4622,6 +4719,7 @@ def test_change_set_validator_requires_complete_available_candidate(
             "--source-stack", "PacificBioArchive-Database",
             "--change-set", "candidate",
             "--expected-type", "UPDATE",
+            "--expected-commit", _EXPECTED_COMMIT,
             "--workdir", str(tmp_path),
         ])
 
@@ -5104,6 +5202,7 @@ def test_recovery_report_cli_records_only_classification_and_ownership(
     import prepare_import
 
     cli = PostImportCli()
+    _allow_recovery_runtime_gate(monkeypatch, prepare_import)
     monkeypatch.setattr(prepare_import, "AwsCli", lambda: cli)
     (tmp_path / "sanitized-snapshot.json").write_text(
         json.dumps(valid_snapshot()),
@@ -5116,6 +5215,7 @@ def test_recovery_report_cli_records_only_classification_and_ownership(
             "--region", "ap-southeast-2",
             "--source-stack", "PacificBioArchive-Database",
             "--target-stack", "PacificBioArchive-QueryAdoption",
+            "--expected-commit", "a" * 40,
             "--workdir", str(tmp_path),
         ]
     ) == 0
@@ -5157,6 +5257,7 @@ def test_recovery_report_failed_creation_absent_target_discards_stale_artifacts(
     import prepare_import
 
     cli = FakeAwsCli()
+    _allow_recovery_runtime_gate(monkeypatch, prepare_import)
     monkeypatch.setattr(prepare_import, "AwsCli", lambda: cli)
     (tmp_path / "sanitized-snapshot.json").write_text(
         json.dumps(valid_snapshot()),
@@ -5169,6 +5270,7 @@ def test_recovery_report_failed_creation_absent_target_discards_stale_artifacts(
             "--region", "ap-southeast-2",
             "--source-stack", "PacificBioArchive-Database",
             "--target-stack", "PacificBioArchive-QueryAdoption",
+            "--expected-commit", "a" * 40,
             "--workdir", str(tmp_path),
             "--import-change-set-creation-failed",
         ]
@@ -5187,6 +5289,7 @@ def test_recovery_report_failed_creation_absent_target_discards_stale_artifacts(
 def _run_recovery_report(tmp_path, monkeypatch, cli):
     import prepare_import
 
+    _allow_recovery_runtime_gate(monkeypatch, prepare_import)
     monkeypatch.setattr(prepare_import, "AwsCli", lambda: cli)
     (tmp_path / "sanitized-snapshot.json").write_text(
         json.dumps(valid_snapshot()),
@@ -5198,6 +5301,7 @@ def _run_recovery_report(tmp_path, monkeypatch, cli):
             "--region", "ap-southeast-2",
             "--source-stack", "PacificBioArchive-Database",
             "--target-stack", "PacificBioArchive-QueryAdoption",
+            "--expected-commit", "a" * 40,
             "--workdir", str(tmp_path),
         ]
     ) == 0

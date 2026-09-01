@@ -1,0 +1,5 @@
+/infrastructure/member-d/import/member-d-yaml-audit.pyz binary
+/infrastructure/member-d/import/member-d-yaml-audit.lock.json text eol=lf
+/infrastructure/member-d/import/THIRD_PARTY_NOTICES.md text eol=lf
+/infrastructure/member-d/import/THIRD_PARTY_LICENSES/PyYAML-6.0.3-LICENSE.txt text eol=lf
+/infrastructure/member-d/import/*.py text eol=lf

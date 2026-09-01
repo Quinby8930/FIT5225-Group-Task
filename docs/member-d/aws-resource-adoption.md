@@ -83,10 +83,11 @@ Query Stack 通过普通、非敏感参数接收经过只读审计的
 只读恢复命令的真实接口为：
 
 ```bash
-python infrastructure/member-d/import/prepare_import.py recovery-report \
+python3 -B -E -S infrastructure/member-d/import/prepare_import.py recovery-report \
   --region "$AWS_REGION" \
   --source-stack "$SOURCE_STACK" \
   --target-stack "$TARGET_STACK" \
+  --expected-commit "$APPROVED_COMMIT" \
   --workdir "$WORK_DIR"
 ```
 
@@ -100,17 +101,20 @@ python infrastructure/member-d/import/prepare_import.py recovery-report \
 > 本节只覆盖：新鲜审计、备份/生成工件、创建 IMPORT preview、验证并汇报。
 > 它在执行 IMPORT 之前强制停止，且故意不提供 execute 命令。
 
-### 4.1 新会话或 CloudShell 重连后的初始化
+### 4.1 新 audit attempt 的初始化
 
 使用 A 的普通 AWS 身份打开 CloudShell；CloudShell 已自动认证，不得创建、索取或粘贴
-Root/IAM access key。每次重连后从仓库目录重新运行整个变量块，不得假设旧变量仍存在。
+Root/IAM access key。下面的变量块只用于开始一次**全新的** audit attempt，不用于恢复旧
+attempt；不得假设旧变量仍存在。
 `SOURCE_STACK` 和 `TARGET_STACK` 使用固定字面值，绝不会因占位符未填写而变成空名称。
 
 先把两个尖括号占位符替换为**非敏感**的已批准值；未替换时下面的 `test` 会停止流程。
 
 ```bash
 set +x
-set -euo pipefail
+set +e
+set -u
+set -o pipefail
 export AWS_PAGER=""
 export AWS_REGION=ap-southeast-2
 
@@ -120,20 +124,48 @@ API_ID=2dd2aqb32j
 AUTHORIZER_ID=7ir7fs
 INTEGRATION_ID=fbjojun
 FUNCTION_NAME=PacificBioArchive-QueryLambda
-WORK_DIR=infrastructure/member-d/import/.work/query-adoption-first-preview
 IMPORT_CHANGE_SET=member-d-query-adoption-import-preview
 APPROVED_COMMIT='<eventual-approved-full-commit-sha>'
 ARTIFACT_BUCKET='<approved-private-versioned-artifact-bucket>'
+ATTEMPT_ID="$(date -u +%Y%m%dT%H%M%SZ)-$$"
+WORK_DIR="$HOME/member-d-query-adoption-$APPROVED_COMMIT-$ATTEMPT_ID"
+CHECKOUT_DIR="$HOME/FIT5225-Group-Task-query-adoption-$ATTEMPT_ID"
+INIT_SUCCEEDED=false
+CHECKOUT_SUCCEEDED=false
+READ_ONLY_CONTEXT_SUCCEEDED=false
+TEST_EVIDENCE_APPROVED=false
 
-test "$SOURCE_STACK" = "PacificBioArchive-Database"
-test "$TARGET_STACK" = "PacificBioArchive-QueryAdoption"
-test "$SOURCE_STACK" != "$TARGET_STACK"
-test "$APPROVED_COMMIT" != '<eventual-approved-full-commit-sha>'
-test "$ARTIFACT_BUCKET" != '<approved-private-versioned-artifact-bucket>'
-test -n "$APPROVED_COMMIT" && test -n "$ARTIFACT_BUCKET"
-test "${#APPROVED_COMMIT}" -eq 40
-printf '%s' "$APPROVED_COMMIT" | grep -Eq '^[0-9a-f]{40}$'
+if test "$SOURCE_STACK" = "PacificBioArchive-Database" &&
+   test "$TARGET_STACK" = "PacificBioArchive-QueryAdoption" &&
+   test "$SOURCE_STACK" != "$TARGET_STACK" &&
+   test "$APPROVED_COMMIT" != '<eventual-approved-full-commit-sha>' &&
+   test "$ARTIFACT_BUCKET" != '<approved-private-versioned-artifact-bucket>' &&
+   test -n "$APPROVED_COMMIT" && test -n "$ARTIFACT_BUCKET" &&
+   test "${#APPROVED_COMMIT}" -eq 40 &&
+   printf '%s' "$APPROVED_COMMIT" | grep -Eq '^[0-9a-f]{40}$' &&
+   test ! -e "$WORK_DIR" && test ! -e "$CHECKOUT_DIR"
+then
+  INIT_SUCCEEDED=true
+  printf 'Fresh attempt workdir (retain for recovery): %s\n' "$WORK_DIR"
+else
+  printf 'STOP: initialization or fresh-path gate failed; do not continue.\n' >&2
+fi
 ```
+
+这里故意不启用顶层 `set -e`：后续只读 audit 的非零退出必须由条件块捕获并保留当前
+CloudShell 会话、变量和诊断上下文。初始化只在全部断言成功后把
+`INIT_SUCCEEDED` 设为 `true`；否则后续代码块会显式拒绝运行。不得用忽略失败或重新设置
+状态变量的方式绕过门禁。每个新 attempt 的 `WORK_DIR` 和 checkout 都
+包含新的 UTC 时间和 shell PID，并在 audit 前强制要求尚不存在，防止同一 commit 静默复用
+旧 snapshot。`WORK_DIR` 故意位于 Git checkout 之外：audit 生成 snapshot 后，紧接着运行的
+recovery process 仍能重新证明仓库处于同一完整 commit 且 clean；不得把它改回仓库中被
+`.gitignore` 隐藏的 `.work` 目录。
+
+若 CloudShell 在 audit **已生成**本次工件后重连，禁止重新运行上面的新-attempt 块，也
+禁止生成新 `ATTEMPT_ID`。先从先前终端记录恢复屏幕上打印的**精确完整** `WORK_DIR`，再
+重新设置其余非敏感变量并运行 `test -d "$WORK_DIR"`；随后只可针对该路径运行第 3 节的
+只读 `recovery-report`。找不到精确路径、目录不存在或不确定它属于哪次 attempt 时立即
+**STOP**，不得猜测、扫描其他 attempt、复用旧工件或继续 prepare。
 
 ### 4.2 从全新 checkout 绑定获批 commit
 
@@ -141,15 +173,23 @@ printf '%s' "$APPROVED_COMMIT" | grep -Eq '^[0-9a-f]{40}$'
 的完整 commit SHA：
 
 ```bash
-cd ~
-git clone https://github.com/Quinby8930/FIT5225-Group-Task.git \
-  FIT5225-Group-Task-query-adoption-preview
-cd FIT5225-Group-Task-query-adoption-preview
-git fetch --prune origin
-git checkout --detach "$APPROVED_COMMIT"
-test "$(git rev-parse HEAD)" = "$APPROVED_COMMIT"
-test -z "$(git status --porcelain=v1 --untracked-files=all)"
-test -z "$(git ls-files --others --ignored --exclude-standard)"
+if [ "$INIT_SUCCEEDED" != true ]
+then
+  printf 'STOP: initialization gate did not pass; no checkout was created.\n' >&2
+elif cd "$HOME" &&
+     git clone https://github.com/Quinby8930/FIT5225-Group-Task.git "$CHECKOUT_DIR" &&
+     cd "$CHECKOUT_DIR" &&
+     git fetch --prune origin &&
+     git checkout --detach "$APPROVED_COMMIT" &&
+     test "$(git rev-parse HEAD)" = "$APPROVED_COMMIT" &&
+     test -z "$(git status --porcelain=v1 --untracked-files=all)" &&
+     test -z "$(git ls-files --others --ignored --exclude-standard)"
+then
+  CHECKOUT_SUCCEEDED=true
+  printf 'Fresh checkout is bound to %s.\n' "$APPROVED_COMMIT"
+else
+  printf 'STOP: fresh checkout or repository identity gate failed.\n' >&2
+fi
 ```
 
 ### 4.3 只读核对调用者、区域和当前所有权
@@ -158,27 +198,33 @@ test -z "$(git ls-files --others --ignored --exclude-standard)"
 `ap-southeast-2`。数据库 Stack 必须仍精确拥有 4 项，Target Stack 必须不存在：
 
 ```bash
-ACCOUNT_ID=$(aws sts get-caller-identity \
-  --region "$AWS_REGION" --query Account --output text --no-cli-pager)
-CALLER_ARN=$(aws sts get-caller-identity \
-  --region "$AWS_REGION" --query Arn --output text --no-cli-pager)
-test "$CALLER_ARN" = "arn:aws:iam::$ACCOUNT_ID:user/fit5225-cli-deployer"
-
-aws cloudformation describe-stacks \
-  --region "$AWS_REGION" --stack-name "$SOURCE_STACK" \
-  --query 'Stacks[0].{Name:StackName,Status:StackStatus}' \
-  --output table --no-cli-pager
-
-aws cloudformation list-stack-resources \
-  --region "$AWS_REGION" --stack-name "$SOURCE_STACK" \
-  --query 'StackResourceSummaries[].{LogicalId:LogicalResourceId,Type:ResourceType,PhysicalId:PhysicalResourceId,Status:ResourceStatus}' \
-  --output table --no-cli-pager
-
-TARGET_STATUS=$(aws cloudformation list-stacks \
-  --region "$AWS_REGION" \
-  --query "StackSummaries[?StackName=='PacificBioArchive-QueryAdoption' && StackStatus!='DELETE_COMPLETE'].StackStatus | [0]" \
-  --output text --no-cli-pager)
-test -z "$TARGET_STATUS" || test "$TARGET_STATUS" = "None"
+if [ "$CHECKOUT_SUCCEEDED" != true ]
+then
+  printf 'STOP: checkout gate did not pass; no AWS read was attempted.\n' >&2
+elif ACCOUNT_ID=$(aws sts get-caller-identity \
+       --region "$AWS_REGION" --query Account --output text --no-cli-pager) &&
+     CALLER_ARN=$(aws sts get-caller-identity \
+       --region "$AWS_REGION" --query Arn --output text --no-cli-pager) &&
+     test "$CALLER_ARN" = "arn:aws:iam::$ACCOUNT_ID:user/fit5225-cli-deployer" &&
+     aws cloudformation describe-stacks \
+       --region "$AWS_REGION" --stack-name "$SOURCE_STACK" \
+       --query 'Stacks[0].{Name:StackName,Status:StackStatus}' \
+       --output table --no-cli-pager &&
+     aws cloudformation list-stack-resources \
+       --region "$AWS_REGION" --stack-name "$SOURCE_STACK" \
+       --query 'StackResourceSummaries[].{LogicalId:LogicalResourceId,Type:ResourceType,PhysicalId:PhysicalResourceId,Status:ResourceStatus}' \
+       --output table --no-cli-pager &&
+     TARGET_STATUS=$(aws cloudformation list-stacks \
+       --region "$AWS_REGION" \
+       --query "StackSummaries[?StackName=='PacificBioArchive-QueryAdoption' && StackStatus!='DELETE_COMPLETE'].StackStatus | [0]" \
+       --output text --no-cli-pager) &&
+     { test -z "$TARGET_STATUS" || test "$TARGET_STATUS" = "None"; }
+then
+  READ_ONLY_CONTEXT_SUCCEEDED=true
+  printf 'Caller, source Stack and absent target checks passed.\n'
+else
+  printf 'STOP: caller, source Stack or target ownership gate failed.\n' >&2
+fi
 unset TARGET_STATUS
 ```
 
@@ -212,7 +258,10 @@ python -m pytest -q -p no:cacheprovider infrastructure/member-b/test_template.py
 python -m pytest -q -p no:cacheprovider \
   infrastructure/member-d/test_template.py \
   infrastructure/member-d/import/test_adoption.py \
-  infrastructure/member-d/import/test_prepare_import.py
+  infrastructure/member-d/import/test_prepare_import.py \
+  infrastructure/member-d/import/test_yaml_audit.py \
+  infrastructure/member-d/import/test_build_yaml_audit_artifact.py \
+  infrastructure/member-d/import/test_runtime_gate.py
 npm --prefix frontend test
 npm --prefix frontend run build
 ```
@@ -222,6 +271,14 @@ GitHub 也明确建议用 commit ID（而非会移动的分支名）固定文件
 证据 SHA 与 `APPROVED_COMMIT` 不同，或任一测试/构建失败时，明确 **STOP**；不得进入
 CloudShell audit。CloudShell 的 §4.2 只证明当前 checkout 与已批准证据 SHA 相同且干净，
 不会重新证明测试通过。
+
+批准人逐项核对并保存全部证据后，才可在当前 shell 明确设置：
+
+```bash
+TEST_EVIDENCE_APPROVED=true
+```
+
+不得预先设置、代替批准人设置或在证据缺失时设置此变量。
 
 ### 4.5 新鲜 audit 和所有权恢复报告
 
@@ -236,12 +293,17 @@ unmanaged，并严格核对真实 Role ARN、API ID、authorizer ID、integratio
 
 ```bash
 AUDIT_SUCCEEDED=false
+RECOVERY_REPORT_SUCCEEDED=false
 
-if ! command -v python3 >/dev/null 2>&1 || \
-   ! python3 -B -S -c 'import sys; raise SystemExit(0 if sys.version_info >= (3, 10) else 1)'
+if [ "$READ_ONLY_CONTEXT_SUCCEEDED" != true ] || \
+   [ "$TEST_EVIDENCE_APPROVED" != true ]
+then
+  printf 'STOP: checkout/caller/ownership or external-test evidence gate did not pass.\n' >&2
+elif ! command -v python3 >/dev/null 2>&1 || \
+   ! python3 -B -E -S -c 'import sys; raise SystemExit(0 if sys.version_info >= (3, 10) else 1)'
 then
   printf 'STOP: Python 3.10+ is unavailable; do not install packages in CloudShell.\n' >&2
-elif python3 -B -S infrastructure/member-d/import/prepare_import.py audit \
+elif python3 -B -E -S infrastructure/member-d/import/prepare_import.py audit \
     --region "$AWS_REGION" \
     --stack "$SOURCE_STACK" \
     --api "$API_ID" \
@@ -260,12 +322,14 @@ fi
 
 if [ "$AUDIT_SUCCEEDED" = true ]
 then
-  if python3 -B -S infrastructure/member-d/import/prepare_import.py recovery-report \
+  if python3 -B -E -S infrastructure/member-d/import/prepare_import.py recovery-report \
       --region "$AWS_REGION" \
       --source-stack "$SOURCE_STACK" \
       --target-stack "$TARGET_STACK" \
+      --expected-commit "$APPROVED_COMMIT" \
       --workdir "$WORK_DIR"
   then
+    RECOVERY_REPORT_SUCCEEDED=true
     printf 'Read-only audit and recovery report completed.\n'
   else
     RECOVERY_EXIT=$?
@@ -275,11 +339,22 @@ then
 fi
 ```
 
-`audit` 的启动路径只依赖 Python 标准库、仓库源码、Git 和已预装的 AWS CLI；它读取
-CloudFormation 的 `Processed` template，而 AWS 明确规定 processed template 即使源模板
-是 YAML 也会格式化为 JSON（[Processed template][processed-template]）。PyYAML 仅在后续
-prepare/validator 确实解析 YAML 时延迟加载。任何缺失工具、SHA/clean-tree 不匹配或非零
-退出都必须按上面的 `STOP` 处理，不得临时安装依赖后绕过门禁。
+`GetTemplate` 的 `TemplateBody` 可以是 JSON 或 YAML 字符串；AWS 并不保证无 Transform
+Stack 的 `Processed` template 会转换成 JSON（[GetTemplate API][get-template]、
+[template formats][template-formats]）。因此 audit 在任何 AWS 查询之前，先验证当前完整
+commit、clean tree、`-B -E -S` 解释器标志，再完整验证仓库内的
+`member-d-yaml-audit.pyz` 与外部 lock manifest：archive 总哈希、逐 entry 哈希、固定
+PyYAML 6.0.3 sdist 哈希、entry allowlist、路径/类型/解压限制和完整 MIT License 全部通过
+后，才从**已经验证并保存在内存中的 entry bytes** 编译私有 `_pba_yaml`；导入过程不会
+重新打开可被替换的 archive pathname，也不会把 archive 或外部路径加入 `sys.path`。最终
+模块 `__file__` 仍必须精确指向该已验证 archive 内的 entry。恶意 `PYTHONPATH`、系统
+site-packages、未锁定的 `yaml` 包或校验后的同路径替换都不能成为执行来源。
+
+该 archive 只能由 `build_yaml_audit_artifact.py` 在受控本地/CI 中，从已下载的官方 sdist
+离线构建；构建器先验证固定 PyPI SHA-256，且两次构建必须字节级一致。CloudShell 不构建
+archive、不联网取依赖，也不得运行 `pip install`。任何缺失工件、manifest/hash/entry
+不一致、SHA/clean-tree 不匹配或非零退出都必须按上面的 `STOP` 处理，不得临时安装依赖
+或绕过模板验证。
 
 报告必须把 target 分类为 `prepare`，且 source 仍是精确四资源边界；否则停止。
 
@@ -295,15 +370,26 @@ CloudShell 的系统 Python 中临时安装 PyYAML、pytest 或 query requiremen
 
 ```bash
 # FUTURE WRITE — 仅在 prepare 获得独立批准后运行。
-python infrastructure/member-d/import/prepare_import.py prepare \
-  --region "$AWS_REGION" \
-  --stack "$SOURCE_STACK" \
-  --api "$API_ID" \
-  --authorizer "$AUTHORIZER_ID" \
-  --integration "$INTEGRATION_ID" \
-  --function "$FUNCTION_NAME" \
-  --artifact-bucket "$ARTIFACT_BUCKET" \
-  --workdir "$WORK_DIR"
+PREPARE_SUCCEEDED=false
+if [ "$AUDIT_SUCCEEDED" != true ] || [ "$RECOVERY_REPORT_SUCCEEDED" != true ]
+then
+  printf 'STOP: fresh audit and recovery-report gates did not both pass.\n' >&2
+elif python3 -B -E -S infrastructure/member-d/import/prepare_import.py prepare \
+    --region "$AWS_REGION" \
+    --stack "$SOURCE_STACK" \
+    --api "$API_ID" \
+    --authorizer "$AUTHORIZER_ID" \
+    --integration "$INTEGRATION_ID" \
+    --function "$FUNCTION_NAME" \
+    --artifact-bucket "$ARTIFACT_BUCKET" \
+    --expected-commit "$APPROVED_COMMIT" \
+    --workdir "$WORK_DIR"
+then
+  PREPARE_SUCCEEDED=true
+  printf 'Prepare completed; do not create a preview without separate approval.\n'
+else
+  printf 'STOP: prepare failed; discard this attempt and do not create a preview.\n' >&2
+fi
 ```
 
 必须得到下面四个新生成文件，且不得编辑：
@@ -323,71 +409,90 @@ python infrastructure/member-d/import/prepare_import.py prepare \
 
 ```bash
 # FUTURE WRITE — 只创建 preview；不执行 IMPORT。
-set +e
-aws cloudformation create-change-set \
-  --region "$AWS_REGION" \
-  --stack-name "$TARGET_STACK" \
-  --change-set-name "$IMPORT_CHANGE_SET" \
-  --change-set-type IMPORT \
-  --template-body "file://$WORK_DIR/import-template.json" \
-  --resources-to-import "file://$WORK_DIR/resources-to-import.json" \
-  --parameters "file://$WORK_DIR/import-parameters.json"
-CREATE_RC=$?
-set -e
+PREVIEW_CREATED=false
+PREVIEW_READY=false
+PREVIEW_VALIDATED=false
 
-if [ "$CREATE_RC" -ne 0 ]; then
-  python infrastructure/member-d/import/prepare_import.py recovery-report \
+if [ "${PREPARE_SUCCEEDED:-false}" != true ]
+then
+  printf 'STOP: prepare gate did not pass; no Change Set was requested.\n' >&2
+elif aws cloudformation create-change-set \
     --region "$AWS_REGION" \
-    --source-stack "$SOURCE_STACK" \
-    --target-stack "$TARGET_STACK" \
-    --workdir "$WORK_DIR" \
-    --import-change-set-creation-failed
-  echo 'STOP: preview creation failed; discard this preparation bundle.' >&2
-  exit 1
+    --stack-name "$TARGET_STACK" \
+    --change-set-name "$IMPORT_CHANGE_SET" \
+    --change-set-type IMPORT \
+    --template-body "file://$WORK_DIR/import-template.json" \
+    --resources-to-import "file://$WORK_DIR/resources-to-import.json" \
+    --parameters "file://$WORK_DIR/import-parameters.json"
+then
+  PREVIEW_CREATED=true
+else
+  if ! python3 -B -E -S infrastructure/member-d/import/prepare_import.py recovery-report \
+      --region "$AWS_REGION" \
+      --source-stack "$SOURCE_STACK" \
+      --target-stack "$TARGET_STACK" \
+      --expected-commit "$APPROVED_COMMIT" \
+      --workdir "$WORK_DIR" \
+      --import-change-set-creation-failed
+  then
+    printf 'STOP: preview creation and recovery report both failed.\n' >&2
+  else
+    printf 'STOP: preview creation failed; discard this preparation bundle.\n' >&2
+  fi
 fi
-unset CREATE_RC
 
-set +e
-aws cloudformation wait change-set-create-complete \
-  --region "$AWS_REGION" \
-  --stack-name "$TARGET_STACK" \
-  --change-set-name "$IMPORT_CHANGE_SET"
-WAIT_RC=$?
-set -e
-
-if [ "$WAIT_RC" -ne 0 ]; then
-  python infrastructure/member-d/import/prepare_import.py recovery-report \
-    --region "$AWS_REGION" \
-    --source-stack "$SOURCE_STACK" \
-    --target-stack "$TARGET_STACK" \
-    --workdir "$WORK_DIR" \
-    --import-change-set-creation-failed
-  echo 'STOP: preview is not CREATE_COMPLETE; do not retry.' >&2
-  exit 1
+if [ "$PREVIEW_CREATED" = true ]
+then
+  if aws cloudformation wait change-set-create-complete \
+      --region "$AWS_REGION" \
+      --stack-name "$TARGET_STACK" \
+      --change-set-name "$IMPORT_CHANGE_SET"
+  then
+    PREVIEW_READY=true
+  else
+    if ! python3 -B -E -S infrastructure/member-d/import/prepare_import.py recovery-report \
+        --region "$AWS_REGION" \
+        --source-stack "$SOURCE_STACK" \
+        --target-stack "$TARGET_STACK" \
+        --expected-commit "$APPROVED_COMMIT" \
+        --workdir "$WORK_DIR" \
+        --import-change-set-creation-failed
+    then
+      printf 'STOP: preview wait and recovery report both failed.\n' >&2
+    else
+      printf 'STOP: preview is not CREATE_COMPLETE; do not retry.\n' >&2
+    fi
+  fi
 fi
-unset WAIT_RC
 
-aws cloudformation describe-change-set \
-  --region "$AWS_REGION" \
-  --stack-name "$TARGET_STACK" \
-  --change-set-name "$IMPORT_CHANGE_SET" \
-  --query 'Changes[].ResourceChange.{Action:Action,LogicalId:LogicalResourceId,Type:ResourceType,Replacement:Replacement}' \
-  --output table --no-cli-pager
-
-python infrastructure/member-d/import/prepare_import.py validate-change-set \
-  --region "$AWS_REGION" \
-  --source-stack "$SOURCE_STACK" \
-  --stack "$TARGET_STACK" \
-  --change-set "$IMPORT_CHANGE_SET" \
-  --expected-type IMPORT \
-  --api "$API_ID" \
-  --authorizer "$AUTHORIZER_ID" \
-  --integration "$INTEGRATION_ID" \
-  --function "$FUNCTION_NAME" \
-  --workdir "$WORK_DIR" \
-  --artifact-bucket "$ARTIFACT_BUCKET"
-
-echo 'STOP: report the validated 19-Import preview for a new approval.'
+if [ "$PREVIEW_READY" = true ]
+then
+  if aws cloudformation describe-change-set \
+      --region "$AWS_REGION" \
+      --stack-name "$TARGET_STACK" \
+      --change-set-name "$IMPORT_CHANGE_SET" \
+      --query 'Changes[].ResourceChange.{Action:Action,LogicalId:LogicalResourceId,Type:ResourceType,Replacement:Replacement}' \
+      --output table --no-cli-pager &&
+     python3 -B -E -S infrastructure/member-d/import/prepare_import.py validate-change-set \
+       --region "$AWS_REGION" \
+       --source-stack "$SOURCE_STACK" \
+       --stack "$TARGET_STACK" \
+       --change-set "$IMPORT_CHANGE_SET" \
+       --expected-type IMPORT \
+       --api "$API_ID" \
+       --authorizer "$AUTHORIZER_ID" \
+       --integration "$INTEGRATION_ID" \
+       --function "$FUNCTION_NAME" \
+       --expected-commit "$APPROVED_COMMIT" \
+       --workdir "$WORK_DIR" \
+       --artifact-bucket "$ARTIFACT_BUCKET"
+  then
+    PREVIEW_VALIDATED=true
+    printf 'STOP: report the validated 19-Import preview for a new approval.\n'
+  else
+    printf 'STOP: preview description or validator failed; it is not approved.\n' >&2
+  fi
+fi
 ```
 
 Validator 必须从 CloudFormation 实际描述中确认：`ChangeSetType=IMPORT`、目标 Stack 精确
@@ -405,7 +510,7 @@ preview snapshot。
 若未来另行批准并执行该 IMPORT，Stack 到达 `IMPORT_COMPLETE` 后必须立即运行：
 
 ```bash
-python infrastructure/member-d/import/prepare_import.py verify-post-import \
+python3 -B -E -S infrastructure/member-d/import/prepare_import.py verify-post-import \
   --region "$AWS_REGION" \
   --source-stack "$SOURCE_STACK" \
   --target-stack "$TARGET_STACK" \
@@ -447,7 +552,7 @@ Stack 自动发现的 live evidence，也不扩大本流程的 Stack 所有权�
 必须来自同一次另行获批流程）：
 
 ```bash
-python infrastructure/member-d/import/prepare_import.py validate-change-set \
+python3 -B -E -S infrastructure/member-d/import/prepare_import.py validate-change-set \
   --region "$AWS_REGION" \
   --source-stack "$SOURCE_STACK" \
   --stack "$TARGET_STACK" \
@@ -498,7 +603,7 @@ runtime/API/ownership 验证。只有确认 19 项导入资源仍精确归 Query
 作为 baseline：
 
 ```bash
-python infrastructure/member-d/import/prepare_import.py verify-update-rollback \
+python3 -B -E -S infrastructure/member-d/import/prepare_import.py verify-update-rollback \
   --region "$AWS_REGION" \
   --source-stack "$SOURCE_STACK" \
   --target-stack "$TARGET_STACK" \
@@ -523,7 +628,11 @@ Stack，源 4 项、Lambda、API/authorizer、integration 和 16 条 Route 必�
 - core database template：[`../../infrastructure/member-d/dynamodb.yaml`](../../infrastructure/member-d/dynamodb.yaml)
 - Query normal-UPDATE template：[`../../infrastructure/member-d/query-adoption.yaml`](../../infrastructure/member-d/query-adoption.yaml)
 - adoption 工具：[`../../infrastructure/member-d/import/prepare_import.py`](../../infrastructure/member-d/import/prepare_import.py)
+- 离线 YAML artifact builder：[`../../infrastructure/member-d/import/build_yaml_audit_artifact.py`](../../infrastructure/member-d/import/build_yaml_audit_artifact.py)
+- parser artifact lock：[`../../infrastructure/member-d/import/member-d-yaml-audit.lock.json`](../../infrastructure/member-d/import/member-d-yaml-audit.lock.json)
+- PyYAML notices/license：[`../../infrastructure/member-d/import/THIRD_PARTY_NOTICES.md`](../../infrastructure/member-d/import/THIRD_PARTY_NOTICES.md)
 
 [cloudshell-software]: https://docs.aws.amazon.com/cloudshell/latest/userguide/vm-specs.html
 [github-permalinks]: https://docs.github.com/en/repositories/working-with-files/using-files/getting-permanent-links-to-files
-[processed-template]: https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/template-macros-troubleshoot-processed-template.html
+[get-template]: https://docs.aws.amazon.com/AWSCloudFormation/latest/APIReference/API_GetTemplate.html
+[template-formats]: https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/template-formats.html
