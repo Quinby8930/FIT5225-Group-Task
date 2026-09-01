@@ -14,7 +14,12 @@ import pytest
 from fastapi.testclient import TestClient
 
 from app import main
-from app.notification_client import NotificationPublisher
+from app.notification_client import (
+    EmailSubscriptionConflict,
+    EmailSubscriptionSetupError,
+    NotificationPublisher,
+    StubNotificationPublisher,
+)
 from app.repository import SQLiteNotificationRepository, SQLiteRepository
 from app.schemas import FileRecord, Notification
 from app.services.notification_service import build_notifications
@@ -55,6 +60,37 @@ def _record(fid, ftype, thumb, tags, obj=None):
 class TestPureLogic:
     def test_legacy_processing_callbacks_are_disabled_by_default(self):
         assert main.Settings().allow_legacy_processing_callbacks is False
+
+    def test_stub_notification_mode_keeps_local_delivery_side_effect_free(self):
+        built = main._build_publisher(
+            SimpleNamespace(notification_publisher="stub")
+        )
+
+        assert isinstance(built, StubNotificationPublisher)
+
+    def test_shared_demo_mode_keeps_the_existing_static_topic_behavior(
+        self, monkeypatch
+    ):
+        captured = {}
+
+        def build_shared(**kwargs):
+            captured.update(kwargs)
+            return "shared-publisher"
+
+        monkeypatch.setattr(main, "SNSNotificationPublisher", build_shared)
+        built = main._build_publisher(
+            SimpleNamespace(
+                notification_publisher="shared_demo",
+                aws_region="ap-southeast-2",
+                sns_topic_arn="arn:aws:sns:ap-southeast-2:123456789012:demo",
+            )
+        )
+
+        assert built == "shared-publisher"
+        assert captured == {
+            "region": "ap-southeast-2",
+            "topic_arn": "arn:aws:sns:ap-southeast-2:123456789012:demo",
+        }
 
     def test_sqlite_repository_migrates_existing_processing_schema(self, tmp_path):
         database = tmp_path / "legacy.db"
@@ -261,18 +297,33 @@ def client(tmp_path):
         def publish(self, notification):
             self.published.append(notification)
 
+    class _Provisioner:
+        def __init__(self):
+            self.calls = []
+            self.error = None
+
+        def ensure_subscription(self, user_id, email):
+            self.calls.append((user_id, email))
+            if self.error is not None:
+                raise self.error
+
     storage = _Storage()
     detector = _Detector()
     publisher = _Publisher()
+    provisioner = _Provisioner()
     main.app.dependency_overrides[main.get_repo] = lambda: repo
     main.app.dependency_overrides[main.get_notification_repo] = lambda: notif_repo
     main.app.dependency_overrides[main.get_detector] = lambda: detector
     main.app.dependency_overrides[main.get_storage] = lambda: storage
     main.app.dependency_overrides[main.get_publisher] = lambda: publisher
+    main.app.dependency_overrides[main.get_subscription_provisioner] = (
+        lambda: provisioner
+    )
     main.app.dependency_overrides[main.get_current_user] = lambda: "u1"
     test_settings = SimpleNamespace(
         internal_api_key=INTERNAL_API_KEY,
         query_input_bucket="private-media",
+        notification_publisher="stub",
     )
     main.app.dependency_overrides[main.get_settings] = lambda: test_settings
 
@@ -282,9 +333,13 @@ def client(tmp_path):
         c.storage = storage
         c.detector = detector
         c.publisher = publisher
+        c.provisioner = provisioner
+        c.settings = test_settings
         yield c
 
     main.app.dependency_overrides.clear()
+    if hasattr(main.app.state, "lambda_event"):
+        del main.app.state.lambda_event
 
 
 class TestEndpoints:
@@ -1930,6 +1985,7 @@ class TestSubscriptionAndNotification:
         r = client.post("/notifications/subscribe", json={"species": "wombat"})
         assert r.status_code == 201
         assert r.json()["user_id"] == "u1"
+        assert client.provisioner.calls == []
         r = client.get("/notifications/subscriptions")
         assert r.json() == {"species": ["wombat"], "count": 1}
 
@@ -1941,6 +1997,165 @@ class TestSubscriptionAndNotification:
         assert r.status_code == 422
         assert client.notif_repo.subscriptions("u1") == []
         assert client.notif_repo.subscriptions("u2") == []
+
+    @pytest.mark.parametrize("field", ["email", "TopicArn"])
+    def test_subscribe_rejects_public_email_and_topic_arn(self, client, field):
+        response = client.post(
+            "/notifications/subscribe",
+            json={"species": "wombat", field: "untrusted-client-value"},
+        )
+
+        assert response.status_code == 422
+        assert client.notif_repo.subscriptions("u1") == []
+
+    @pytest.mark.parametrize(
+        "claims",
+        [
+            {
+                "email": "verified@example.test",
+                "email_verified": True,
+                "token_use": "id",
+            },
+            {
+                "sub": " ",
+                "email": "verified@example.test",
+                "email_verified": True,
+                "token_use": "id",
+            },
+            {"sub": "u1", "email_verified": True, "token_use": "id"},
+            {
+                "sub": "u1",
+                "email": " ",
+                "email_verified": True,
+                "token_use": "id",
+            },
+            {
+                "sub": "u1",
+                "email": "verified@example.test",
+                "email_verified": False,
+                "token_use": "id",
+            },
+            {
+                "sub": "u1",
+                "email": "verified@example.test",
+                "email_verified": "false",
+                "token_use": "id",
+            },
+            {
+                "sub": "u1",
+                "email": "verified@example.test",
+                "email_verified": True,
+                "token_use": "access",
+            },
+        ],
+        ids=[
+            "missing-sub",
+            "blank-sub",
+            "missing-email",
+            "blank-email",
+            "false-boolean",
+            "false-string",
+            "access-token",
+        ],
+    )
+    def test_per_user_subscribe_requires_verified_id_token_claims(self, client, claims):
+        client.settings.notification_publisher = "per_user"
+        main.app.state.lambda_event = {
+            "requestContext": {"authorizer": {"jwt": {"claims": claims}}}
+        }
+
+        response = client.post(
+            "/notifications/subscribe", json={"species": "wombat"}
+        )
+
+        assert response.status_code == 403
+        assert client.provisioner.calls == []
+        assert client.notif_repo.subscriptions("u1") == []
+
+    @pytest.mark.parametrize("verified", [True, "true"])
+    def test_per_user_subscribe_provisions_before_writing_species(
+        self, client, verified
+    ):
+        client.settings.notification_publisher = "per_user"
+        main.app.state.lambda_event = {
+            "requestContext": {
+                "authorizer": {
+                    "jwt": {
+                        "claims": {
+                            "sub": "u1",
+                            "email": "verified@example.test",
+                            "email_verified": verified,
+                            "token_use": "id",
+                        }
+                    }
+                }
+            }
+        }
+
+        response = client.post(
+            "/notifications/subscribe", json={"species": "wombat"}
+        )
+
+        assert response.status_code == 201
+        assert client.provisioner.calls == [("u1", "verified@example.test")]
+        assert "email" not in response.json()
+        assert client.notif_repo.subscriptions("u1") == ["wombat"]
+
+    def test_per_user_subscribe_does_not_write_species_when_sns_fails(self, client):
+        client.settings.notification_publisher = "per_user"
+        client.provisioner.error = EmailSubscriptionSetupError(
+            "email notification setup failed"
+        )
+        main.app.state.lambda_event = {
+            "requestContext": {
+                "authorizer": {
+                    "jwt": {
+                        "claims": {
+                            "sub": "u1",
+                            "email": "verified@example.test",
+                            "email_verified": True,
+                            "token_use": "id",
+                        }
+                    }
+                }
+            }
+        }
+
+        response = client.post(
+            "/notifications/subscribe", json={"species": "wombat"}
+        )
+
+        assert response.status_code == 502
+        assert "verified@example.test" not in response.text
+        assert client.notif_repo.subscriptions("u1") == []
+
+    def test_per_user_subscribe_fails_closed_for_another_email(self, client):
+        client.settings.notification_publisher = "per_user"
+        client.provisioner.error = EmailSubscriptionConflict(
+            "user topic already has a different email subscription"
+        )
+        main.app.state.lambda_event = {
+            "requestContext": {
+                "authorizer": {
+                    "jwt": {
+                        "claims": {
+                            "sub": "u1",
+                            "email": "verified@example.test",
+                            "email_verified": True,
+                            "token_use": "id",
+                        }
+                    }
+                }
+            }
+        }
+
+        response = client.post(
+            "/notifications/subscribe", json={"species": "wombat"}
+        )
+
+        assert response.status_code == 409
+        assert "verified@example.test" not in response.text
+        assert client.notif_repo.subscriptions("u1") == []
 
     def test_subscription_species_is_normalized_before_persistence(self, client):
         response = client.post(

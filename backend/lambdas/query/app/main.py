@@ -37,7 +37,7 @@ import logging
 import secrets
 from datetime import timedelta
 
-from fastapi import Depends, FastAPI, Header, HTTPException, UploadFile
+from fastapi import Depends, FastAPI, Header, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
@@ -68,9 +68,14 @@ from app.schemas import (
     utcnow,
 )
 from app.notification_client import (
+    EmailSubscriptionConflict,
+    EmailSubscriptionError,
     NotificationPublisher,
+    PerUserSNSNotificationPublisher,
+    SNSUserSubscriptionProvisioner,
     SNSNotificationPublisher,
     StubNotificationPublisher,
+    UserTopicResolver,
 )
 from app.services.notification_service import build_notifications
 from app.services.query_service import (
@@ -101,7 +106,7 @@ from app.tag_detector import (
     TagDetector,
     UnavailableTagDetector,
 )
-from app.auth import build_get_current_user
+from app.auth import build_get_current_user, verified_email_identity
 
 app = FastAPI(title="Pacific BioArchive — Database & Query API", version="1.0.0")
 app.add_middleware(
@@ -198,17 +203,50 @@ detector: TagDetector = _build_detector()
 storage: StorageClient = _build_storage()
 
 
-def _build_publisher() -> NotificationPublisher:
-    if settings.notification_publisher == "sns":
+def _notification_mode(settings_: Settings) -> str:
+    mode = settings_.notification_publisher.strip().casefold()
+    if mode in {"stub", "shared_demo", "per_user", "sns"}:
+        return mode
+    raise RuntimeError(
+        "NOTIFICATION_PUBLISHER must be stub, shared_demo, or per_user"
+    )
+
+
+def _build_publisher(settings_: Settings = settings) -> NotificationPublisher:
+    mode = _notification_mode(settings_)
+    if mode == "per_user":
+        return PerUserSNSNotificationPublisher(
+            region=settings_.aws_region,
+            resolver=UserTopicResolver(settings_.sns_user_topic_arn_prefix),
+        )
+    if mode == "shared_demo":
         return SNSNotificationPublisher(
-            region=settings.aws_region,
-            topic_arn=settings.sns_topic_arn,
-            topic_arn_template=settings.sns_topic_arn_template,
+            region=settings_.aws_region,
+            topic_arn=settings_.sns_topic_arn,
+        )
+    if mode == "sns":  # backward-compatible alias for the previous behavior
+        return SNSNotificationPublisher(
+            region=settings_.aws_region,
+            topic_arn=settings_.sns_topic_arn,
+            topic_arn_template=settings_.sns_topic_arn_template,
         )
     return StubNotificationPublisher()
 
 
+def _build_subscription_provisioner(
+    settings_: Settings = settings,
+) -> SNSUserSubscriptionProvisioner | None:
+    if _notification_mode(settings_) != "per_user":
+        return None
+    resolver = UserTopicResolver(settings_.sns_user_topic_arn_prefix)
+    return SNSUserSubscriptionProvisioner(
+        region=settings_.aws_region,
+        resolver=resolver,
+    )
+
+
 publisher: NotificationPublisher = _build_publisher()
+subscription_provisioner = _build_subscription_provisioner()
 
 
 def get_repo() -> FileRepository:
@@ -229,6 +267,10 @@ def get_storage() -> StorageClient:
 
 def get_publisher() -> NotificationPublisher:
     return publisher
+
+
+def get_subscription_provisioner() -> SNSUserSubscriptionProvisioner | None:
+    return subscription_provisioner
 
 
 def get_settings() -> Settings:
@@ -608,12 +650,55 @@ def delete_files(
 @app.post("/notifications/subscribe", status_code=201)
 def subscribe(
     body: SubscribeRequest,
+    request: Request,
     notif_repo_: NotificationRepository = Depends(get_notification_repo),
+    provisioner_: SNSUserSubscriptionProvisioner | None = Depends(
+        get_subscription_provisioner
+    ),
+    settings_: Settings = Depends(get_settings),
     _user: str = Depends(get_current_user),
 ) -> dict:
     species = _normalise_species(body.species)
-    notif_repo_.subscribe(_user, species)
-    return {"user_id": _user, "species": species, "subscribed": True}
+    user_id = _user
+    if _notification_mode(settings_) == "per_user":
+        identity = verified_email_identity(request)
+        if not hmac.compare_digest(identity.sub, _user):
+            raise HTTPException(
+                status_code=401,
+                detail={
+                    "code": "AUTHENTICATED_USER_MISMATCH",
+                    "message": "authenticated identity is inconsistent",
+                },
+            )
+        if provisioner_ is None:
+            raise HTTPException(
+                status_code=503,
+                detail={
+                    "code": "EMAIL_DELIVERY_NOT_CONFIGURED",
+                    "message": "email notification delivery is not configured",
+                },
+            )
+        try:
+            provisioner_.ensure_subscription(identity.sub, identity.email)
+        except EmailSubscriptionConflict as exc:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "EMAIL_SUBSCRIPTION_CONFLICT",
+                    "message": "email notification subscription conflicts with the user topic",
+                },
+            ) from exc
+        except EmailSubscriptionError as exc:
+            raise HTTPException(
+                status_code=502,
+                detail={
+                    "code": "EMAIL_SUBSCRIPTION_FAILED",
+                    "message": "email notification setup failed",
+                },
+            ) from exc
+        user_id = identity.sub
+    notif_repo_.subscribe(user_id, species)
+    return {"user_id": user_id, "species": species, "subscribed": True}
 
 
 @app.delete("/notifications/subscribe")

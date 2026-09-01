@@ -65,19 +65,55 @@ links use `POST /asset-urls` on the same API Gateway base URL.
 
 ## SNS Notification Delivery
 
-Local development uses the stub publisher and the frontend inbox. In AWS, set:
+The default remains `stub`. An existing deployment configured with the legacy
+`sns` value retains its previous static Topic/template behavior, so deploying
+the package alone does not switch notification mode.
+
+Available modes are:
 
 ```text
-NOTIFICATION_PUBLISHER=sns
+NOTIFICATION_PUBLISHER=stub
+NOTIFICATION_PUBLISHER=shared_demo
+NOTIFICATION_PUBLISHER=per_user
+```
+
+The single-inbox course demonstration mode uses:
+
+```text
+NOTIFICATION_PUBLISHER=shared_demo
 SNS_TOPIC_ARN=arn:aws:sns:ap-southeast-2:<account-id>:<topic-name>
 ```
 
-For per-user SNS topics, use:
+Per-user course-demo email uses:
 
 ```text
-NOTIFICATION_PUBLISHER=sns
-SNS_TOPIC_ARN_TEMPLATE=arn:aws:sns:ap-southeast-2:<account-id>:bioarchive-{user_id}
+NOTIFICATION_PUBLISHER=per_user
+SNS_USER_TOPIC_ARN_PREFIX=arn:aws:sns:ap-southeast-2:<account-id>:pba-user-
 ```
 
-The publisher includes `user_id` and `species` as SNS message attributes and
-the full notification payload as JSON.
+The subscribe request remains `{"species":"wombat"}`. The backend takes
+`sub`, `email`, and `email_verified` only from API Gateway JWT claims, hashes
+`sub` into `pba-user-<sha256>`, reuses an existing pending/confirmed email
+subscription, and asks SNS to send a confirmation email only when none exists.
+Email, user ID, and Topic ARN are never accepted from the browser. A per-user
+SNS failure never falls back to the shared demo Topic.
+
+The Query Lambda execution role needs only these SNS actions on
+`arn:aws:sns:ap-southeast-2:<account-id>:pba-user-*`:
+
+- `sns:CreateTopic`
+- `sns:Subscribe` with `sns:Protocol` restricted to `email`
+- `sns:ListSubscriptionsByTopic`
+- `sns:Publish`
+
+It does not need `SetSubscriptionAttributes`, `Unsubscribe`, `DeleteTopic`, a
+new DynamoDB table, or a new Lambda.
+
+### Course-demo limitations
+
+This bounded implementation intentionally does not solve concurrent first
+subscriptions, automatic Cognito email migration, SNS/DynamoDB atomicity,
+automatic Topic cleanup, leases, reconciliation, or a compensation worker.
+Species unsubscribe removes only the existing `(user_id, species)` record.
+The durable in-app inbox remains the source of record and email delivery keeps
+the existing at-least-once retry semantics.

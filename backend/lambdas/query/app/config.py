@@ -59,10 +59,14 @@ class Settings:
         if origin.strip()
     )
 
-    # Notification delivery. Use "stub" locally or "sns" in AWS.
+    # Notification delivery. New deployments use one of:
+    # "stub", "shared_demo", or "per_user".  The legacy "sns" value remains
+    # an alias for the pre-existing shared/template behavior so a code-only
+    # deployment cannot silently change the current cloud behavior.
     notification_publisher: str = os.getenv("NOTIFICATION_PUBLISHER", "stub")
     sns_topic_arn: str = os.getenv("SNS_TOPIC_ARN", "")
     sns_topic_arn_template: str = os.getenv("SNS_TOPIC_ARN_TEMPLATE", "")
+    sns_user_topic_arn_prefix: str = os.getenv("SNS_USER_TOPIC_ARN_PREFIX", "")
 
 
 settings = Settings()

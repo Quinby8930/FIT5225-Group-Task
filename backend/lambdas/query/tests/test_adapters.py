@@ -13,16 +13,49 @@ from uuid import UUID
 
 import pytest
 
-from app.notification_client import SNSNotificationPublisher
+from app.notification_client import (
+    EmailSubscriptionConflict,
+    PerUserSNSNotificationPublisher,
+    SNSUserSubscriptionProvisioner,
+    SNSNotificationPublisher,
+    UserTopicResolver,
+)
 from app.schemas import Notification
 from app.storage_client import LambdaStorageClient, StorageClientError
 from app.tag_detector import RemoteTagDetector, TagDetectionError, _NoRedirectHandler
 
 
 class FakeSNSClient:
-    def __init__(self, error=None):
+    def __init__(self, error=None, subscription_pages=None, subscribe_error=None):
         self.error = error
+        self.subscribe_error = subscribe_error
         self.calls = []
+        self.create_topic_calls = []
+        self.list_subscription_calls = []
+        self.subscribe_calls = []
+        self.subscription_pages = list(subscription_pages or [{"Subscriptions": []}])
+
+    def create_topic(self, **kwargs):
+        self.create_topic_calls.append(kwargs)
+        if self.error is not None:
+            raise self.error
+        return {
+            "TopicArn": (
+                "arn:aws:sns:ap-southeast-2:123456789012:" + kwargs["Name"]
+            )
+        }
+
+    def list_subscriptions_by_topic(self, **kwargs):
+        self.list_subscription_calls.append(kwargs)
+        if self.error is not None:
+            raise self.error
+        return self.subscription_pages[len(self.list_subscription_calls) - 1]
+
+    def subscribe(self, **kwargs):
+        self.subscribe_calls.append(kwargs)
+        if self.subscribe_error is not None:
+            raise self.subscribe_error
+        return {"SubscriptionArn": "pending confirmation"}
 
     def publish(self, **kwargs):
         self.calls.append(kwargs)
@@ -53,6 +86,172 @@ def _notification(user_id="user-1"):
         object_key=f"originals/{user_id}/file-1/wombat.jpg",
         created_at=datetime(2026, 9, 1, 12, 0, tzinfo=timezone.utc),
     )
+
+
+def _user_topic_resolver():
+    return UserTopicResolver(
+        "arn:aws:sns:ap-southeast-2:123456789012:pba-user-"
+    )
+
+
+def test_user_topic_resolver_hashes_user_identity_into_safe_distinct_topics():
+    resolver = _user_topic_resolver()
+
+    first_name = resolver.topic_name("../../user-A")
+    second_name = resolver.topic_name("user-B")
+
+    assert first_name == (
+        "pba-user-"
+        "809d383b57bd06d778ed1a76be9eeb79abc146984029c1f16d7b77db23db6ef7"
+    )
+    assert second_name != first_name
+    assert len(first_name) == 73
+    assert set(first_name) <= set("abcdefghijklmnopqrstuvwxyz0123456789-")
+
+
+@pytest.mark.parametrize(
+    "subscription_arn",
+    ["pending confirmation", "arn:aws:sns:ap-southeast-2:123456789012:pba-user-x:sub"],
+)
+def test_user_subscription_provisioner_does_not_resubscribe_existing_email(
+    monkeypatch, subscription_arn
+):
+    endpoint = "verified-user@example.test"
+    sns = FakeSNSClient(
+        subscription_pages=[
+            {
+                "Subscriptions": [
+                    {
+                        "Protocol": "email",
+                        "Endpoint": endpoint,
+                        "SubscriptionArn": subscription_arn,
+                    }
+                ]
+            }
+        ]
+    )
+    provisioner = _sns_provisioner(monkeypatch, sns)
+
+    provisioner.ensure_subscription("user-1", endpoint)
+
+    assert sns.subscribe_calls == []
+
+
+def test_user_subscription_provisioner_paginates_before_subscribing(monkeypatch):
+    endpoint = "verified-user@example.test"
+    sns = FakeSNSClient(
+        subscription_pages=[
+            {"Subscriptions": [], "NextToken": "page-2"},
+            {
+                "Subscriptions": [
+                    {
+                        "Protocol": "email",
+                        "Endpoint": endpoint,
+                        "SubscriptionArn": "pending confirmation",
+                    }
+                ]
+            },
+        ]
+    )
+    provisioner = _sns_provisioner(monkeypatch, sns)
+
+    provisioner.ensure_subscription("user-1", endpoint)
+
+    assert sns.list_subscription_calls[1]["NextToken"] == "page-2"
+    assert sns.subscribe_calls == []
+
+
+def test_user_subscription_provisioner_subscribes_verified_email_once(monkeypatch):
+    endpoint = "verified-user@example.test"
+    sns = FakeSNSClient()
+    provisioner = _sns_provisioner(monkeypatch, sns)
+
+    provisioner.ensure_subscription("user-1", endpoint)
+
+    assert sns.create_topic_calls == [
+        {"Name": _user_topic_resolver().topic_name("user-1")}
+    ]
+    assert sns.subscribe_calls == [
+        {
+            "TopicArn": _user_topic_resolver().topic_arn("user-1"),
+            "Protocol": "email",
+            "Endpoint": endpoint,
+            "ReturnSubscriptionArn": True,
+        }
+    ]
+
+
+def test_user_subscription_provisioner_rejects_other_email_without_leaking_it(
+    monkeypatch,
+):
+    requested = "new-verified@example.test"
+    existing = "other-verified@example.test"
+    sns = FakeSNSClient(
+        subscription_pages=[
+            {
+                "Subscriptions": [
+                    {
+                        "Protocol": "email",
+                        "Endpoint": existing,
+                        "SubscriptionArn": "pending confirmation",
+                    }
+                ]
+            }
+        ]
+    )
+    provisioner = _sns_provisioner(monkeypatch, sns)
+
+    with pytest.raises(EmailSubscriptionConflict) as caught:
+        provisioner.ensure_subscription("user-1", requested)
+
+    assert requested not in str(caught.value)
+    assert existing not in str(caught.value)
+    assert sns.subscribe_calls == []
+
+
+def test_user_subscription_provisioner_redacts_email_from_sns_failure(monkeypatch):
+    endpoint = "verified-user@example.test"
+    sns = FakeSNSClient(
+        subscribe_error=RuntimeError(f"failed endpoint {endpoint}")
+    )
+    provisioner = _sns_provisioner(monkeypatch, sns)
+
+    with pytest.raises(RuntimeError) as caught:
+        provisioner.ensure_subscription("user-1", endpoint)
+
+    assert str(caught.value) == "email notification setup failed"
+    assert endpoint not in str(caught.value)
+
+
+def _sns_provisioner(monkeypatch, client):
+    boto3 = ModuleType("boto3")
+
+    def build_client(service_name, *, region_name):
+        assert service_name == "sns"
+        assert region_name == "ap-southeast-2"
+        return client
+
+    boto3.client = build_client
+    monkeypatch.setitem(sys.modules, "boto3", boto3)
+    return SNSUserSubscriptionProvisioner(
+        region="ap-southeast-2", resolver=_user_topic_resolver()
+    )
+
+
+def test_per_user_publisher_uses_hashed_topic_and_has_no_shared_fallback(monkeypatch):
+    sns = FakeSNSClient(error=RuntimeError("SNS unavailable"))
+    boto3 = ModuleType("boto3")
+    boto3.client = lambda service_name, *, region_name: sns
+    monkeypatch.setitem(sys.modules, "boto3", boto3)
+    publisher = PerUserSNSNotificationPublisher(
+        region="ap-southeast-2", resolver=_user_topic_resolver()
+    )
+
+    with pytest.raises(RuntimeError, match="SNS unavailable"):
+        publisher.publish(_notification("user-1"))
+
+    assert sns.calls[0]["TopicArn"] == _user_topic_resolver().topic_arn("user-1")
+    assert len(sns.calls) == 1
 
 
 def test_sns_notification_publisher_selects_the_topic_from_user_id(monkeypatch):

@@ -165,14 +165,35 @@ storage 或 metadata 删除失败时，重试会安装新的随机 attempt token
 接好后：未登录请求自动 401，且 `sub` 会一路流到 `FileRecord.user_id`。
 **成员 B 写库时 `user_id` 必须用 `claims.sub`，不是 email。**
 
+普通查询、编辑、删除和站内通知接口继续只使用 `sub`。只有显式启用
+`NOTIFICATION_PUBLISHER=per_user` 的邮件订阅路径会额外要求 ID token 中同时存在：
+
+- 非空 `sub`；
+- 非空 `email`；
+- `email_verified=true`（布尔值或规范字符串 `"true"`）；
+- `token_use=id`。
+
+邮箱只在该次 Lambda invocation 内传给 SNS `Subscribe`，不接受前端 email 字段，
+也不写入数据库、响应、Topic 名、日志或异常文本。
+
 ### 4.4 成员 D — `NotificationPublisher`（通知投递）
 
 接口：`app/notification_client.py`，方法 `publish(notification) -> None`。
 
 作用：新文件 `complete` 时，Member D 先用 lease token 条件更新 file 为 completed，
 成功后才用 `(file_id,user_id,species)` 确定性 ID 和已存储 metadata 幂等 ensure pending
-inbox，最后调用 publisher。SAM 已将生产
-publisher 接到单一 SNS Topic；成员 E 在此之上负责前端/站内通知体验。
+inbox，最后调用 publisher。成员 E 在此之上负责前端/站内通知体验。
+
+投递模式通过 `NOTIFICATION_PUBLISHER` 明确选择：
+
+| 值 | 行为 |
+|---|---|
+| `stub` | 默认值；只保留站内 inbox，本地或未启用邮件时使用 |
+| `shared_demo` | 兼容单一演示 Topic，使用 `SNS_TOPIC_ARN` |
+| `per_user` | 使用 `SNS_USER_TOPIC_ARN_PREFIX` 和 `sha256(sub)` 路由到每用户 Topic |
+
+旧值 `sns` 仅作为既有部署的兼容别名，仍保持原来的静态 Topic/template 行为；新部署
+应使用以上三个显式值。`per_user` 发布失败时绝不回退到共享 Topic。
 
 通知数据模型见 §3.1，订阅/通知端点见 §5.8。
 
@@ -355,6 +376,20 @@ POST /notifications/subscribe
 
 - `201 {"user_id": ..., "species": ..., "subscribed": true}`（幂等，重复订阅无副作用）。
 
+在 `per_user` 模式下，服务会先从 API Gateway 已验证的 JWT claims 取得用户的
+verified email，再执行以下课程演示流程：
+
+1. Topic 名固定为 `pba-user-<sha256(sub)>`；
+2. 幂等调用 `CreateTopic`；
+3. 分页读取 `ListSubscriptionsByTopic`；
+4. 相同 email 已 pending/confirmed 时不再调用 `Subscribe`；
+5. 若 Topic 已存在其他 email subscription，返回不含任何邮箱的 `409`；
+6. 否则发起 `Protocol=email` 的确认邮件；
+7. SNS 设置成功后才写入现有 `(user_id, species)` 订阅。
+
+请求体仍然只能包含 `species`；email、`user_id` 和 Topic ARN 都会被 schema 拒绝。
+取消物种订阅只删除 `(user_id, species)`，不会删除 SNS Topic 或 email subscription。
+
 **取消订阅**
 
 ```
@@ -388,6 +423,19 @@ begin-processing 观察到 completed 时，都会从已存储 metadata（不信�
 补齐 inbox 并 publish pending；后者让 B 在不重新下载/推理的情况下恢复。没有周期
 worker/DLQ；投递为 at-least-once，SNS 成功但 delivered 更新失败时可能重复。
 订阅/取消订阅的 `species` 也会在持久化前统一映射为团队短名。
+
+### 5.9 Per-user SNS 课程演示范围
+
+该实现用于课程演示，不声称具备生产级分布式协调。明确接受以下限制：
+
+- 不处理同一用户多个首次订阅的极端并发；
+- Cognito 邮箱后来变更时不自动迁移旧 subscription；
+- SNS 与 DynamoDB 之间没有跨服务原子事务；
+- 不自动删除已无物种订阅的用户 Topic；
+- 没有租约、后台 reconciliation 或补偿 worker；
+- 通知 outbox 继续采用 at-least-once 语义，极端重试可能重复邮件。
+
+这些限制不影响站内通知按 `(user_id, species)` 隔离，也不会引入新表或新 Lambda。
 
 ---
 
