@@ -101,7 +101,9 @@ Complete local regression commands are in
 
 Before any deployment, the student must obtain approval and supply:
 
-1. An active AWS Academy session and the course-approved AWS region.
+1. Access to the team's existing AWS account through Member A's approved,
+   non-root identity, preferably using the console's pre-authenticated
+   CloudShell for AWS CLI checks; the project region is `ap-southeast-2`.
 2. The real existing HTTP API ID and its JWT authorizer ID.
 3. Reachable HTTPS Member C inference and Member D metadata endpoint values.
 4. An approved, architecture-compatible FFmpeg Lambda layer whose executable

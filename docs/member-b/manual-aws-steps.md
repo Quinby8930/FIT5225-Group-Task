@@ -27,28 +27,36 @@ These artifacts do not prove that any cloud resource exists.
 
 ## Operations requiring the student
 
-### 1. Start an approved AWS Academy session
+### 1. Sign in to the team's existing AWS account
 
-Log in through the course portal, choose the course-approved region, and use
-the temporary credentials only through the approved AWS console/CLI mechanism.
-Never store credentials, tokens, or copied console values in repository files,
-screenshots, documentation, or shell scripts.
+Member A signs in to the existing AWS Management Console with the team's
+approved, non-root identity. Prefer AWS CloudShell for AWS CLI inventory and
+account checks: CloudShell inherits the console session and does not require
+any access key to be shared or copied. Never create a root access key, and
+never store credentials, tokens, or copied console values in repository files,
+screenshots, documentation, shell scripts, Codex, or group chat.
 
-For a non-secret region prompt in PowerShell:
+Run the account check in CloudShell before any change:
 
-```powershell
-$CourseRegion = Read-Host 'Course-approved AWS region'
+```bash
 aws sts get-caller-identity
 ```
 
-Confirm the returned account is the intended AWS Academy account before any
-change.
+Confirm the returned account is the team's intended AWS account and use the
+project region `ap-southeast-2`. If a repository-local SAM deployment must run
+from a developer machine instead of CloudShell, Member A configures the local
+AWS CLI using the account's actual authentication method, preferably IAM
+Identity Center (`aws configure sso`) or an explicitly permission-limited IAM
+identity. This project assumes no course-managed credential workflow and never
+uses root programmatic access.
 
 ### 2. Look up the existing JWT authorizer ID
 
-```powershell
-$HttpApiId = Read-Host 'Existing HTTP API ID'
-aws apigatewayv2 get-authorizers --api-id $HttpApiId --region $CourseRegion
+```bash
+read -r -p 'Existing HTTP API ID: ' HTTP_API_ID
+aws apigatewayv2 get-authorizers \
+  --api-id "$HTTP_API_ID" \
+  --region ap-southeast-2
 ```
 
 Record only the authorizer ID in the deployment interaction. Verify that it is
