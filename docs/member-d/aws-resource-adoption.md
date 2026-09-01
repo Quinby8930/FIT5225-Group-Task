@@ -199,21 +199,45 @@ python -m pytest \
 unmanaged，并严格核对真实 Role ARN、API ID、authorizer ID、integration ID、function 和
 16 条 Route。它只调用只读 AWS API，并只写净化后的本地 snapshot：
 
-```bash
-python infrastructure/member-d/import/prepare_import.py audit \
-  --region "$AWS_REGION" \
-  --stack "$SOURCE_STACK" \
-  --api "$API_ID" \
-  --authorizer "$AUTHORIZER_ID" \
-  --integration "$INTEGRATION_ID" \
-  --function "$FUNCTION_NAME" \
-  --workdir "$WORK_DIR"
+不要在顶层 `set -e` 下裸跑 `audit`：非零退出会直接关闭当前 CloudShell 命令会话，并
+丢失本节需要保留的变量和诊断上下文。下面的条件块会捕获退出码；失败时明确输出
+`STOP`、保留当前 shell 与变量，并且不会运行 recovery report。看到 `STOP` 后不得继续
+任何后续 prepare 或 Change Set 步骤。
 
-python infrastructure/member-d/import/prepare_import.py recovery-report \
-  --region "$AWS_REGION" \
-  --source-stack "$SOURCE_STACK" \
-  --target-stack "$TARGET_STACK" \
-  --workdir "$WORK_DIR"
+```bash
+AUDIT_SUCCEEDED=false
+
+if python infrastructure/member-d/import/prepare_import.py audit \
+    --region "$AWS_REGION" \
+    --stack "$SOURCE_STACK" \
+    --api "$API_ID" \
+    --authorizer "$AUTHORIZER_ID" \
+    --integration "$INTEGRATION_ID" \
+    --function "$FUNCTION_NAME" \
+    --workdir "$WORK_DIR"
+then
+  AUDIT_SUCCEEDED=true
+else
+  AUDIT_EXIT=$?
+  printf 'STOP: read-only audit failed with exit %s; keep this shell open and do not continue.\n' \
+    "$AUDIT_EXIT" >&2
+fi
+
+if [ "$AUDIT_SUCCEEDED" = true ]
+then
+  if python infrastructure/member-d/import/prepare_import.py recovery-report \
+      --region "$AWS_REGION" \
+      --source-stack "$SOURCE_STACK" \
+      --target-stack "$TARGET_STACK" \
+      --workdir "$WORK_DIR"
+  then
+    printf 'Read-only audit and recovery report completed.\n'
+  else
+    RECOVERY_EXIT=$?
+    printf 'STOP: recovery report failed with exit %s; keep this shell open and do not continue.\n' \
+      "$RECOVERY_EXIT" >&2
+  fi
+fi
 ```
 
 报告必须把 target 分类为 `prepare`，且 source 仍是精确四资源边界；否则停止。

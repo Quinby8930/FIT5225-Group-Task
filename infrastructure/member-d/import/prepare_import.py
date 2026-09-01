@@ -652,6 +652,32 @@ def _collect_paginated_items(
         token = next_token
 
 
+def _active_stack_statuses(
+    summaries: list[Mapping[str, Any]],
+    malformed_message: str,
+) -> dict[str, str]:
+    """Validate all summaries, then ignore retained deleted history."""
+    active: dict[str, str] = {}
+    for summary in summaries:
+        if not isinstance(summary, Mapping):
+            raise AdoptionError(malformed_message)
+        name = summary.get("StackName")
+        status = summary.get("StackStatus")
+        if (
+            not isinstance(name, str)
+            or not name
+            or not isinstance(status, str)
+            or not status
+        ):
+            raise AdoptionError(malformed_message)
+        if status == "DELETE_COMPLETE":
+            continue
+        if name in active:
+            raise AdoptionError(malformed_message)
+        active[name] = status
+    return active
+
+
 def _collect_provisioned_concurrency(
     cli: AwsCli,
     config: AuditConfig,
@@ -803,27 +829,16 @@ def collect_snapshot(
         "--region",
         config.region,
     )
-    active_stacks: dict[str, str] = {}
-    for item in active_summaries:
-        stack_name = item.get("StackName")
-        stack_status = item.get("StackStatus")
-        if (
-            not isinstance(stack_name, str)
-            or not stack_name
-            or not isinstance(stack_status, str)
-            or not stack_status
-            or stack_name in active_stacks
-        ):
-            raise AdoptionError("CloudFormation stack owner evidence is malformed")
-        active_stacks[stack_name] = stack_status
+    active_stacks = _active_stack_statuses(
+        active_summaries,
+        "CloudFormation stack owner evidence is malformed",
+    )
     if active_stacks.get(config.stack) != stack_view.get("StackStatus"):
         raise AdoptionError("source stack owner evidence is incomplete")
 
     physical_owners: dict[str, set[str]] = {}
     target_resources: dict[str, dict[str, str]] = {}
-    for stack_name, stack_status in active_stacks.items():
-        if stack_status == "DELETE_COMPLETE":
-            continue
+    for stack_name in active_stacks:
         stack_resources = (
             resource_summaries
             if stack_name == config.stack
@@ -1137,20 +1152,10 @@ def collect_recovery_ownership(
         "--region",
         region,
     )
-    active: dict[str, str] = {}
-    for summary in summaries:
-        name = summary.get("StackName")
-        status = summary.get("StackStatus")
-        if (
-            not isinstance(name, str)
-            or not name
-            or not isinstance(status, str)
-            or not status
-            or name in active
-        ):
-            raise AdoptionError("recovery stack evidence is malformed")
-        if status != "DELETE_COMPLETE":
-            active[name] = status
+    active = _active_stack_statuses(
+        summaries,
+        "recovery stack evidence is malformed",
+    )
     owners_by_physical_id: dict[str, set[str]] = {}
     source_resources: dict[str, dict[str, str]] = {}
     target_resources: dict[str, dict[str, str]] = {}

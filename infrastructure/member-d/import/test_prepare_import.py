@@ -32,6 +32,7 @@ from prepare_import import (
     AuditConfig,
     AwsCli,
     backup_function_package,
+    collect_recovery_ownership,
     collect_snapshot,
     run_prepare,
     run_audit,
@@ -2013,6 +2014,207 @@ def test_query_adoption_owner_evidence_records_exact_unmanaged_mapping(
     assert snapshot["import_owners"] == {
         logical_id: None for logical_id in _EXPECTED_IMPORT_RESOURCES
     }
+
+
+_SOURCE_STACK_SUMMARY = {
+    "StackName": "PacificBioArchive-Database",
+    "StackStatus": "UPDATE_ROLLBACK_COMPLETE",
+}
+_MEDIA_ACTIVE_SUMMARY = {
+    "StackName": "PacificBioArchive-Media",
+    "StackStatus": "CREATE_COMPLETE",
+}
+_MEDIA_DELETED_SUMMARY = {
+    "StackName": "PacificBioArchive-Media",
+    "StackStatus": "DELETE_COMPLETE",
+}
+
+
+class StackHistoryCli(FakeAwsCli):
+    """Return complete ListStacks history without inventing media owners."""
+
+    def __init__(self, summaries):
+        super().__init__()
+        self.summaries = deepcopy(summaries)
+
+    def json(self, *args):
+        if args[:2] == ("cloudformation", "list-stacks"):
+            self.calls.append(args)
+            return {"StackSummaries": deepcopy(self.summaries)}
+        if (
+            args[:2] == ("cloudformation", "list-stack-resources")
+            and "--stack-name" in args
+            and args[args.index("--stack-name") + 1]
+            == "PacificBioArchive-Media"
+        ):
+            self.calls.append(args)
+            return {"StackResourceSummaries": []}
+        return super().json(*args)
+
+
+@pytest.mark.parametrize(
+    "summaries",
+    [
+        [
+            _SOURCE_STACK_SUMMARY,
+            _MEDIA_ACTIVE_SUMMARY,
+            _MEDIA_DELETED_SUMMARY,
+        ],
+        [
+            _SOURCE_STACK_SUMMARY,
+            _MEDIA_DELETED_SUMMARY,
+            _MEDIA_ACTIVE_SUMMARY,
+        ],
+        [
+            _SOURCE_STACK_SUMMARY,
+            _MEDIA_DELETED_SUMMARY,
+            _MEDIA_ACTIVE_SUMMARY,
+            _MEDIA_DELETED_SUMMARY,
+        ],
+    ],
+    ids=(
+        "active-before-deleted-history",
+        "deleted-history-before-active",
+        "multiple-deleted-histories",
+    ),
+)
+def test_collection_ignores_deleted_stack_history_before_name_uniqueness(
+    tmp_path,
+    summaries,
+):
+    snapshot = collect_snapshot(
+        StackHistoryCli(summaries),
+        fixture_config(tmp_path),
+    )
+
+    assert snapshot["target_stack"] == {
+        "name": "PacificBioArchive-QueryAdoption",
+        "status": None,
+        "resources": {},
+    }
+    assert set(snapshot["import_owners"].values()) == {None}
+
+
+@pytest.mark.parametrize(
+    "summaries",
+    [
+        [
+            _SOURCE_STACK_SUMMARY,
+            _MEDIA_ACTIVE_SUMMARY,
+            _MEDIA_DELETED_SUMMARY,
+        ],
+        [
+            _SOURCE_STACK_SUMMARY,
+            _MEDIA_DELETED_SUMMARY,
+            _MEDIA_ACTIVE_SUMMARY,
+        ],
+        [
+            _SOURCE_STACK_SUMMARY,
+            _MEDIA_DELETED_SUMMARY,
+            _MEDIA_ACTIVE_SUMMARY,
+            _MEDIA_DELETED_SUMMARY,
+        ],
+    ],
+    ids=(
+        "active-before-deleted-history",
+        "deleted-history-before-active",
+        "multiple-deleted-histories",
+    ),
+)
+def test_recovery_ignores_deleted_stack_history_before_name_uniqueness(
+    summaries,
+):
+    ownership = collect_recovery_ownership(
+        StackHistoryCli(summaries),
+        "ap-southeast-2",
+        "PacificBioArchive-Database",
+        "PacificBioArchive-QueryAdoption",
+        valid_snapshot(),
+    )
+
+    assert ownership["source_stack"]["status"] == (
+        "UPDATE_ROLLBACK_COMPLETE"
+    )
+    assert ownership["target_stack"] == {
+        "name": "PacificBioArchive-QueryAdoption",
+        "status": None,
+        "resources": {},
+    }
+    assert set(ownership["import_owners"].values()) == {None}
+
+
+@pytest.mark.parametrize(
+    ("collector", "message"),
+    [
+        ("audit", "CloudFormation stack owner evidence is malformed"),
+        ("recovery", "recovery stack evidence is malformed"),
+    ],
+)
+def test_stack_owner_collection_rejects_duplicate_active_stack_names(
+    tmp_path,
+    collector,
+    message,
+):
+    cli = StackHistoryCli(
+        [
+            _SOURCE_STACK_SUMMARY,
+            _MEDIA_ACTIVE_SUMMARY,
+            {
+                "StackName": "PacificBioArchive-Media",
+                "StackStatus": "UPDATE_COMPLETE",
+            },
+        ]
+    )
+
+    with pytest.raises(AdoptionError, match=message):
+        if collector == "audit":
+            collect_snapshot(cli, fixture_config(tmp_path))
+        else:
+            collect_recovery_ownership(
+                cli,
+                "ap-southeast-2",
+                "PacificBioArchive-Database",
+                "PacificBioArchive-QueryAdoption",
+                valid_snapshot(),
+            )
+
+
+@pytest.mark.parametrize(
+    "malformed_summary",
+    [
+        {"StackStatus": "DELETE_COMPLETE"},
+        {"StackName": "PacificBioArchive-Media"},
+        "not-a-stack-summary",
+    ],
+    ids=("missing-name", "missing-status", "non-mapping"),
+)
+@pytest.mark.parametrize(
+    "collector",
+    [
+        "audit",
+        "recovery",
+    ],
+)
+def test_stack_owner_collection_validates_every_summary_before_filtering(
+    tmp_path,
+    malformed_summary,
+    collector,
+):
+    cli = StackHistoryCli(
+        [_SOURCE_STACK_SUMMARY, malformed_summary]
+    )
+
+    with pytest.raises(AdoptionError, match="malformed"):
+        if collector == "audit":
+            collect_snapshot(cli, fixture_config(tmp_path))
+        else:
+            collect_recovery_ownership(
+                cli,
+                "ap-southeast-2",
+                "PacificBioArchive-Database",
+                "PacificBioArchive-QueryAdoption",
+                valid_snapshot(),
+            )
 
 
 @pytest.mark.parametrize(
