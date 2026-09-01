@@ -131,6 +131,8 @@ test "$SOURCE_STACK" != "$TARGET_STACK"
 test "$APPROVED_COMMIT" != '<eventual-approved-full-commit-sha>'
 test "$ARTIFACT_BUCKET" != '<approved-private-versioned-artifact-bucket>'
 test -n "$APPROVED_COMMIT" && test -n "$ARTIFACT_BUCKET"
+test "${#APPROVED_COMMIT}" -eq 40
+printf '%s' "$APPROVED_COMMIT" | grep -Eq '^[0-9a-f]{40}$'
 ```
 
 ### 4.2 从全新 checkout 绑定获批 commit
@@ -146,8 +148,8 @@ cd FIT5225-Group-Task-query-adoption-preview
 git fetch --prune origin
 git checkout --detach "$APPROVED_COMMIT"
 test "$(git rev-parse HEAD)" = "$APPROVED_COMMIT"
-git diff --quiet
-git diff --cached --quiet
+test -z "$(git status --porcelain=v1 --untracked-files=all)"
+test -z "$(git ls-files --others --ignored --exclude-standard)"
 ```
 
 ### 4.3 只读核对调用者、区域和当前所有权
@@ -180,18 +182,46 @@ test -z "$TARGET_STATUS" || test "$TARGET_STATUS" = "None"
 unset TARGET_STATUS
 ```
 
-### 4.4 运行本地 Member D 测试
+### 4.4 核对外部完整测试证据；CloudShell 不运行测试
+
+本方案选择“完整测试证据绑定精确 commit SHA”，不使用 CloudShell 作为测试环境。AWS
+说明 CloudShell 会持续更新预装软件，且只承诺 Python 3、Git 等工具可用，不承诺固定的
+Python 3.12 或预装 pytest（[CloudShell 软件规格][cloudshell-software]）。因此不得在
+CloudShell 运行 pytest、`pip install`、创建 venv、修改系统 Python，或把 CloudShell 的
+Python 版本当成 Lambda 运行时测试证据。
+
+在打开 CloudShell **之前**，批准人必须保存由受控本地环境或 CI 生成的完整测试记录。
+记录至少包含：
+
+- `git rev-parse HEAD` 输出的完整 40 位 SHA，且精确等于 `APPROVED_COMMIT`；
+- 测试开始时 clean worktree 的证明；
+- Python、Node/npm 版本，以及 `backend/lambdas/query/requirements.txt`、
+  `infrastructure/member-d/import/member-d-query-build.lock.json` 和
+  `frontend/package-lock.json` 的 SHA-256；
+- 完整测试/构建命令、退出码和未截断结果；
+- 证据生成时间与保存位置。
+
+当前要求保存的完整命令集合如下；它们只在受控本地/CI checkout 中执行，不得复制到
+CloudShell：
 
 ```bash
-python -m pytest \
-  backend/lambdas/query/tests \
-  infrastructure/member-d/import/test_adoption.py \
-  infrastructure/member-d/import/test_prepare_import.py \
+(cd backend/ml-inference && python -m pytest -q -p no:cacheprovider)
+(cd backend/lambdas/query && python -m pytest -q -p no:cacheprovider)
+(cd backend/lambdas/media-processing && python -m pytest -q -p no:cacheprovider)
+python -m pytest -q -p no:cacheprovider infrastructure/member-b/test_template.py
+python -m pytest -q -p no:cacheprovider \
   infrastructure/member-d/test_template.py \
-  -q -p no:cacheprovider
+  infrastructure/member-d/import/test_adoption.py \
+  infrastructure/member-d/import/test_prepare_import.py
+npm --prefix frontend test
+npm --prefix frontend run build
 ```
 
-测试不全绿则停止。测试通过只是本地 validator 证据，不等于 AWS 服务可行性证明。
+GitHub 也明确建议用 commit ID（而非会移动的分支名）固定文件版本
+（[GitHub permanent links][github-permalinks]）。证据不存在、SHA 不是完整 40 位、
+证据 SHA 与 `APPROVED_COMMIT` 不同，或任一测试/构建失败时，明确 **STOP**；不得进入
+CloudShell audit。CloudShell 的 §4.2 只证明当前 checkout 与已批准证据 SHA 相同且干净，
+不会重新证明测试通过。
 
 ### 4.5 新鲜 audit 和所有权恢复报告
 
@@ -207,13 +237,18 @@ unmanaged，并严格核对真实 Role ARN、API ID、authorizer ID、integratio
 ```bash
 AUDIT_SUCCEEDED=false
 
-if python infrastructure/member-d/import/prepare_import.py audit \
+if ! command -v python3 >/dev/null 2>&1 || \
+   ! python3 -B -S -c 'import sys; raise SystemExit(0 if sys.version_info >= (3, 10) else 1)'
+then
+  printf 'STOP: Python 3.10+ is unavailable; do not install packages in CloudShell.\n' >&2
+elif python3 -B -S infrastructure/member-d/import/prepare_import.py audit \
     --region "$AWS_REGION" \
     --stack "$SOURCE_STACK" \
     --api "$API_ID" \
     --authorizer "$AUTHORIZER_ID" \
     --integration "$INTEGRATION_ID" \
     --function "$FUNCTION_NAME" \
+    --expected-commit "$APPROVED_COMMIT" \
     --workdir "$WORK_DIR"
 then
   AUDIT_SUCCEEDED=true
@@ -225,7 +260,7 @@ fi
 
 if [ "$AUDIT_SUCCEEDED" = true ]
 then
-  if python infrastructure/member-d/import/prepare_import.py recovery-report \
+  if python3 -B -S infrastructure/member-d/import/prepare_import.py recovery-report \
       --region "$AWS_REGION" \
       --source-stack "$SOURCE_STACK" \
       --target-stack "$TARGET_STACK" \
@@ -240,6 +275,12 @@ then
 fi
 ```
 
+`audit` 的启动路径只依赖 Python 标准库、仓库源码、Git 和已预装的 AWS CLI；它读取
+CloudFormation 的 `Processed` template，而 AWS 明确规定 processed template 即使源模板
+是 YAML 也会格式化为 JSON（[Processed template][processed-template]）。PyYAML 仅在后续
+prepare/validator 确实解析 YAML 时延迟加载。任何缺失工具、SHA/clean-tree 不匹配或非零
+退出都必须按上面的 `STOP` 处理，不得临时安装依赖后绕过门禁。
+
 报告必须把 target 分类为 `prepare`，且 source 仍是精确四资源边界；否则停止。
 
 ### 4.6 新鲜 prepare（未来单独获批的 AWS 写操作）
@@ -247,6 +288,10 @@ fi
 `prepare` 会再次采集完整只读证据，然后把当前 Query Lambda zip 以内容寻址方式上传到
 已批准、私有、加密且启用版本的 artifact bucket。这个 versioned Lambda backup 会执行
 `s3:PutObject`，因此 **prepare 本身也必须先取得 AWS 写批准**；当前批准不包含它。
+
+§4.6 及之后的命令是未来流程参考，不属于本次 CloudShell 只读路径。未来若获写批准，
+还必须先单独批准一个与 Lambda `python3.12` 和哈希锁一致的受控执行环境；不得在
+CloudShell 的系统 Python 中临时安装 PyYAML、pytest 或 query requirements 后继续。
 
 ```bash
 # FUTURE WRITE — 仅在 prepare 获得独立批准后运行。
@@ -478,3 +523,7 @@ Stack，源 4 项、Lambda、API/authorizer、integration 和 16 条 Route 必�
 - core database template：[`../../infrastructure/member-d/dynamodb.yaml`](../../infrastructure/member-d/dynamodb.yaml)
 - Query normal-UPDATE template：[`../../infrastructure/member-d/query-adoption.yaml`](../../infrastructure/member-d/query-adoption.yaml)
 - adoption 工具：[`../../infrastructure/member-d/import/prepare_import.py`](../../infrastructure/member-d/import/prepare_import.py)
+
+[cloudshell-software]: https://docs.aws.amazon.com/cloudshell/latest/userguide/vm-specs.html
+[github-permalinks]: https://docs.github.com/en/repositories/working-with-files/using-files/getting-permanent-links-to-files
+[processed-template]: https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/template-macros-troubleshoot-processed-template.html

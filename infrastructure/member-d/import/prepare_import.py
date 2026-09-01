@@ -15,7 +15,6 @@ import re
 import stat
 import subprocess
 import time
-import yaml
 from copy import deepcopy
 from functools import wraps
 from urllib.parse import unquote
@@ -165,10 +164,6 @@ _HARDENING_FUNCTION_FIELDS = (
 )
 
 
-class _CloudFormationLoader(yaml.SafeLoader):
-    """Load CloudFormation short-form intrinsic tags without executing code."""
-
-
 _INTRINSIC_NAMES = {
     "And": "Fn::And",
     "Base64": "Fn::Base64",
@@ -191,34 +186,49 @@ _INTRINSIC_NAMES = {
 }
 
 
-def _construct_cloudformation_intrinsic(
-    loader: yaml.SafeLoader,
-    tag_suffix: str,
-    node: yaml.Node,
-) -> dict[str, Any]:
-    if isinstance(node, yaml.ScalarNode):
-        value = loader.construct_scalar(node)
-        if tag_suffix == "GetAtt":
-            logical_id, separator, attribute = value.partition(".")
-            if not separator or not logical_id or not attribute:
-                raise yaml.constructor.ConstructorError(
-                    None,
-                    None,
-                    "!GetAtt scalar must use Resource.Attribute form",
-                    node.start_mark,
-                )
-            value = [logical_id, attribute]
-    elif isinstance(node, yaml.SequenceNode):
-        value = loader.construct_sequence(node)
-    else:
-        value = loader.construct_mapping(node)
-    return {_INTRINSIC_NAMES.get(tag_suffix, tag_suffix): value}
+def _parse_cloudformation_yaml(value: str) -> Any:
+    """Parse YAML only on template paths that explicitly need PyYAML."""
+    try:
+        import yaml
+    except ImportError:
+        raise AdoptionError("YAML parser dependency is unavailable") from None
 
+    class CloudFormationLoader(yaml.SafeLoader):
+        """Load short-form intrinsic tags without executing code."""
 
-_CloudFormationLoader.add_multi_constructor(
-    "!",
-    _construct_cloudformation_intrinsic,
-)
+    def construct_cloudformation_intrinsic(
+        loader: Any,
+        tag_suffix: str,
+        node: Any,
+    ) -> dict[str, Any]:
+        if isinstance(node, yaml.ScalarNode):
+            parsed_value = loader.construct_scalar(node)
+            if tag_suffix == "GetAtt":
+                logical_id, separator, attribute = parsed_value.partition(".")
+                if not separator or not logical_id or not attribute:
+                    raise yaml.constructor.ConstructorError(
+                        None,
+                        None,
+                        "!GetAtt scalar must use Resource.Attribute form",
+                        node.start_mark,
+                    )
+                parsed_value = [logical_id, attribute]
+        elif isinstance(node, yaml.SequenceNode):
+            parsed_value = loader.construct_sequence(node)
+        else:
+            parsed_value = loader.construct_mapping(node)
+        return {_INTRINSIC_NAMES.get(tag_suffix, tag_suffix): parsed_value}
+
+    CloudFormationLoader.add_multi_constructor(
+        "!",
+        construct_cloudformation_intrinsic,
+    )
+    try:
+        return yaml.load(value, Loader=CloudFormationLoader)
+    except yaml.YAMLError:
+        raise AdoptionError(
+            "processed template is not valid JSON or YAML"
+        ) from None
 
 
 def _parse_processed_template(value: Any) -> Mapping[str, Any]:
@@ -228,12 +238,7 @@ def _parse_processed_template(value: Any) -> Mapping[str, Any]:
         try:
             parsed = json.loads(value)
         except json.JSONDecodeError:
-            try:
-                parsed = yaml.load(value, Loader=_CloudFormationLoader)
-            except yaml.YAMLError:
-                raise AdoptionError(
-                    "processed template is not valid JSON or YAML"
-                ) from None
+            parsed = _parse_cloudformation_yaml(value)
         if isinstance(parsed, Mapping):
             return parsed
     raise AdoptionError("processed template is unavailable")
@@ -1427,6 +1432,82 @@ def _regular_files(root: Path, description: str) -> dict[str, Path]:
     return result
 
 
+def verify_repository_identity(source: Path, expected_commit: str) -> None:
+    """Require one clean repository at the approved full commit before audit."""
+    if not re.fullmatch(r"[0-9a-f]{40}", expected_commit):
+        raise AdoptionError("approved commit is malformed")
+    try:
+        resolved = source.resolve()
+        repository = Path(
+            subprocess.run(
+                [
+                    "git",
+                    "-C",
+                    str(resolved.parent),
+                    "rev-parse",
+                    "--show-toplevel",
+                ],
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout.strip()
+        ).resolve()
+        relative = resolved.relative_to(repository).as_posix()
+        head = subprocess.run(
+            ["git", "-C", str(repository), "rev-parse", "HEAD"],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        status = subprocess.run(
+            [
+                "git",
+                "-C",
+                str(repository),
+                "status",
+                "--porcelain=v1",
+                "--untracked-files=all",
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout
+        ignored = subprocess.run(
+            [
+                "git",
+                "-C",
+                str(repository),
+                "ls-files",
+                "--others",
+                "--ignored",
+                "--exclude-standard",
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout
+        subprocess.run(
+            [
+                "git",
+                "-C",
+                str(repository),
+                "ls-files",
+                "--error-unmatch",
+                "--",
+                relative,
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+    except (OSError, subprocess.SubprocessError, ValueError):
+        raise AdoptionError("repository identity cannot be verified") from None
+    if head != expected_commit or status or ignored:
+        raise AdoptionError(
+            "repository differs from the approved commit or has a dirty worktree"
+        )
+
+
 def _git_tracked_source_files(
     source: Path, expected_commit: str
 ) -> dict[str, Path]:
@@ -1944,6 +2025,8 @@ def _parser() -> argparse.ArgumentParser:
             command.add_argument(f"--{argument}", required=True)
         command.add_argument("--workdir", default=".work")
         command.add_argument("--baseline")
+        if name == "audit":
+            command.add_argument("--expected-commit", required=True)
         if name == "prepare":
             command.add_argument("--artifact-bucket", required=True)
     for verifier_name in ("verify-post-import", "verify-update-rollback"):
@@ -2035,6 +2118,8 @@ def _read_json_file(path: Path, description: str) -> Any:
 
 def main(argv: list[str] | None = None) -> int:
     args = _parser().parse_args(argv)
+    if args.command == "audit":
+        verify_repository_identity(Path(__file__), args.expected_commit)
     cli = AwsCli()
     if args.command in {"verify-post-import", "verify-update-rollback"}:
         validate_stack_names(args.source_stack, args.target_stack)

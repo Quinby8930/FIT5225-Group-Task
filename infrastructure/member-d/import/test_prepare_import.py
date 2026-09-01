@@ -62,6 +62,109 @@ _FIXTURE_ARTIFACT_KEY = (
 _EXPECTED_COMMIT = "a" * 40
 
 
+def _create_clean_git_repository(tmp_path):
+    repository = tmp_path / "repository"
+    repository.mkdir()
+    tracked = repository / "tracked.py"
+    tracked.write_text("print('audited')\n", encoding="utf-8")
+    (repository / ".gitignore").write_text("ignored.txt\n", encoding="utf-8")
+    for command in (
+        ["git", "init"],
+        ["git", "config", "user.name", "Member D Tests"],
+        ["git", "config", "user.email", "member-d@example.invalid"],
+        ["git", "add", "tracked.py", ".gitignore"],
+        ["git", "commit", "-m", "test fixture"],
+    ):
+        subprocess.run(
+            command,
+            cwd=repository,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+    commit = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=repository,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    return repository, tracked, commit
+
+
+def test_audit_cli_help_starts_without_third_party_site_packages():
+    script = Path(__file__).with_name("prepare_import.py")
+    result = subprocess.run(
+        [sys.executable, "-B", "-S", str(script), "audit", "--help"],
+        check=False,
+        capture_output=True,
+        text=True,
+        env=os.environ.copy(),
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "--expected-commit" in result.stdout
+
+
+def test_repository_identity_accepts_only_clean_full_head(tmp_path):
+    import prepare_import
+
+    _repository, tracked, commit = _create_clean_git_repository(tmp_path)
+
+    assert prepare_import.verify_repository_identity(tracked, commit) is None
+
+
+@pytest.mark.parametrize("dirty_kind", ["tracked", "untracked", "ignored"])
+def test_repository_identity_rejects_dirty_worktree(tmp_path, dirty_kind):
+    import prepare_import
+
+    repository, tracked, commit = _create_clean_git_repository(tmp_path)
+    if dirty_kind == "tracked":
+        tracked.write_text("print('changed')\n", encoding="utf-8")
+    elif dirty_kind == "untracked":
+        (repository / "untracked.txt").write_text("unexpected\n", encoding="utf-8")
+    else:
+        (repository / "ignored.txt").write_text("unexpected\n", encoding="utf-8")
+
+    with pytest.raises(AdoptionError, match="approved commit|worktree|repository"):
+        prepare_import.verify_repository_identity(tracked, commit)
+
+
+@pytest.mark.parametrize("expected_commit", ["a" * 7, "b" * 40])
+def test_repository_identity_rejects_short_or_different_commit(
+    tmp_path,
+    expected_commit,
+):
+    import prepare_import
+
+    _repository, tracked, _commit = _create_clean_git_repository(tmp_path)
+
+    with pytest.raises(AdoptionError, match="commit|repository"):
+        prepare_import.verify_repository_identity(tracked, expected_commit)
+
+
+def test_audit_rejects_commit_mismatch_before_aws_client(monkeypatch):
+    import prepare_import
+
+    class ForbiddenAwsCli:
+        def __init__(self):
+            raise AssertionError("AWS client must not be constructed")
+
+    monkeypatch.setattr(prepare_import, "AwsCli", ForbiddenAwsCli)
+
+    with pytest.raises(AdoptionError, match="approved commit|repository"):
+        prepare_import.main([
+            "audit",
+            "--region", "ap-southeast-2",
+            "--stack", "PacificBioArchive-Database",
+            "--api", "2dd2aqb32j",
+            "--authorizer", "7ir7fs",
+            "--integration", "fbjojun",
+            "--function", "PacificBioArchive-QueryLambda",
+            "--expected-commit", "b" * 40,
+        ])
+
+
 def test_aws_cli_json_accepts_successful_empty_response(monkeypatch):
     def successful_empty_run(command, **_kwargs):
         return subprocess.CompletedProcess(
