@@ -802,7 +802,6 @@ def _function_properties(function: Mapping[str, Any], artifact: CodeArtifact) ->
 def build_import_template(snapshot: Mapping[str, Any], artifact: CodeArtifact) -> dict[str, Any]:
     validate_snapshot(snapshot)
     _require(all((artifact.bucket, artifact.key, artifact.version_id)), "artifact is incomplete")
-    _require("InternalApiKey" in _stack_parameter_names(snapshot["stack"]), "InternalApiKey is not an existing stack parameter")
     template = deepcopy(snapshot["stack"]["template"])
     template.setdefault("Parameters", {})["InternalApiKey"] = {"Type": "String", "NoEcho": True, "MinLength": 1}
     resources = template.setdefault("Resources", {})
@@ -834,7 +833,6 @@ def build_import_template(snapshot: Mapping[str, Any], artifact: CodeArtifact) -
 def build_parameters_to_reuse(snapshot: Mapping[str, Any]) -> list[dict[str, Any]]:
     validate_snapshot(snapshot)
     names = _stack_parameter_names(snapshot["stack"])
-    _require("InternalApiKey" in names, "InternalApiKey is not an existing stack parameter")
     return [{"ParameterKey": name, "UsePreviousValue": True} for name in sorted(names)]
 
 
@@ -1479,15 +1477,28 @@ def validate_import_artifacts(
         )
         expected_keys.add(item["ParameterKey"])
     actual = _change_set_parameter_map(change_set_parameters)
+    internal_key_already_exists = "InternalApiKey" in expected_keys
+    actual_keys = (
+        expected_keys
+        if internal_key_already_exists
+        else expected_keys | {"InternalApiKey"}
+    )
     _require(
-        set(actual) == expected_keys
+        set(actual) == actual_keys
         and all(
-            item.get("UsePreviousValue") is True
-            and "ParameterValue" not in item
-            for item in actual.values()
+            actual[name].get("UsePreviousValue") is True
+            and "ParameterValue" not in actual[name]
+            for name in expected_keys
         ),
         "IMPORT must reuse every existing parameter without a value override",
     )
+    if not internal_key_already_exists:
+        internal_key = actual["InternalApiKey"]
+        _require(
+            "ParameterValue" in internal_key
+            and internal_key.get("UsePreviousValue") in (None, False),
+            "missing InternalApiKey must be supplied through the NoEcho console parameter",
+        )
     return artifact
 
 

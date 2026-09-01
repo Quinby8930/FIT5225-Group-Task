@@ -939,11 +939,44 @@ def test_import_parameters_reuse_existing_internal_key_without_reading_it():
     assert all("ParameterValue" not in item for item in parameters)
 
 
-def test_template_refuses_missing_existing_internal_key_parameter():
+def test_import_template_adds_noecho_internal_key_when_stack_parameter_is_missing():
     snapshot = valid_snapshot()
     snapshot["stack"]["parameters"] = []
-    with pytest.raises(AdoptionError, match="InternalApiKey"):
-        build_import_template(snapshot, CodeArtifact("private-artifacts", "backups/code.zip", "version-1"))
+
+    template = build_import_template(
+        snapshot,
+        CodeArtifact(
+            "private-artifacts",
+            "backups/code.zip",
+            "version-1",
+        ),
+    )
+
+    assert template["Parameters"]["InternalApiKey"] == {
+        "Type": "String",
+        "NoEcho": True,
+        "MinLength": 1,
+    }
+
+
+def test_missing_internal_key_keeps_role_template_and_parameter_file_secret_free():
+    snapshot = valid_snapshot()
+    snapshot["stack"]["parameters"] = []
+    original_role = deepcopy(
+        snapshot["stack"]["template"]["Resources"]["QueryLambdaRole"]
+    )
+
+    template = build_import_template(
+        snapshot,
+        CodeArtifact(
+            "private-artifacts",
+            "backups/code.zip",
+            "version-1",
+        ),
+    )
+
+    assert template["Resources"]["QueryLambdaRole"] == original_role
+    assert build_parameters_to_reuse(snapshot) == []
 
 
 def test_post_import_baseline_allows_expected_managed_resource_ownership_only():
@@ -954,6 +987,25 @@ def test_post_import_baseline_allows_expected_managed_resource_ownership_only():
     after["stack"]["managed"]["ReservationsTable"] = "PacificBioArchiveUploadReservations"
     for logical_id, route in zip(ROUTES_BY_LOGICAL_ID, after["api"]["routes"]):
         after["stack"]["managed"][logical_id] = route["RouteId"]
+    assert_runtime_unchanged(before, after)
+
+
+def test_post_import_baseline_allows_only_the_new_noecho_parameter_registration():
+    before = valid_snapshot()
+    before["stack"]["parameters"] = []
+    after = deepcopy(before)
+    after["stack"]["parameters"] = ["InternalApiKey"]
+    after["stack"]["managed"].update({
+        "QueryFunction": "PacificBioArchive-QueryLambda",
+        "QueryIntegration": "fbjojun",
+        "ReservationsTable": "PacificBioArchiveUploadReservations",
+    })
+    for logical_id, route in zip(
+        ROUTES_BY_LOGICAL_ID,
+        after["api"]["routes"],
+    ):
+        after["stack"]["managed"][logical_id] = route["RouteId"]
+
     assert_runtime_unchanged(before, after)
 
 

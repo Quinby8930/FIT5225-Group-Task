@@ -2082,6 +2082,46 @@ def test_prepare_accepts_direct_code_query_and_writes_sanitized_artifacts(
     assert "X-Amz-Signature" not in captured.out + captured.err
 
 
+def test_prepare_with_missing_internal_key_writes_no_parameter_value(tmp_path):
+    class MissingInternalKeyStackCli(FakeAwsCli):
+        def json(self, *args):
+            response = super().json(*args)
+            if args[:2] == ("cloudformation", "describe-stacks"):
+                response = deepcopy(response)
+                response["Stacks"][0]["Parameters"] = []
+            return response
+
+    package = lambda_zip_bytes()
+    digest = base64.b64encode(hashlib.sha256(package).digest()).decode()
+    cli = MissingInternalKeyStackCli(
+        uploaded_checksum=digest,
+        code_sha=digest,
+    )
+
+    artifact_paths = run_prepare(
+        cli,
+        fixture_config(tmp_path),
+        "private-artifacts",
+        lambda _url, destination: destination.write_bytes(package),
+    )
+
+    assert json.loads(
+        (tmp_path / "import-parameters.json").read_text(encoding="utf-8")
+    ) == []
+    template = json.loads(
+        (tmp_path / "import-template.json").read_text(encoding="utf-8")
+    )
+    assert template["Parameters"]["InternalApiKey"] == {
+        "Type": "String",
+        "NoEcho": True,
+        "MinLength": 1,
+    }
+    assert all(
+        "internal-secret" not in path.read_text(encoding="utf-8")
+        for path in artifact_paths
+    )
+
+
 def test_audit_exception_never_interpolates_secret_or_presigned_url(tmp_path):
     class SecretFailingCli(FakeAwsCli):
         def json(self, *args):
@@ -2523,6 +2563,185 @@ def test_import_artifacts_accept_exact_local_template_and_use_previous():
         snapshot,
         "private-artifacts",
     )
+
+
+def test_import_artifacts_accept_console_supplied_noecho_parameter_when_missing():
+    snapshot = valid_snapshot()
+    snapshot["stack"]["parameters"] = []
+    local = build_import_template(
+        snapshot,
+        CodeArtifact(
+            "private-artifacts",
+            _FIXTURE_ARTIFACT_KEY,
+            "import-version-1",
+        ),
+    )
+
+    adoption.validate_import_artifacts(
+        deepcopy(local),
+        local,
+        [{"ParameterKey": "InternalApiKey", "ParameterValue": "*****"}],
+        [],
+        snapshot,
+        "private-artifacts",
+    )
+
+
+@pytest.mark.parametrize(
+    ("change_set_parameters", "local_parameters"),
+    [
+        ([], []),
+        (
+            [{
+                "ParameterKey": "InternalApiKey",
+                "UsePreviousValue": True,
+            }],
+            [],
+        ),
+        (
+            [{
+                "ParameterKey": "InternalApiKey",
+                "ParameterValue": "*****",
+            }],
+            [{
+                "ParameterKey": "InternalApiKey",
+                "ParameterValue": "must-not-be-written",
+            }],
+        ),
+    ],
+    ids=(
+        "console-value-missing",
+        "missing-value-cannot-use-previous",
+        "secret-cannot-enter-local-parameter-file",
+    ),
+)
+def test_missing_internal_key_rejects_unsafe_parameter_sources(
+    change_set_parameters,
+    local_parameters,
+):
+    snapshot = valid_snapshot()
+    snapshot["stack"]["parameters"] = []
+    local = build_import_template(
+        snapshot,
+        CodeArtifact(
+            "private-artifacts",
+            _FIXTURE_ARTIFACT_KEY,
+            "import-version-1",
+        ),
+    )
+
+    with pytest.raises(
+        AdoptionError,
+        match="IMPORT|parameter|NoEcho|console|previous",
+    ):
+        adoption.validate_import_artifacts(
+            deepcopy(local),
+            local,
+            change_set_parameters,
+            local_parameters,
+            snapshot,
+            "private-artifacts",
+        )
+
+
+def test_import_change_set_rejects_query_role_modify_with_missing_internal_key():
+    snapshot = valid_snapshot()
+    snapshot["stack"]["parameters"] = []
+    changes = _import_changes(snapshot)
+    changes.append({
+        "ResourceChange": {
+            "Action": "Modify",
+            "LogicalResourceId": "QueryLambdaRole",
+            "ResourceType": "AWS::IAM::Role",
+            "Replacement": "False",
+        }
+    })
+
+    with pytest.raises(AdoptionError, match="19 Import"):
+        adoption.validate_import_change_set(
+            changes,
+            build_resources_to_import(snapshot),
+        )
+
+
+def test_missing_internal_key_import_still_contains_exactly_nineteen_imports():
+    snapshot = valid_snapshot()
+    snapshot["stack"]["parameters"] = []
+    expected = build_resources_to_import(snapshot)
+    changes = _import_changes(snapshot)
+
+    adoption.validate_import_change_set(changes, expected)
+
+    assert len(changes) == 19
+    assert all(
+        change["ResourceChange"]["Action"] == "Import"
+        for change in changes
+    )
+    assert all(
+        change["ResourceChange"]["LogicalResourceId"]
+        != "QueryLambdaRole"
+        for change in changes
+    )
+
+
+def test_console_supplied_internal_key_is_never_written_or_logged(
+    tmp_path,
+    monkeypatch,
+    capsys,
+):
+    import prepare_import
+
+    workdir = tmp_path / "missing-key-import"
+    files = _write_change_set_validation_files(workdir)
+    snapshot = files["snapshot"]
+    snapshot["stack"]["parameters"] = []
+    files["snapshot"] = snapshot
+    local = build_import_template(
+        snapshot,
+        CodeArtifact(
+            "private-artifacts",
+            _FIXTURE_ARTIFACT_KEY,
+            "import-version-1",
+        ),
+    )
+    (workdir / "sanitized-snapshot.json").write_text(
+        json.dumps(_json_safe_snapshot(snapshot)),
+        encoding="utf-8",
+    )
+    (workdir / "import-template.json").write_text(
+        json.dumps(local),
+        encoding="utf-8",
+    )
+    (workdir / "import-parameters.json").write_text(
+        "[]",
+        encoding="utf-8",
+    )
+    console_secret = "console-secret-must-never-leak"
+    cli = CandidateChangeSetCli(
+        change_set_type="IMPORT",
+        changes=_import_changes(snapshot),
+        parameters=[{
+            "ParameterKey": "InternalApiKey",
+            "ParameterValue": console_secret,
+        }],
+        processed=local,
+    )
+    monkeypatch.setattr(prepare_import, "AwsCli", lambda: cli)
+    _use_stored_snapshot_as_fresh(monkeypatch, prepare_import, files)
+    monkeypatch.setenv("INTERNAL_API_KEY", "environment-secret-must-be-ignored")
+
+    assert prepare_import.main(
+        _validate_change_set_args(workdir, "IMPORT")
+    ) == 0
+
+    captured = capsys.readouterr()
+    assert console_secret not in captured.out + captured.err
+    assert "environment-secret-must-be-ignored" not in captured.out + captured.err
+    for path in workdir.iterdir():
+        if path.is_file():
+            contents = path.read_bytes()
+            assert console_secret.encode() not in contents
+            assert b"environment-secret-must-be-ignored" not in contents
 
 
 @pytest.mark.parametrize("section", ["Parameters", "Outputs"])
