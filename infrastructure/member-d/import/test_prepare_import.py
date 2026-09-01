@@ -46,7 +46,9 @@ from test_adoption import (
     _route_scoped_lambda_policy,
     _update_processed,
     approved_role_drift_snapshot,
+    import_preview_snapshot,
     post_import_snapshot,
+    update_rollback_snapshot,
     valid_snapshot,
 )
 
@@ -604,7 +606,11 @@ def _write_change_set_validation_files(workdir):
     workdir.mkdir(parents=True, exist_ok=True)
     _write_built_code(workdir / "built-code")
     _write_source_code(workdir / "source-code")
-    snapshot = approved_role_drift_snapshot()
+    snapshot = collect_snapshot(
+        ApprovedRoleDriftCli(),
+        fixture_config(workdir),
+        ownership_phase="pre",
+    )
     import_template = build_import_template(
         snapshot,
         CodeArtifact(
@@ -640,7 +646,22 @@ def _write_change_set_validation_files(workdir):
         json.dumps(_json_safe_snapshot(snapshot)),
         encoding="utf-8",
     )
-    imported = post_import_snapshot()
+    imported = deepcopy(snapshot)
+    imported["import_owners"] = {
+        logical_id: "PacificBioArchive-QueryAdoption"
+        for logical_id in imported["import_owners"]
+    }
+    imported["target_stack"] = {
+        "name": "PacificBioArchive-QueryAdoption",
+        "status": "IMPORT_COMPLETE",
+        "resources": adoption.expected_imported_physical_ids(imported),
+    }
+    preview = deepcopy(snapshot)
+    preview["target_stack"] = {
+        "name": "PacificBioArchive-QueryAdoption",
+        "status": "REVIEW_IN_PROGRESS",
+        "resources": {},
+    }
     (workdir / "post-import-evidence.json").write_text(
         json.dumps(_json_safe_snapshot(imported)),
         encoding="utf-8",
@@ -664,6 +685,7 @@ def _write_change_set_validation_files(workdir):
     return {
         "snapshot": snapshot,
         "post_import": imported,
+        "preview": preview,
         "import_template": import_template,
         "import_parameters": import_parameters,
         "packaged": packaged,
@@ -675,10 +697,20 @@ def _write_change_set_validation_files(workdir):
 
 
 def _use_stored_snapshot_as_fresh(monkeypatch, prepare_import, files):
+    def recollect(_cli, _config, *, ownership_phase="pre"):
+        return deepcopy(
+            {
+                "pre": files["snapshot"],
+                "preview": files["preview"],
+                "post": files["post_import"],
+                "update-rollback": update_rollback_snapshot(),
+            }[ownership_phase]
+        )
+
     monkeypatch.setattr(
         prepare_import,
         "collect_snapshot",
-        lambda _cli, _config: deepcopy(files["snapshot"]),
+        recollect,
     )
 
 
@@ -888,7 +920,7 @@ def _validate_change_set_args(
         (
             "UPDATE_ROLLBACK_COMPLETE",
             _EXPECTED_IMPORT_RESOURCES,
-            "verify-runtime-and-ownership",
+            "verify-update-rollback",
             False,
         ),
         (
@@ -1780,6 +1812,36 @@ class ApprovedRoleDriftCli(FakeAwsCli):
                     approved_role_drift_snapshot()["stack"]["template"]
                 )
             }
+        return super().json(*args)
+
+
+class PreviewCandidateChangeSetCli(
+    CandidateChangeSetCli,
+    ApprovedRoleDriftCli,
+):
+    """Mirror a real IMPORT preview: source plus an empty REVIEW shell."""
+
+    def json(self, *args):
+        if args[:2] == ("cloudformation", "list-stacks"):
+            self.calls.append(args)
+            return {
+                "StackSummaries": [
+                    {
+                        "StackName": "PacificBioArchive-Database",
+                        "StackStatus": "UPDATE_ROLLBACK_COMPLETE",
+                    },
+                    {
+                        "StackName": "PacificBioArchive-QueryAdoption",
+                        "StackStatus": "REVIEW_IN_PROGRESS",
+                    },
+                ]
+            }
+        if (
+            args[:2] == ("cloudformation", "list-stack-resources")
+            and "PacificBioArchive-QueryAdoption" in args
+        ):
+            self.calls.append(args)
+            return {"StackResourceSummaries": []}
         return super().json(*args)
 
 
@@ -3174,7 +3236,7 @@ def test_import_rejects_console_supplied_internal_key_without_logging_it(
     files = _write_change_set_validation_files(workdir)
     snapshot = files["snapshot"]
     snapshot["stack"]["parameters"] = []
-    snapshot["stack"]["template"].pop("Parameters")
+    snapshot["stack"]["template"].pop("Parameters", None)
     files["snapshot"] = snapshot
     local = build_import_template(
         snapshot,
@@ -3350,15 +3412,190 @@ def test_update_change_set_main_binds_local_packaged_template_and_cli_values(
     )
     monkeypatch.setattr(prepare_import, "AwsCli", lambda: cli)
     _use_packaged_update_artifact(monkeypatch, prepare_import, files)
-    monkeypatch.setattr(
-        prepare_import,
-        "collect_snapshot",
-        lambda _cli, _config: deepcopy(files["snapshot"]),
-    )
+    recollections = []
+
+    def recollect(_cli, config, *, ownership_phase="pre"):
+        recollections.append((config, ownership_phase))
+        return deepcopy(files["post_import"])
+
+    monkeypatch.setattr(prepare_import, "collect_snapshot", recollect)
 
     assert prepare_import.main(
         _validate_change_set_args(workdir, "UPDATE")
     ) == 0
+    assert len(recollections) == 1
+    config, ownership_phase = recollections[0]
+    assert ownership_phase == "post"
+    assert config == AuditConfig(
+        "ap-southeast-2",
+        "PacificBioArchive-Database",
+        "2dd2aqb32j",
+        "7ir7fs",
+        "fbjojun",
+        "PacificBioArchive-QueryLambda",
+        workdir,
+    )
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        lambda snapshot: snapshot["stack"]["managed"].update(
+            {"FilesTable": "WrongFilesTable"}
+        ),
+        lambda snapshot: snapshot["target_stack"]["resources"][
+            "QueryFunction"
+        ].update({"physical_id": "wrong-function"}),
+        lambda snapshot: snapshot["import_owners"].update(
+            {"QueryFunction": "ForeignStack"}
+        ),
+        lambda snapshot: snapshot["api"].update({"id": "wrong-api"}),
+        lambda snapshot: snapshot["api"]["authorizer"].update(
+            {"JwtConfiguration": {"Issuer": "https://changed.invalid"}}
+        ),
+        lambda snapshot: snapshot["function"].update(
+            {"RevisionId": "changed-revision"}
+        ),
+        lambda snapshot: snapshot["function"].update(
+            {"resource_policy_revision_id": "changed-policy-revision"}
+        ),
+        lambda snapshot: snapshot["function"].update(
+            {"provisioned_concurrency": [{"changed": True}]}
+        ),
+        lambda snapshot: snapshot["function"]["safe_environment"].update(
+            {"DYNAMODB_TABLE": "WrongFilesTable"}
+        ),
+        lambda snapshot: snapshot["integration"].update(
+            {"Description": "changed"}
+        ),
+        lambda snapshot: snapshot["api"]["routes"][0].update(
+            {"OperationName": "changed"}
+        ),
+    ],
+    ids=(
+        "source-mapping",
+        "target-mapping",
+        "target-owner",
+        "api",
+        "authorizer",
+        "function-revision",
+        "policy-revision",
+        "concurrency",
+        "core-table",
+        "integration",
+        "managed-route",
+    ),
+)
+def test_update_change_set_rejects_fresh_boundary_mutation(
+    tmp_path,
+    monkeypatch,
+    mutation,
+):
+    import prepare_import
+
+    workdir = tmp_path / "stale-update-work"
+    files = _write_change_set_validation_files(workdir)
+    fresh = deepcopy(files["post_import"])
+    mutation(fresh)
+    cli = CandidateChangeSetCli(
+        change_set_type="UPDATE",
+        changes=_update_changes(),
+        parameters=_explicit_update_parameters(),
+        processed=files["processed_update"],
+        artifact_checksum=files["update_checksum"],
+        artifact_version=files["update_artifact"].version_id,
+    )
+    monkeypatch.setattr(prepare_import, "AwsCli", lambda: cli)
+    _use_packaged_update_artifact(monkeypatch, prepare_import, files)
+    monkeypatch.setattr(
+        prepare_import,
+        "collect_snapshot",
+        lambda _cli, _config, *, ownership_phase="pre": deepcopy(fresh),
+    )
+
+    with pytest.raises(
+        AdoptionError,
+        match="fresh|boundary|runtime|owner|stack|policy|concurrency",
+    ):
+        prepare_import.main(_validate_change_set_args(workdir, "UPDATE"))
+
+
+@pytest.mark.parametrize(
+    "flag",
+    ["--api", "--authorizer", "--integration", "--function"],
+)
+def test_update_change_set_requires_complete_live_recollection_scope(
+    tmp_path,
+    monkeypatch,
+    flag,
+):
+    import prepare_import
+
+    workdir = tmp_path / "missing-update-scope"
+    files = _write_change_set_validation_files(workdir)
+    cli = CandidateChangeSetCli(
+        change_set_type="UPDATE",
+        changes=_update_changes(),
+        parameters=_explicit_update_parameters(),
+        processed=files["processed_update"],
+        artifact_checksum=files["update_checksum"],
+        artifact_version=files["update_artifact"].version_id,
+    )
+    monkeypatch.setattr(prepare_import, "AwsCli", lambda: cli)
+    _use_packaged_update_artifact(monkeypatch, prepare_import, files)
+    args = _validate_change_set_args(workdir, "UPDATE")
+    index = args.index(flag)
+    del args[index : index + 2]
+
+    with pytest.raises(AdoptionError, match="recollection|scope|required"):
+        prepare_import.main(args)
+
+
+@pytest.mark.parametrize(
+    ("change_index", "replacement"),
+    [
+        (0, None),
+        (0, False),
+        (0, "false"),
+        (1, None),
+        (1, False),
+        (1, "Conditional"),
+    ],
+    ids=(
+        "modify-null",
+        "modify-boolean",
+        "modify-lowercase",
+        "add-null",
+        "add-boolean",
+        "add-conditional",
+    ),
+)
+def test_update_change_set_cli_rejects_non_string_false_replacement(
+    tmp_path,
+    monkeypatch,
+    change_index,
+    replacement,
+):
+    import prepare_import
+
+    workdir = tmp_path / "replacement-wire-type"
+    files = _write_change_set_validation_files(workdir)
+    changes = _update_changes()
+    changes[change_index]["ResourceChange"]["Replacement"] = replacement
+    cli = CandidateChangeSetCli(
+        change_set_type="UPDATE",
+        changes=changes,
+        parameters=_explicit_update_parameters(),
+        processed=files["processed_update"],
+        artifact_checksum=files["update_checksum"],
+        artifact_version=files["update_artifact"].version_id,
+    )
+    monkeypatch.setattr(prepare_import, "AwsCli", lambda: cli)
+    _use_packaged_update_artifact(monkeypatch, prepare_import, files)
+    _use_stored_snapshot_as_fresh(monkeypatch, prepare_import, files)
+
+    with pytest.raises(AdoptionError, match="Replacement|replacement|False"):
+        prepare_import.main(_validate_change_set_args(workdir, "UPDATE"))
 
 
 def test_first_update_accepts_console_masked_noecho_when_parameter_was_missing(
@@ -3369,10 +3606,10 @@ def test_first_update_accepts_console_masked_noecho_when_parameter_was_missing(
 
     workdir = tmp_path / "first-update-work"
     files = _write_change_set_validation_files(workdir)
-    files["snapshot"]["stack"]["parameters"] = []
-    files["snapshot"]["stack"]["template"].pop("Parameters")
-    (workdir / "sanitized-snapshot.json").write_text(
-        json.dumps(_json_safe_snapshot(files["snapshot"])),
+    files["post_import"]["stack"]["parameters"] = []
+    files["post_import"]["stack"]["template"].pop("Parameters", None)
+    (workdir / "post-import-evidence.json").write_text(
+        json.dumps(_json_safe_snapshot(files["post_import"])),
         encoding="utf-8",
     )
     parameters = _explicit_update_parameters()
@@ -3393,7 +3630,9 @@ def test_first_update_accepts_console_masked_noecho_when_parameter_was_missing(
     monkeypatch.setattr(
         prepare_import,
         "collect_snapshot",
-        lambda _cli, _config: deepcopy(files["snapshot"]),
+        lambda _cli, _config, *, ownership_phase="pre": deepcopy(
+            files["post_import"]
+        ),
     )
 
     assert prepare_import.main(
@@ -3417,10 +3656,10 @@ def test_first_update_rejects_parameter_state_change_during_validation(
 
     workdir = tmp_path / "first-update-race"
     files = _write_change_set_validation_files(workdir)
-    files["snapshot"]["stack"]["parameters"] = []
-    files["snapshot"]["stack"]["template"].pop("Parameters")
-    (workdir / "sanitized-snapshot.json").write_text(
-        json.dumps(_json_safe_snapshot(files["snapshot"])),
+    files["post_import"]["stack"]["parameters"] = []
+    files["post_import"]["stack"]["template"].pop("Parameters", None)
+    (workdir / "post-import-evidence.json").write_text(
+        json.dumps(_json_safe_snapshot(files["post_import"])),
         encoding="utf-8",
     )
     cli = CandidateChangeSetCli(
@@ -3437,7 +3676,9 @@ def test_first_update_rejects_parameter_state_change_during_validation(
     monkeypatch.setattr(
         prepare_import,
         "collect_snapshot",
-        lambda _cli, _config: deepcopy(files["snapshot"]),
+        lambda _cli, _config, *, ownership_phase="pre": deepcopy(
+            files["post_import"]
+        ),
     )
 
     with pytest.raises(AdoptionError, match="parameter names|IMPORT boundary"):
@@ -3453,10 +3694,10 @@ def test_first_update_plaintext_parameter_is_not_logged_or_persisted(
 
     workdir = tmp_path / "first-update-plaintext"
     files = _write_change_set_validation_files(workdir)
-    files["snapshot"]["stack"]["parameters"] = []
-    files["snapshot"]["stack"]["template"].pop("Parameters")
-    (workdir / "sanitized-snapshot.json").write_text(
-        json.dumps(_json_safe_snapshot(files["snapshot"])),
+    files["post_import"]["stack"]["parameters"] = []
+    files["post_import"]["stack"]["template"].pop("Parameters", None)
+    (workdir / "post-import-evidence.json").write_text(
+        json.dumps(_json_safe_snapshot(files["post_import"])),
         encoding="utf-8",
     )
     secret = "plaintext-console-secret-must-not-leak"
@@ -3473,7 +3714,9 @@ def test_first_update_plaintext_parameter_is_not_logged_or_persisted(
     monkeypatch.setattr(
         prepare_import,
         "collect_snapshot",
-        lambda _cli, _config: deepcopy(files["snapshot"]),
+        lambda _cli, _config, *, ownership_phase="pre": deepcopy(
+            files["post_import"]
+        ),
     )
 
     with pytest.raises(AdoptionError, match="masked|NoEcho|InternalApiKey"):
@@ -3488,7 +3731,7 @@ def test_first_update_plaintext_parameter_is_not_logged_or_persisted(
     )
 
 
-def test_first_update_rejects_query_function_only_preview_without_recollection(
+def test_first_update_recollects_before_rejecting_query_function_only_preview(
     tmp_path,
     monkeypatch,
 ):
@@ -3514,13 +3757,13 @@ def test_first_update_rejects_query_function_only_preview_without_recollection(
     )
     monkeypatch.setattr(prepare_import, "AwsCli", lambda: cli)
     _use_packaged_update_artifact(monkeypatch, prepare_import, files)
-    monkeypatch.setattr(
-        prepare_import,
-        "collect_snapshot",
-        lambda *_args: (_ for _ in ()).throw(
-            AssertionError("hardening-only UPDATE must not recollect old role drift")
-        ),
-    )
+    recollections = []
+
+    def recollect(_cli, _config, *, ownership_phase="pre"):
+        recollections.append(ownership_phase)
+        return deepcopy(files["post_import"])
+
+    monkeypatch.setattr(prepare_import, "collect_snapshot", recollect)
     with pytest.raises(AdoptionError, match="exact 37-action"):
         prepare_import.main(
             _validate_change_set_args(
@@ -3529,6 +3772,7 @@ def test_first_update_rejects_query_function_only_preview_without_recollection(
                 expect_role_reconciliation="false",
             )
         )
+    assert recollections == ["post"]
 
 
 def test_first_update_rejects_legacy_role_reconciliation_mode(tmp_path, monkeypatch):
@@ -3589,7 +3833,9 @@ def test_update_change_set_main_rejects_tampered_local_packaged_template(
     monkeypatch.setattr(
         prepare_import,
         "collect_snapshot",
-        lambda _cli, _config: deepcopy(files["snapshot"]),
+        lambda _cli, _config, *, ownership_phase="pre": deepcopy(
+            files["post_import"]
+        ),
     )
 
     with pytest.raises(AdoptionError, match="maintained|packaged|template"):
@@ -3604,14 +3850,13 @@ def test_import_change_set_main_binds_processed_template_and_local_artifacts(
 
     workdir = tmp_path / "import-work"
     files = _write_change_set_validation_files(workdir)
-    cli = CandidateChangeSetCli(
+    cli = PreviewCandidateChangeSetCli(
         change_set_type="IMPORT",
         changes=_import_changes(files["snapshot"]),
         parameters=files["import_parameters"],
         processed=files["import_template"],
     )
     monkeypatch.setattr(prepare_import, "AwsCli", lambda: cli)
-    _use_stored_snapshot_as_fresh(monkeypatch, prepare_import, files)
 
     assert prepare_import.main(
         _validate_change_set_args(workdir, "IMPORT")
@@ -3626,6 +3871,71 @@ def test_import_change_set_main_binds_processed_template_and_local_artifacts(
         "import-version-1"
     )
     assert "--checksum-mode" in head_object
+    assert any(
+        call[:2] == ("cloudformation", "list-stacks") for call in cli.calls
+    )
+    assert any(
+        call[:2] == ("cloudformation", "list-stack-resources")
+        and "PacificBioArchive-QueryAdoption" in call
+        for call in cli.calls
+    )
+
+
+def test_import_change_set_rejects_absent_target_after_preview_creation(
+    tmp_path,
+    monkeypatch,
+):
+    import prepare_import
+
+    workdir = tmp_path / "absent-preview-target"
+    files = _write_change_set_validation_files(workdir)
+    cli = CandidateChangeSetCli(
+        change_set_type="IMPORT",
+        changes=_import_changes(files["snapshot"]),
+        parameters=files["import_parameters"],
+        processed=files["import_template"],
+    )
+    monkeypatch.setattr(prepare_import, "AwsCli", lambda: cli)
+
+    with pytest.raises(AdoptionError, match="REVIEW|preview|target"):
+        prepare_import.main(_validate_change_set_args(workdir, "IMPORT"))
+
+
+def test_import_change_set_rejects_preview_shell_with_any_resource(
+    tmp_path,
+    monkeypatch,
+):
+    import prepare_import
+
+    workdir = tmp_path / "nonempty-preview-target"
+    files = _write_change_set_validation_files(workdir)
+
+    class NonemptyPreviewCli(PreviewCandidateChangeSetCli):
+        def json(self, *args):
+            response = super().json(*args)
+            if (
+                args[:2] == ("cloudformation", "list-stack-resources")
+                and "PacificBioArchive-QueryAdoption" in args
+            ):
+                response["StackResourceSummaries"] = [
+                    {
+                        "LogicalResourceId": "QueryFunction",
+                        "PhysicalResourceId": "PacificBioArchive-QueryLambda",
+                        "ResourceType": "AWS::Lambda::Function",
+                    }
+                ]
+            return response
+
+    cli = NonemptyPreviewCli(
+        change_set_type="IMPORT",
+        changes=_import_changes(files["snapshot"]),
+        parameters=files["import_parameters"],
+        processed=files["import_template"],
+    )
+    monkeypatch.setattr(prepare_import, "AwsCli", lambda: cli)
+
+    with pytest.raises(AdoptionError, match="preview|zero|resource|owner"):
+        prepare_import.main(_validate_change_set_args(workdir, "IMPORT"))
 
 
 @pytest.mark.parametrize(
@@ -3844,9 +4154,16 @@ def test_import_live_recollection_rejects_synchronized_snapshot_template_tamper(
     monkeypatch.setattr(prepare_import, "AwsCli", lambda: cli)
     recollections = []
 
-    def recollect(_cli, config):
+    def recollect(_cli, config, *, ownership_phase="pre"):
         recollections.append(config)
-        return deepcopy(fresh)
+        observed = deepcopy(fresh)
+        assert ownership_phase == "preview"
+        observed["target_stack"] = {
+            "name": "PacificBioArchive-QueryAdoption",
+            "status": "REVIEW_IN_PROGRESS",
+            "resources": {},
+        }
+        return observed
 
     monkeypatch.setattr(prepare_import, "collect_snapshot", recollect)
 
@@ -4076,6 +4393,19 @@ class PostImportCli(FakeAwsCli):
         raise AssertionError(f"write boundary must not be called: {args}")
 
 
+class UpdateRollbackCli(PostImportCli):
+    def json(self, *args):
+        response = super().json(*args)
+        if args[:2] == ("cloudformation", "list-stacks"):
+            target = next(
+                item
+                for item in response["StackSummaries"]
+                if item["StackName"] == "PacificBioArchive-QueryAdoption"
+            )
+            target["StackStatus"] = "UPDATE_ROLLBACK_COMPLETE"
+        return response
+
+
 _VERIFY_POST_IMPORT_READ_ONLY_OPERATIONS = {
     ("sts", "get-caller-identity"),
     ("cloudformation", "describe-stacks"),
@@ -4161,6 +4491,34 @@ def test_collection_safe_environment_query_never_selects_secret_value(tmp_path):
     query = configuration_call[configuration_call.index("--query") + 1]
     assert "keys(Environment.Variables)" in query
     assert "Environment.Variables.INTERNAL_API_KEY" not in query
+
+
+def test_unprojected_lambda_secret_fails_closed_without_crossing_python_outputs(
+    tmp_path,
+    capsys,
+):
+    sentinel = "SENTINEL_SECRET_MUST_NOT_CROSS_QUERY_BOUNDARY"
+
+    class UnprojectedSecretCli(FakeAwsCli):
+        def json(self, *args):
+            response = super().json(*args)
+            if args[:2] == ("lambda", "get-function-configuration"):
+                response["Environment"]["Variables"]["INTERNAL_API_KEY"] = (
+                    sentinel
+                )
+            return response
+
+    with pytest.raises(AdoptionError, match="environment|query|malformed") as error:
+        run_audit(UnprojectedSecretCli(), fixture_config(tmp_path))
+
+    captured = capsys.readouterr()
+    assert sentinel not in str(error.value)
+    assert sentinel not in captured.out + captured.err
+    assert all(
+        sentinel.encode() not in path.read_bytes()
+        for path in tmp_path.rglob("*")
+        if path.is_file()
+    )
 
 
 def test_collection_paginates_and_canonicalizes_provisioned_concurrency(tmp_path):
@@ -4324,6 +4682,115 @@ def test_verify_post_import_cli_writes_sanitized_evidence_after_read_only_gate(
     )
 
 
+def _verify_update_rollback_args(workdir):
+    return [
+        "verify-update-rollback",
+        "--region", "ap-southeast-2",
+        "--source-stack", "PacificBioArchive-Database",
+        "--target-stack", "PacificBioArchive-QueryAdoption",
+        "--baseline", str(workdir / "post-import-evidence.json"),
+        "--api", "2dd2aqb32j",
+        "--authorizer", "7ir7fs",
+        "--integration", "fbjojun",
+        "--function", "PacificBioArchive-QueryLambda",
+        "--workdir", str(workdir),
+    ]
+
+
+def test_verify_update_rollback_cli_writes_sanitized_full_evidence(
+    tmp_path,
+    monkeypatch,
+):
+    import prepare_import
+
+    baseline = collect_snapshot(
+        PostImportCli(),
+        fixture_config(tmp_path),
+        ownership_phase="post",
+    )
+    (tmp_path / "post-import-evidence.json").write_text(
+        json.dumps(baseline),
+        encoding="utf-8",
+    )
+    cli = UpdateRollbackCli()
+    monkeypatch.setattr(prepare_import, "AwsCli", lambda: cli)
+
+    assert prepare_import.main(_verify_update_rollback_args(tmp_path)) == 0
+    evidence = json.loads(
+        (tmp_path / "update-rollback-evidence.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert evidence["target_stack"]["status"] == "UPDATE_ROLLBACK_COMPLETE"
+    assert evidence["target_stack"]["resources"] == (
+        adoption.expected_imported_physical_ids(evidence)
+    )
+    assert "internal-secret" not in json.dumps(evidence)
+    _assert_exact_read_only_allowlist(
+        cli.calls,
+        _VERIFY_POST_IMPORT_READ_ONLY_OPERATIONS,
+    )
+
+
+def test_verify_update_rollback_requires_import_complete_baseline(
+    tmp_path,
+    monkeypatch,
+):
+    import prepare_import
+
+    (tmp_path / "post-import-evidence.json").write_text(
+        json.dumps(valid_snapshot()),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(prepare_import, "AwsCli", UpdateRollbackCli)
+
+    with pytest.raises(AdoptionError, match="IMPORT_COMPLETE|post-import"):
+        prepare_import.main(_verify_update_rollback_args(tmp_path))
+
+
+def test_verify_update_rollback_rejects_import_complete_observed_state(
+    tmp_path,
+    monkeypatch,
+):
+    import prepare_import
+
+    (tmp_path / "post-import-evidence.json").write_text(
+        json.dumps(post_import_snapshot()),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(prepare_import, "AwsCli", PostImportCli)
+
+    with pytest.raises(AdoptionError, match="UPDATE_ROLLBACK_COMPLETE|rollback"):
+        prepare_import.main(_verify_update_rollback_args(tmp_path))
+
+
+def test_verify_post_import_still_rejects_update_rollback_state(
+    tmp_path,
+    monkeypatch,
+):
+    import prepare_import
+
+    baseline = tmp_path / "baseline.json"
+    baseline.write_text(json.dumps(valid_snapshot()), encoding="utf-8")
+    monkeypatch.setattr(prepare_import, "AwsCli", UpdateRollbackCli)
+
+    with pytest.raises(AdoptionError, match="IMPORT_COMPLETE|post-import"):
+        prepare_import.main(
+            [
+                "verify-post-import",
+                "--region", "ap-southeast-2",
+                "--source-stack", "PacificBioArchive-Database",
+                "--target-stack", "PacificBioArchive-QueryAdoption",
+                "--baseline", str(baseline),
+                "--api", "2dd2aqb32j",
+                "--authorizer", "7ir7fs",
+                "--integration", "fbjojun",
+                "--function", "PacificBioArchive-QueryLambda",
+                "--workdir", str(tmp_path),
+            ]
+        )
+
+
 def test_recovery_report_cli_records_only_classification_and_ownership(
     tmp_path,
     monkeypatch,
@@ -4432,6 +4899,19 @@ def _run_recovery_report(tmp_path, monkeypatch, cli):
     return json.loads(
         (tmp_path / "recovery-report.json").read_text(encoding="utf-8")
     )
+
+
+def test_recovery_report_points_update_rollback_to_executable_gate(
+    tmp_path,
+    monkeypatch,
+):
+    report = _run_recovery_report(
+        tmp_path,
+        monkeypatch,
+        UpdateRollbackCli(),
+    )
+
+    assert report["classification"]["action"] == "verify-update-rollback"
 
 
 @pytest.mark.parametrize("status", ["IMPORT_COMPLETE", "UPDATE_ROLLBACK_COMPLETE"])

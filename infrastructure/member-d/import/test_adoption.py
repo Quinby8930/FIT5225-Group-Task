@@ -34,9 +34,34 @@ assert_post_import_equivalent = getattr(
     "assert_post_import_equivalent",
     _missing_post_import_feature,
 )
+assert_import_preview_equivalent = getattr(
+    adoption,
+    "assert_import_preview_equivalent",
+    _missing_post_import_feature,
+)
+assert_post_import_boundary_current = getattr(
+    adoption,
+    "assert_post_import_boundary_current",
+    _missing_post_import_feature,
+)
+assert_update_rollback_equivalent = getattr(
+    adoption,
+    "assert_update_rollback_equivalent",
+    _missing_post_import_feature,
+)
 expected_imported_physical_ids = getattr(
     adoption,
     "expected_imported_physical_ids",
+    _missing_post_import_feature,
+)
+validate_import_preview_snapshot = getattr(
+    adoption,
+    "validate_import_preview_snapshot",
+    _missing_post_import_feature,
+)
+validate_update_rollback_snapshot = getattr(
+    adoption,
+    "validate_update_rollback_snapshot",
     _missing_post_import_feature,
 )
 
@@ -324,6 +349,99 @@ def post_import_snapshot():
     return snapshot
 
 
+def import_preview_snapshot():
+    snapshot = valid_snapshot()
+    snapshot["target_stack"] = {
+        "name": _EXPECTED_TARGET_STACK,
+        "status": "REVIEW_IN_PROGRESS",
+        "resources": {},
+    }
+    return snapshot
+
+
+def update_rollback_snapshot():
+    snapshot = post_import_snapshot()
+    snapshot["target_stack"]["status"] = "UPDATE_ROLLBACK_COMPLETE"
+    return snapshot
+
+
+def test_import_preview_gate_accepts_only_review_shell_with_all_unmanaged():
+    validate_import_preview_snapshot(import_preview_snapshot())
+    assert_import_preview_equivalent(valid_snapshot(), import_preview_snapshot())
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        lambda snapshot: snapshot["target_stack"].update({"status": None}),
+        lambda snapshot: snapshot["target_stack"].update(
+            {"status": "IMPORT_COMPLETE"}
+        ),
+        lambda snapshot: snapshot["target_stack"]["resources"].update(
+            {
+                "QueryFunction": {
+                    "physical_id": "PacificBioArchive-QueryLambda",
+                    "resource_type": "AWS::Lambda::Function",
+                }
+            }
+        ),
+        lambda snapshot: snapshot["import_owners"].pop("QueryFunction"),
+        lambda snapshot: snapshot["import_owners"].update(
+            {"Unexpected": None}
+        ),
+        lambda snapshot: snapshot["import_owners"].update(
+            {"QueryFunction": _EXPECTED_TARGET_STACK}
+        ),
+        lambda snapshot: snapshot["import_owners"].update(
+            {"QueryFunction": "ForeignStack"}
+        ),
+    ],
+    ids=(
+        "target-absent",
+        "wrong-status",
+        "target-has-resource",
+        "missing-owner",
+        "extra-owner",
+        "target-owner",
+        "foreign-owner",
+    ),
+)
+def test_import_preview_gate_rejects_every_other_phase_or_owner(mutation):
+    snapshot = import_preview_snapshot()
+    mutation(snapshot)
+
+    with pytest.raises(AdoptionError):
+        validate_import_preview_snapshot(snapshot)
+
+
+def test_import_preview_equivalence_rejects_runtime_or_source_change():
+    preview = import_preview_snapshot()
+    preview["function"]["RevisionId"] = "changed-during-preview"
+
+    with pytest.raises(AdoptionError):
+        assert_import_preview_equivalent(valid_snapshot(), preview)
+
+
+def test_post_import_same_boundary_accepts_fresh_identical_evidence():
+    assert_post_import_boundary_current(
+        post_import_snapshot(),
+        post_import_snapshot(),
+    )
+
+
+def test_update_rollback_gate_accepts_exact_import_complete_boundary():
+    validate_update_rollback_snapshot(update_rollback_snapshot())
+    assert_update_rollback_equivalent(
+        post_import_snapshot(),
+        update_rollback_snapshot(),
+    )
+
+
+def test_post_import_gate_remains_import_complete_only():
+    with pytest.raises(AdoptionError):
+        adoption.validate_post_import_snapshot(update_rollback_snapshot())
+
+
 def test_post_import_gate_accepts_exact_ownership_only_transition():
     assert_post_import_equivalent(valid_snapshot(), post_import_snapshot())
 
@@ -450,6 +568,80 @@ def test_post_import_gate_rejects_environment_evidence_mutation(mutation):
         assert_post_import_equivalent(valid_snapshot(), observed)
 
 
+def _same_boundary_cases():
+    return (
+        (
+            assert_post_import_boundary_current,
+            post_import_snapshot(),
+            post_import_snapshot(),
+        ),
+        (
+            assert_update_rollback_equivalent,
+            post_import_snapshot(),
+            update_rollback_snapshot(),
+        ),
+    )
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        lambda snapshot: snapshot["stack"]["managed"].update(
+            {"FilesTable": "WrongFilesTable"}
+        ),
+        lambda snapshot: snapshot["target_stack"]["resources"][
+            "QueryFunction"
+        ].update({"physical_id": "wrong-function"}),
+        lambda snapshot: snapshot["import_owners"].update(
+            {"QueryFunction": "ForeignStack"}
+        ),
+        lambda snapshot: snapshot["api"].update({"id": "wrong-api"}),
+        lambda snapshot: snapshot["api"]["authorizer"].update(
+            {"JwtConfiguration": {"Issuer": "https://changed.invalid"}}
+        ),
+    ],
+    ids=(
+        "source-physical",
+        "target-physical",
+        "target-owner",
+        "api-id",
+        "complete-authorizer",
+    ),
+)
+def test_same_boundary_gates_reject_scope_or_ownership_mutation(mutation):
+    for gate, baseline, observed in _same_boundary_cases():
+        mutation(observed)
+        with pytest.raises(AdoptionError):
+            gate(baseline, observed)
+
+
+@pytest.mark.parametrize("field", _POST_IMPORT_FUNCTION_FIELDS)
+def test_same_boundary_gates_reject_each_lambda_field_mutation(field):
+    for gate, baseline, observed in _same_boundary_cases():
+        observed["function"][field] = {"changed": True}
+        with pytest.raises(AdoptionError):
+            gate(baseline, observed)
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        lambda function: function["environment_names"].remove(
+            "INTERNAL_API_KEY"
+        ),
+        lambda function: function["safe_environment"].update(
+            {"DYNAMODB_TABLE": "WrongFilesTable"}
+        ),
+    ],
+    ids=("environment-names", "core-table-value"),
+)
+def test_same_boundary_gates_reject_environment_mutation(mutation):
+    for gate, baseline, observed in _same_boundary_cases():
+        mutation(observed["function"])
+        with pytest.raises(AdoptionError):
+            gate(baseline, observed)
+
+
 _COMPLETE_INTEGRATION = {
     "IntegrationId": "fbjojun",
     "IntegrationType": "AWS_PROXY",
@@ -482,6 +674,16 @@ def test_post_import_gate_rejects_each_captured_integration_field_mutation(field
 
     with pytest.raises(AdoptionError):
         assert_post_import_equivalent(before, observed)
+
+
+@pytest.mark.parametrize("field", tuple(_COMPLETE_INTEGRATION))
+def test_same_boundary_gates_reject_each_integration_field_mutation(field):
+    for gate, baseline, observed in _same_boundary_cases():
+        baseline["integration"] = deepcopy(_COMPLETE_INTEGRATION)
+        observed["integration"] = deepcopy(_COMPLETE_INTEGRATION)
+        observed["integration"][field] = "changed"
+        with pytest.raises(AdoptionError):
+            gate(baseline, observed)
 
 
 _COMPLETE_ROUTE_FIELDS = {
@@ -522,6 +724,41 @@ def test_post_import_gate_rejects_every_captured_field_for_each_route(
 
     with pytest.raises(AdoptionError):
         assert_post_import_equivalent(before, observed)
+
+
+@pytest.mark.parametrize("logical_id", tuple(ROUTES_BY_LOGICAL_ID))
+@pytest.mark.parametrize(
+    "field",
+    (
+        "RouteId",
+        "RouteKey",
+        "Target",
+        "AuthorizationType",
+        "AuthorizerId",
+        *_COMPLETE_ROUTE_FIELDS,
+    ),
+)
+def test_same_boundary_gates_reject_every_managed_route_field(
+    logical_id,
+    field,
+):
+    for gate, baseline, observed in _same_boundary_cases():
+        route_key = ROUTES_BY_LOGICAL_ID[logical_id].route_key
+        baseline_route = next(
+            route
+            for route in baseline["api"]["routes"]
+            if route["RouteKey"] == route_key
+        )
+        observed_route = next(
+            route
+            for route in observed["api"]["routes"]
+            if route["RouteKey"] == route_key
+        )
+        baseline_route.update(deepcopy(_COMPLETE_ROUTE_FIELDS))
+        observed_route.update(deepcopy(_COMPLETE_ROUTE_FIELDS))
+        observed_route[field] = "changed"
+        with pytest.raises(AdoptionError):
+            gate(baseline, observed)
 
 
 def test_post_import_gate_ignores_unrelated_api_route():
@@ -2792,6 +3029,65 @@ def test_first_query_update_accepts_exact_query_function_and_36_additions():
     changes = _first_query_update_changes()
 
     assert len(changes) == 37
+    validate_update_change_set(changes, _first_query_update_processed())
+
+
+@pytest.mark.parametrize(
+    "replacement",
+    [None, False, True, 0, 1, "false", "True", "Conditional"],
+    ids=(
+        "null",
+        "boolean-false",
+        "boolean-true",
+        "zero",
+        "one",
+        "lowercase",
+        "true-string",
+        "conditional",
+    ),
+)
+def test_first_query_update_modify_requires_exact_false_string(replacement):
+    changes = _first_query_update_changes()
+    changes[0]["ResourceChange"]["Replacement"] = replacement
+
+    with pytest.raises(AdoptionError, match="Replacement|replacement|False"):
+        validate_update_change_set(changes, _first_query_update_processed())
+
+
+def test_first_query_update_modify_rejects_missing_replacement_key():
+    changes = _first_query_update_changes()
+    changes[0]["ResourceChange"].pop("Replacement")
+
+    with pytest.raises(AdoptionError, match="Replacement|replacement|False"):
+        validate_update_change_set(changes, _first_query_update_processed())
+
+
+@pytest.mark.parametrize(
+    "replacement",
+    [None, False, True, 0, 1, "false", "True", "Conditional"],
+    ids=(
+        "null",
+        "boolean-false",
+        "boolean-true",
+        "zero",
+        "one",
+        "lowercase",
+        "true-string",
+        "conditional",
+    ),
+)
+def test_first_query_update_add_rejects_non_false_wire_value(replacement):
+    changes = _first_query_update_changes()
+    changes[1]["ResourceChange"]["Replacement"] = replacement
+
+    with pytest.raises(AdoptionError, match="Replacement|replacement|False"):
+        validate_update_change_set(changes, _first_query_update_processed())
+
+
+def test_first_query_update_add_accepts_omitted_replacement():
+    changes = _first_query_update_changes()
+    changes[1]["ResourceChange"].pop("Replacement")
+
     validate_update_change_set(changes, _first_query_update_processed())
 
 

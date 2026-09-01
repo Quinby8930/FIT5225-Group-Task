@@ -67,11 +67,17 @@ The audit records the live role ARN, API ID, authorizer ID, table names, account
 and region. Validators require the parameter values to equal that evidence
 exactly. No output or export is added to the database stack.
 
-`InternalApiKey` is deliberately absent from the audit, snapshot, import
-template, resources-to-import manifest, parameter artifacts, command line,
-environment, and logs. It is introduced only in the separately reviewed normal
-UPDATE template as `String`, `NoEcho: true`, `MinLength: 1`, and its value may be
-entered only in the CloudFormation console password field.
+`InternalApiKey` is deliberately absent from the Python audit result, snapshot,
+import template, resources-to-import manifest, parameter artifacts, command
+line, environment, and logs. AWS Lambda has no server-side field projection:
+the trusted AWS CLI child process receives the complete function-configuration
+response and its JMESPath `--query` removes secret values before stdout reaches
+Python. Therefore Python, artifacts, logs, screenshots, argv and operator UI do
+not receive, store or display the value. This child-process trust boundary still
+requires explicit user acceptance before any future AWS step. The key is
+introduced only in the separately reviewed normal UPDATE template as `String`,
+`NoEcho: true`, `MinLength: 1`, and its value may be entered only in the
+CloudFormation console password field.
 
 ## 4. Initial IMPORT artifact contract
 
@@ -83,7 +89,7 @@ The generated template:
   resource;
 - represents `QueryFunction` as `AWS::Lambda::Function` and takes its role from
   `ExistingQueryLambdaRoleArn`;
-- omits `Environment` because the existing secret value must never be read;
+- omits `Environment` so the IMPORT template and artifacts remain secret-free;
 - uses the audited API and authorizer parameters for the integration/routes;
 - is regenerated from a fresh read-only audit and never reused after a failed
   attempt.
@@ -118,8 +124,16 @@ be considered, the Change Set validator must additionally prove:
 - it contains exactly those 19 expected imports;
 - every action is `Import`; there is no Add, Modify, Remove, replacement, or
   unknown logical ID/type;
-- a fresh audit still finds all 19 physical resources unmanaged;
+- a fresh explicit preview-phase collection finds the target in exact
+  `REVIEW_IN_PROGRESS`, with zero target resources and all 19 physical resources
+  still unmanaged;
 - the processed template and parameters still match the preparation bundle.
+
+The preview-phase evidence is compared to the original absent-target baseline
+for caller/region, the source four-resource mapping, Lambda, API/authorizer,
+Integration and all 16 managed Route contracts. The original baseline—not the
+preview snapshot—remains the input to import-template, parameter and manifest
+validation.
 
 `audit`, validation and recovery reporting are read-only. `prepare` performs the
 explicitly disclosed versioned S3 backup only after separate write approval.
@@ -157,9 +171,21 @@ CloudFormation preview, validator and human approval. Its template keeps all imp
 resources retained, adds only explicitly listed query-support resources, and
 modifies only explicitly listed imported resources without replacement.
 
+Before validating that preview, the tool recollects a fresh
+`IMPORT_COMPLETE` snapshot and compares it with `post-import-evidence.json`.
+The comparison covers caller/region, the exact source four-resource and target
+19-resource mappings and owners, complete sanitized Lambda evidence, API ID and
+complete authorizer, Integration, and all 16 managed Routes. Only this fresh
+snapshot supplies the expected role ARN, API ID, authorizer ID and core table
+names. `--expected-http-api-id` and `--expected-jwt-authorizer-id` remain
+operator declarations but must equal that fresh evidence. Query input bucket,
+storage-delete function and inference base URL are explicit operator-reviewed
+new UPDATE inputs; they are not described as existing live evidence and this
+design does not broaden scope to a Media Stack.
+
 The first normal UPDATE allowlist is fixed at exactly 37 actions:
 
-- one `Modify` with `Replacement: False`: `QueryFunction`, for reviewed code
+- one `Modify` with wire value `Replacement: "False"`: `QueryFunction`, for reviewed code
   and complete environment registration;
 - ten `Add` actions: the OPTIONS routes;
 - 26 `Add` actions: the method/path-scoped `AWS::Lambda::Permission`
@@ -188,7 +214,7 @@ live role drift into a template and does not change that role.
 | `IMPORT_ROLLBACK_COMPLETE` | must be re-audited | recovery report only | if empty, separately approve shell cleanup; if any resource is owned, stop |
 | `IMPORT_ROLLBACK_FAILED` | unknown/unsafe | evidence collection only | freeze automation and escalate to AWS Support/manual recovery review |
 | `UPDATE_IN_PROGRESS` | exactly 19 plus approved additions | observe only | rely on CloudFormation rollback, never overlap operations |
-| `UPDATE_ROLLBACK_COMPLETE` | imported 19 must remain owned | full ownership/runtime/API verification | accept only if equivalent to the `IMPORT_COMPLETE` boundary; otherwise stop |
+| `UPDATE_ROLLBACK_COMPLETE` | imported 19 must remain owned | run `verify-update-rollback` against the saved `IMPORT_COMPLETE` baseline | accept only if full ownership/Lambda/API evidence is equivalent to that baseline; otherwise stop |
 | empty query stack | zero resources | generate cleanup checklist | deletion requires a separate explicit approval |
 
 No recovery path deletes, replaces, edits, or disowns a real application
@@ -200,7 +226,9 @@ At every stage:
 
 - no real resource is deleted or replaced;
 - no business data is read or modified by the tooling;
-- no secret is read, printed, recorded, snapshotted, or stored;
+- the trusted AWS CLI child is the only component that receives Lambda's full
+  response; CLI-side `--query` strips secret values before stdout reaches
+  Python, and no secret is printed, recorded, snapshotted or stored;
 - the key appears only in the future normal UPDATE console NoEcho field;
 - each AWS write would require a fresh validator result and explicit human
   approval (none is granted by this design);

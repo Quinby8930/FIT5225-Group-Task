@@ -37,7 +37,9 @@ Route。禁止直接把它们部署进 `PacificBioArchive-Database`，也禁止�
 1. 对数据库 Stack 和 19 项 unmanaged 资源做新鲜只读 audit；
 2. 生成独立、无 Outputs、无 secret 的 Query IMPORT template 和 19 项自动标识 manifest；
 3. 在获得 AWS 写批准后，只为 `PacificBioArchive-QueryAdoption` 创建 IMPORT preview；
-4. Validator 证明 preview 恰好是 19 个 Import，无 Add/Modify/Remove/Replace；
+4. Validator 重新采集 preview phase，要求 Target 精确为 `REVIEW_IN_PROGRESS`、0 项资源、
+   19 项 owners 全部为 `None`，并证明 Change Set 恰好是 19 个 Import，无
+   Add/Modify/Remove/Replace；
 5. 停止并等待执行 IMPORT 的另一项明确批准；
 6. 若未来执行，立即运行 post-import runtime/API evidence gate；
 7. 通过后才可设计并创建正常 UPDATE preview。
@@ -55,26 +57,40 @@ Route。禁止直接把它们部署进 `PacificBioArchive-Database`，也禁止�
 - 只有三个普通参数：现有 Role ARN、API ID、authorizer ID；
 - 没有 `Outputs`、`InternalApiKey`、SNS、OPTIONS Route、Lambda permission 或数据库 Stack
   资源；
-- `QueryFunction.Environment` 暂时省略，避免读取或保存线上 secret；IMPORT 后用完整只读
-  比较证明 Lambda 未改变。
+- `QueryFunction.Environment` 暂时省略，使 IMPORT template 和工件保持 secret-free；
+  IMPORT 后用完整只读比较证明 Lambda 未改变。
 
 ### 第一次正常 UPDATE
 
 它是 IMPORT 之后另行 preview、validator 和批准的操作。允许的 Change Set 固定为：
 
-- `QueryFunction / Modify / Replacement=False`；
+- `QueryFunction / Modify`，且 Change Set JSON 必须含精确字符串
+  `Replacement: "False"`；
 - 10 条 OPTIONS Route `Add`；
 - 26 条 method/path-scoped Lambda permission `Add`。
+
+`Add` 的 `Replacement` 只能省略或是精确字符串 `"False"`；不能接受显式 null、布尔、
+数字、`"True"` 或 `"Conditional"`。
 
 不允许 Remove、Replace、其他 Modify、wildcard permission 或数据库 Stack 资源。模板不含
 SNS Topic/Subscription，也不修改 `QueryLambdaRole`。如果 UPDATE 回滚，只能在完整证据
 等同 `IMPORT_COMPLETE` 边界时继续；否则停止。
 
+最终 UPDATE validator 不能只信任保存的 post-import 文件。它必须重新采集精确
+`IMPORT_COMPLETE` 证据，并比较 caller/region、源 Stack 4 项、Query Stack 19 项及 owners、
+完整净化 Lambda、API ID/完整 authorizer、integration 和 16 条业务 Route。Role ARN、API
+ID、authorizer ID 和 core table 名称只取自这份新鲜证据。Query input bucket、storage-delete
+function 和 inference base URL 仍是显式人工审阅的新 UPDATE 输入；它们不是自动发现的
+Media Stack live evidence。
+
 ## 4. Secret 与通知边界
 
-初始 IMPORT 完全不知道 `InternalApiKey`。该值只在第一次正常 UPDATE 获得独立批准后，
-由 A 在 CloudFormation Console 的 `NoEcho` 密码框输入。不得将其放入 CLI、环境变量、
-文件、日志、截图、Git 或聊天。不存在通过命令行传递当前 key 的受支持路径。
+初始 IMPORT 的 Python、template 和工件不知道 `InternalApiKey` 的值。AWS Lambda API
+没有服务端字段投影；可信 AWS CLI 子进程收到完整 function-configuration 后，通过 CLI
+侧 JMESPath `--query` 在 stdout 到达 Python 前移除 secret value。因此 Python、工件、日志、
+截图、argv 和操作者界面均不接收、保存或显示该值。此信任边界仍需用户在未来 AWS 步骤
+前明确接受。该值只在第一次正常 UPDATE 获得独立批准后，由 A 在 CloudFormation Console
+的 `NoEcho` 密码框输入；不存在通过命令行传递当前 key 的受支持路径。
 
 当前通知能力是 `PacificBioArchiveNotifications` 中的 durable per-user in-app inbox，以及
 `PacificBioArchiveSubscriptions` 中的用户/物种订阅。第一次正常 UPDATE 不部署 SNS email。
@@ -105,6 +121,11 @@ Reservations mutation 并单独批准；adoption IMPORT 本身不修改表数据
 `AWS::ApiGatewayV2::Integration` 在此流程中不能依赖 CloudFormation drift detection。
 IMPORT 后必须由 `verify-post-import` 直接读取 API Gateway integration 和全部 Route 并逐属性
 比较。
+
+若最终 UPDATE 回滚到 `UPDATE_ROLLBACK_COMPLETE`，必须运行独立的只读
+`verify-update-rollback`，以 `post-import-evidence.json` 为 baseline，重新验证原 19 项
+所有权和完整 Lambda/API 边界。`verify-post-import` 仍只接受 `IMPORT_COMPLETE`，不能用来
+绕过回滚门禁。
 
 ## 7. 本地开发与验证
 

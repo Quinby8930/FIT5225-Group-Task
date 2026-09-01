@@ -51,8 +51,12 @@ Query Stack 通过普通、非敏感参数接收经过只读审计的
 - 不删除、不替换真实资源，不修改业务数据。
 - 不把线上 drift 复制进维护模板；Query Stack 不修改或“收敛”数据库 Stack 拥有的
   `QueryLambdaRole`。
-- 初始 IMPORT 不包含、读取或保存 `InternalApiKey`。该值只允许在日后单独获批的正常
-  UPDATE 中，通过 CloudFormation Console 的 `NoEcho` 密码框输入。
+- 初始 IMPORT 的 Python、template 和工件不接收、引用或保存 `InternalApiKey`。AWS
+  Lambda 不支持服务端字段投影：可信 AWS CLI 子进程会收到完整 function-configuration
+  响应，再由 CLI 侧 JMESPath `--query` 在 stdout 到达 Python 前移除 secret value。因此
+  Python、工件、日志、截图、argv 和操作者界面都不接收、保存或显示该值。此子进程信任
+  边界仍须用户在任何未来 AWS 步骤前明确接受。该值只允许在日后单独获批的正常 UPDATE
+  中，通过 CloudFormation Console 的 `NoEcho` 密码框输入。
 - 密钥不得进入 CLI argv、环境变量、文件、snapshot、日志、截图、Git、聊天或群消息。
 - 19 项 `resources-to-import` 必须由工具根据新鲜审计自动生成；操作者不得手工输入资源
   标识符。
@@ -73,7 +77,7 @@ Query Stack 通过普通、非敏感参数接收经过只读审计的
 | `IMPORT_ROLLBACK_COMPLETE` | 必须重新审计 | 仅生成 recovery report；若有任一资源被管理则停止；若确认为空壳，仅可申请独立清理批准 |
 | `IMPORT_ROLLBACK_FAILED` | 未知且不安全 | 冻结自动化，不删除、不重试；保留净化证据并交由 AWS Support/人工恢复评审 |
 | `IMPORT_COMPLETE` | Query Stack 精确拥有 19 项 | 立即执行 post-import evidence gate；通过后才是稳定回滚边界 |
-| `UPDATE_ROLLBACK_COMPLETE` | 导入的 19 项仍精确归 Query Stack | 完整验证所有权、Lambda runtime/policy/concurrency 和 API Gateway；只有与 `IMPORT_COMPLETE` 边界等价才可接受 |
+| `UPDATE_ROLLBACK_COMPLETE` | 导入的 19 项仍精确归 Query Stack | 运行 `verify-update-rollback`，把完整所有权、Lambda runtime/policy/concurrency 和 API Gateway 证据与保存的 `IMPORT_COMPLETE` baseline 比较；只有完全等价才可接受 |
 | 已证明为空的 Target Stack | 0 项且无应用资源 | 只生成清理清单；删除空壳 Stack 必须取得新的明确批准 |
 
 只读恢复命令的真实接口为：
@@ -319,7 +323,11 @@ echo 'STOP: report the validated 19-Import preview for a new approval.'
 
 Validator 必须从 CloudFormation 实际描述中确认：`ChangeSetType=IMPORT`、目标 Stack 精确
 为 `PacificBioArchive-QueryAdoption`、恰好 19 个 `Import`、没有 Add/Modify/Remove/Replace、
-没有数据库 Stack 资源、没有 Outputs/secret，并在预览后再次证明 19 项仍 unmanaged。
+没有数据库 Stack 资源、没有 Outputs/secret。它还会重新采集明确的 preview phase：Target
+必须精确处于 `REVIEW_IN_PROGRESS`、拥有 0 项资源，且 19 项 owner 仍全部为 `None`；同时
+caller/region、源 Stack 4 项映射、Lambda、API/authorizer、integration 和 16 条 Route 必须
+与最初 absent-target baseline 完全一致。IMPORT 工件仍用最初 baseline 校验，不会改用
+preview snapshot。
 
 **到这里必须停止并汇报。第一次 preview 流程中不存在执行 IMPORT 的命令。**
 
@@ -346,8 +354,11 @@ policy 与 policy revision。因为 `AWS::ApiGatewayV2::Integration` 在此工�
 的 CloudFormation drift detection，工具会直接调用 API Gateway 只读 API，逐属性比较
 integration 和全部 16 条 Route。任何差异都停止，不得进入 UPDATE。
 
-IMPORT template 暂时省略 `QueryFunction.Environment` 只是避免读取 secret；不能仅凭模板
-推断线上 Lambda 未改变。只有上述真实 post-import comparison 能证明这一点。
+IMPORT template 暂时省略 `QueryFunction.Environment`，使 template 和工件保持 secret-free；
+不能仅凭模板推断线上 Lambda 未改变。Lambda API 会把完整配置交给可信 AWS CLI 子进程，
+CLI 侧 `--query` 在 stdout 到达 Python 前只保留完整变量名集合和允许比较的非敏感值。
+只有上述真实 post-import comparison 能证明运行时边界未改变；未来运行前仍须明确接受
+这一 AWS CLI 子进程信任边界。
 
 ## 6. 最终正常 UPDATE（仅记录边界，不是操作授权）
 
@@ -356,11 +367,53 @@ build/package，单独创建 preview、运行 validator，并再次取得人工�
 Stack 注册，A 只能在 CloudFormation Console 的 `InternalApiKey` `NoEcho` 密码框输入
 当前值；不存在 secret-bearing CLI 路径。
 
+UPDATE preview validator 必须重新采集 `ownership_phase=post`，并把它与
+`post-import-evidence.json` 的 `IMPORT_COMPLETE` baseline 做完整同边界比较。只有新鲜证据
+可提供 Role ARN、API ID、authorizer ID 和三张 core table 名称；保存文件不能单独作为
+最终判断。`EXPECTED_QUERY_INPUT_BUCKET`、`EXPECTED_STORAGE_DELETE_FUNCTION` 和
+`EXPECTED_INFERENCE_API_BASE_URL` 是本次 UPDATE 的显式人工审阅输入，不是从现有 Media
+Stack 自动发现的 live evidence，也不扩大本流程的 Stack 所有权范围。
+
+未来创建 UPDATE preview 后，精确的只读 validator 接口是（变量、工件与 Change Set 都
+必须来自同一次另行获批流程）：
+
+```bash
+python infrastructure/member-d/import/prepare_import.py validate-change-set \
+  --region "$AWS_REGION" \
+  --source-stack "$SOURCE_STACK" \
+  --stack "$TARGET_STACK" \
+  --change-set "$UPDATE_CHANGE_SET" \
+  --expected-type UPDATE \
+  --api "$API_ID" \
+  --authorizer "$AUTHORIZER_ID" \
+  --integration "$INTEGRATION_ID" \
+  --function "$FUNCTION_NAME" \
+  --workdir "$WORK_DIR" \
+  --artifact-bucket "$ARTIFACT_BUCKET" \
+  --built-template "$UPDATE_BUILT_TEMPLATE" \
+  --packaged-template "$UPDATE_PACKAGED_TEMPLATE" \
+  --built-code-dir "$UPDATE_BUILT_CODE_DIR" \
+  --source-code-dir backend/lambdas/query \
+  --dependency-manifest "$UPDATE_DEPENDENCY_MANIFEST" \
+  --expected-commit "$APPROVED_COMMIT" \
+  --expected-http-api-id "$API_ID" \
+  --expected-jwt-authorizer-id "$AUTHORIZER_ID" \
+  --expected-query-input-bucket "$EXPECTED_QUERY_INPUT_BUCKET" \
+  --expected-storage-delete-function "$EXPECTED_STORAGE_DELETE_FUNCTION" \
+  --expected-inference-api-base-url "$EXPECTED_INFERENCE_API_BASE_URL" \
+  --expected-allow-legacy-processing-callbacks false \
+  --expect-role-reconciliation false
+```
+
 第一次正常 UPDATE 的允许变更固定为 37 项：
 
-- `QueryFunction`：唯一 `Modify`，且 `Replacement=False`；
+- `QueryFunction`：唯一 `Modify`，且 AWS Change Set JSON 的 `Replacement` key 必须存在，
+  wire value 必须是精确字符串 `"False"`；
 - 10 条 OPTIONS Route：`Add`；
 - 26 条 method/path-scoped `AWS::Lambda::Permission`：`Add`。
+
+每个 `Add` 的 `Replacement` 只能省略或为精确字符串 `"False"`；显式 `null`、布尔值、
+数字、大小写不同的字符串、`"True"` 或 `"Conditional"` 都会 fail closed。
 
 禁止任何 Remove、Replace、额外 Modify、wildcard permission、数据库 Stack 资源或
 `QueryLambdaRole` 变更。该 UPDATE 不新增 SNS Topic/Subscription。DynamoDB
@@ -370,6 +423,29 @@ Stack 注册，A 只能在 CloudFormation Console 的 `InternalApiKey` `NoEcho` 
 如果 UPDATE 失败并进入 `UPDATE_ROLLBACK_COMPLETE`，必须运行 recovery report 和完整
 runtime/API/ownership 验证。只有确认 19 项导入资源仍精确归 Query Stack、且全部运行时
 证据等同 `IMPORT_COMPLETE` 稳定边界，才能把回滚视为成功恢复；否则冻结后续操作。
+
+完整恢复验证不是 `verify-post-import` 的宽松变体；后者继续只接受
+`IMPORT_COMPLETE`。回滚必须使用以下独立、只读命令，并把保存的 post-import evidence
+作为 baseline：
+
+```bash
+python infrastructure/member-d/import/prepare_import.py verify-update-rollback \
+  --region "$AWS_REGION" \
+  --source-stack "$SOURCE_STACK" \
+  --target-stack "$TARGET_STACK" \
+  --baseline "$WORK_DIR/post-import-evidence.json" \
+  --api "$API_ID" \
+  --authorizer "$AUTHORIZER_ID" \
+  --integration "$INTEGRATION_ID" \
+  --function "$FUNCTION_NAME" \
+  --workdir "$WORK_DIR"
+```
+
+命令只采集完整只读证据，并生成净化后的
+`update-rollback-evidence.json`。状态必须精确为
+`UPDATE_ROLLBACK_COMPLETE`，Target 必须仍拥有原 19 项，所有 owners 必须指向 Query
+Stack，源 4 项、Lambda、API/authorizer、integration 和 16 条 Route 必须与
+`IMPORT_COMPLETE` baseline 完全一致；任一差异都停止。
 
 ## 7. 相关文件
 

@@ -30,7 +30,10 @@ resource both `DeletionPolicy: Retain` and `UpdateReplacePolicy: Retain`. It has
 no Outputs, SNS resources or internal API key. The 19 physical identifiers are
 generated automatically from the audit, avoiding manual transcription. An
 IMPORT preview is accepted only when CloudFormation reports exactly 19 Import
-actions for the new stack and no Add, Modify, Remove or Replace action.
+actions for the new stack and no Add, Modify, Remove or Replace action. The
+validator also recollects an explicit preview phase: the target must be an empty
+`REVIEW_IN_PROGRESS` shell and every one of the 19 resources must remain
+unmanaged, while the source/runtime/API boundary matches the original audit.
 
 If import is later approved and executed, a mandatory evidence gate compares
 the complete Lambda configuration, safe environment evidence, code hash,
@@ -38,6 +41,14 @@ revision, role, concurrency settings and resource policy with the pre-import
 baseline. API Gateway integration and route properties are read directly from
 the API because Integration drift detection is unavailable for this workflow.
 Any difference blocks the later update.
+
+The normal-update validator does not rely on stale local evidence. It recollects
+the full sanitized `IMPORT_COMPLETE` boundary and compares it with the saved
+post-import evidence before interpreting the Change Set. The fresh snapshot is
+the only source for the existing role ARN, API and authorizer IDs, and core table
+names. The query-input bucket, storage-delete function and inference URL remain
+explicit operator-reviewed new settings; they are not presented as discovered
+Media Stack state.
 
 The first normal update is a separate approval boundary. Its validator permits
 only a non-replacing modification of `QueryFunction`, addition of ten OPTIONS
@@ -49,10 +60,16 @@ approved Cognito-claims, IAM and SNS design.
 
 ## Secret and failure safety
 
-The initial import never reads, stores or references `InternalApiKey`. If the
-normal update is approved, the current value is entered only into the
-CloudFormation Console `NoEcho` field. It is never passed through CLI arguments,
-environment variables, files, logs, screenshots, source control or team chat.
+The initial import's Python process, templates and artifacts never receive,
+store or reference the `InternalApiKey` value. The Lambda API has no server-side
+field projection: the trusted AWS CLI child process receives the complete
+configuration and applies CLI-side JMESPath `--query` before stdout reaches
+Python. Consequently Python, artifacts, logs, screenshots, argv and operator UI
+do not receive, store or display the value. This trust boundary still requires
+explicit user acceptance before a future AWS step. If the normal update is
+approved, the current value is entered only into the CloudFormation Console
+`NoEcho` field and never passed through CLI arguments, environment variables,
+files, logs, screenshots, source control or team chat.
 
 The workflow has explicit handling for an absent target stack,
 `REVIEW_IN_PROGRESS`, import preview failure, `IMPORT_ROLLBACK_COMPLETE`,
@@ -60,7 +77,10 @@ The workflow has explicit handling for an absent target stack,
 `UPDATE_ROLLBACK_COMPLETE`. Automation never deletes or replaces an application
 resource. A proven-empty stack shell can be considered for deletion only under
 a new, explicit approval. The stable recovery boundary after adoption is the
-exact 19-resource `IMPORT_COMPLETE` state.
+exact 19-resource `IMPORT_COMPLETE` state. An `UPDATE_ROLLBACK_COMPLETE` result
+is accepted only after the independent read-only `verify-update-rollback`
+command proves exact 19-resource ownership and complete Lambda/API equivalence
+to that saved baseline; `verify-post-import` remains `IMPORT_COMPLETE`-only.
 
 ## Media and species organization
 

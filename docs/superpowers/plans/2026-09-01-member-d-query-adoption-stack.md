@@ -112,3 +112,34 @@ conditions. Address findings with new failing tests first.
 Deliver the design, modified-file list, full test output, review result,
 ownership table and exact first-preview instructions. Stop before push or any
 AWS action.
+
+## Task 7: Close final-review evidence gaps with TDD
+
+**Files:**
+
+- Modify: `infrastructure/member-d/import/adoption.py`
+- Modify: `infrastructure/member-d/import/prepare_import.py`
+- Modify: both import test modules
+- Modify: the design, adoption runbook, database setup, Member D README,
+  troubleshooting and Team Report source
+
+Record focused failing tests before implementation. Introduce a distinct
+IMPORT-preview evidence phase that accepts only an empty
+`REVIEW_IN_PROGRESS` target and compares it with the original absent-target
+baseline. Recollect fresh `IMPORT_COMPLETE` evidence before validating the
+final UPDATE and use it for existing role/API/authorizer/core-table inputs;
+keep query-input bucket, storage-delete function and inference URL as explicit
+operator-reviewed new inputs rather than expanding scope to a Media Stack.
+
+Add an executable read-only `verify-update-rollback` gate that compares exact
+`UPDATE_ROLLBACK_COMPLETE` ownership and complete sanitized Lambda/API evidence
+with the saved `IMPORT_COMPLETE` baseline. Keep `verify-post-import` strict to
+`IMPORT_COMPLETE`. Tighten Change Set wire validation so `QueryFunction`
+requires the exact string `Replacement: "False"`, while Add actions permit
+only that string or an omitted field.
+
+Finally, document the actual Lambda secret boundary: the trusted AWS CLI child
+receives the complete service response and applies JMESPath `--query` before
+stdout reaches Python. Prove fail-closed behavior with a sentinel secret and
+retain the requirement for explicit user acceptance of this trust boundary
+before any future AWS step.

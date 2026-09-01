@@ -1018,8 +1018,12 @@ def source_recovery_evidence_is_exact(
 def _validate_target_stack(
     snapshot: Mapping[str, Any],
     *,
-    post_import: bool,
+    phase: str,
 ) -> None:
+    _require(
+        phase in {"pre", "preview", "post", "update-rollback"},
+        "target stack validation phase is invalid",
+    )
     target = snapshot.get("target_stack")
     _require(isinstance(target, Mapping), "target stack evidence is missing")
     _require(
@@ -1028,17 +1032,29 @@ def _validate_target_stack(
     )
     resources = target.get("resources")
     _require(isinstance(resources, Mapping), "target stack resources are missing")
-    if not post_import:
+    if phase == "pre":
         _require(
             target.get("status") is None and not resources,
             "target stack must be absent with zero managed resources before import",
         )
         validate_import_owners(snapshot.get("import_owners"))
         return
+    if phase == "preview":
+        _require(
+            target.get("status") == "REVIEW_IN_PROGRESS" and not resources,
+            "target stack must be an empty REVIEW_IN_PROGRESS preview shell",
+        )
+        validate_import_owners(snapshot.get("import_owners"))
+        return
     expected = expected_imported_physical_ids(snapshot)
+    expected_status = (
+        "IMPORT_COMPLETE"
+        if phase == "post"
+        else "UPDATE_ROLLBACK_COMPLETE"
+    )
     _require(
-        target.get("status") == "IMPORT_COMPLETE",
-        "target stack must be IMPORT_COMPLETE after import",
+        target.get("status") == expected_status,
+        f"target stack must be {expected_status} for {phase} evidence",
     )
     _require(
         dict(resources) == expected,
@@ -1056,13 +1072,25 @@ def _validate_target_stack(
 def validate_snapshot(snapshot: Mapping[str, Any]) -> None:
     """Reject any pre-import state that cannot preserve live traffic."""
     _validate_snapshot_common(snapshot)
-    _validate_target_stack(snapshot, post_import=False)
+    _validate_target_stack(snapshot, phase="pre")
+
+
+def validate_import_preview_snapshot(snapshot: Mapping[str, Any]) -> None:
+    """Require the exact empty REVIEW shell created for an IMPORT preview."""
+    _validate_snapshot_common(snapshot)
+    _validate_target_stack(snapshot, phase="preview")
 
 
 def validate_post_import_snapshot(snapshot: Mapping[str, Any]) -> None:
     """Require strict shared evidence plus the completed 19-resource import."""
     _validate_snapshot_common(snapshot)
-    _validate_target_stack(snapshot, post_import=True)
+    _validate_target_stack(snapshot, phase="post")
+
+
+def validate_update_rollback_snapshot(snapshot: Mapping[str, Any]) -> None:
+    """Require the original 19-resource boundary after UPDATE rollback."""
+    _validate_snapshot_common(snapshot)
+    _validate_target_stack(snapshot, phase="update-rollback")
 
 
 def build_resources_to_import(snapshot: Mapping[str, Any]) -> list[dict[str, Any]]:
@@ -1270,6 +1298,32 @@ def _runtime_fingerprint(snapshot: Mapping[str, Any]) -> dict[str, Any]:
     }
 
 
+def _boundary_fingerprint(snapshot: Mapping[str, Any]) -> dict[str, Any]:
+    """Return every stable, sanitized ownership/runtime/API input."""
+    api = snapshot["api"]
+    return {
+        "caller": deepcopy(snapshot["caller"]),
+        "region": snapshot["region"],
+        "source_resources": expected_source_stack_resources(snapshot),
+        "imported_physical_ids": expected_imported_physical_ids(snapshot),
+        "api_identity": {
+            "id": api["id"],
+            "authorizer": deepcopy(api["authorizer"]),
+        },
+        "runtime": _runtime_fingerprint(snapshot),
+    }
+
+
+def _assert_boundary_unchanged(
+    expected: Mapping[str, Any],
+    observed: Mapping[str, Any],
+) -> None:
+    _require(
+        _boundary_fingerprint(expected) == _boundary_fingerprint(observed),
+        "runtime changed or fresh ownership/API boundary differs from approved evidence",
+    )
+
+
 def assert_runtime_unchanged(before: Mapping[str, Any], after: Mapping[str, Any]) -> None:
     validate_snapshot(before)
     validate_snapshot(after)
@@ -1283,10 +1337,37 @@ def assert_post_import_equivalent(
     """Accept only the exact unmanaged-to-target ownership transition."""
     validate_snapshot(before)
     validate_post_import_snapshot(observed)
-    _require(
-        _runtime_fingerprint(before) == _runtime_fingerprint(observed),
-        "runtime changed after import",
-    )
+    _assert_boundary_unchanged(before, observed)
+
+
+def assert_import_preview_equivalent(
+    before: Mapping[str, Any],
+    observed: Mapping[str, Any],
+) -> None:
+    """Accept only creation of an empty REVIEW shell with no live changes."""
+    validate_snapshot(before)
+    validate_import_preview_snapshot(observed)
+    _assert_boundary_unchanged(before, observed)
+
+
+def assert_post_import_boundary_current(
+    expected: Mapping[str, Any],
+    observed: Mapping[str, Any],
+) -> None:
+    """Bind an UPDATE preview to a fresh IMPORT_COMPLETE boundary."""
+    validate_post_import_snapshot(expected)
+    validate_post_import_snapshot(observed)
+    _assert_boundary_unchanged(expected, observed)
+
+
+def assert_update_rollback_equivalent(
+    import_complete_baseline: Mapping[str, Any],
+    observed: Mapping[str, Any],
+) -> None:
+    """Prove UPDATE rollback restored the exact IMPORT_COMPLETE boundary."""
+    validate_post_import_snapshot(import_complete_baseline)
+    validate_update_rollback_snapshot(observed)
+    _assert_boundary_unchanged(import_complete_baseline, observed)
 
 
 def validate_import_change_set(
@@ -1361,7 +1442,7 @@ def classify_recovery_state(
         action = "freeze"
     elif status == "UPDATE_ROLLBACK_COMPLETE":
         action = (
-            "verify-runtime-and-ownership" if exact_import_boundary else "stop"
+            "verify-update-rollback" if exact_import_boundary else "stop"
         )
     else:
         action = "stop"
@@ -2056,16 +2137,25 @@ def validate_update_change_set(
             "UPDATE change set contains an unexpected or duplicate resource",
         )
         changed_logical_ids.add(logical_id)
-        replacement = resource_change.get("Replacement")
         if logical_id == "QueryFunction":
             _require(
-                action == "Modify" and replacement in ("False", False),
-                "QueryFunction must be the sole non-replacing Modify",
+                action == "Modify"
+                and "Replacement" in resource_change
+                and type(resource_change["Replacement"]) is str
+                and resource_change["Replacement"] == "False",
+                'QueryFunction Modify requires Replacement as exact string "False"',
             )
         else:
+            replacement_is_safe = (
+                "Replacement" not in resource_change
+                or (
+                    type(resource_change["Replacement"]) is str
+                    and resource_change["Replacement"] == "False"
+                )
+            )
             _require(
-                action == "Add" and replacement in (None, "False", False),
-                f"first UPDATE requires Add for {logical_id}",
+                action == "Add" and replacement_is_safe,
+                f'first UPDATE requires Add with omitted Replacement or exact string "False" for {logical_id}',
             )
         _require(
             resource_change.get("ResourceType") == expected_types[logical_id],

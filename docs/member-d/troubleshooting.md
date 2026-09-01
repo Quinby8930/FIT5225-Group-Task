@@ -178,5 +178,16 @@ rm -f data/pacific_bioarchive.db && python seed.py
 5. 第一次正常 UPDATE 又是独立 preview/批准，只允许 QueryFunction 非替换 Modify、10 条
    OPTIONS Add 和 26 条 scoped permission Add。它不修改 Role，也不部署 SNS。
 
+Preview validator 会重新采集 `REVIEW_IN_PROGRESS` 空壳、19 项 unmanaged owners 以及完整
+源/Lambda/API 边界；不能只看本地 snapshot。正常 UPDATE validator 也会重新采集
+`IMPORT_COMPLETE` 证据，旧 `post-import-evidence.json` 只作为比较 baseline。若 UPDATE
+回滚到 `UPDATE_ROLLBACK_COMPLETE`，运行独立只读 `verify-update-rollback`；
+`verify-post-import` 仍只接受 `IMPORT_COMPLETE`。
+
+审计 Lambda 环境时，AWS Lambda API 没有服务端字段投影。可信 AWS CLI 子进程收到完整
+configuration，再由 CLI 侧 `--query` 在 stdout 到达 Python 前删除 secret value；Python、
+工件、日志、截图、argv 和操作者界面均不得接收、保存或显示它。任何未来 AWS 步骤前仍
+需用户明确接受这个子进程信任边界。
+
 全新账号没有这些在线资源，不需要 adoption，但两 Stack clean-room 创建顺序仍需要另行
 设计和验证，不能复用本手册。

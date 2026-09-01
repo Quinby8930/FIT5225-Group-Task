@@ -32,8 +32,11 @@ from adoption import (
     ROUTES_BY_LOGICAL_ID,
     SOURCE_STACK_NAME,
     TARGET_STACK_NAME,
+    assert_import_preview_equivalent,
+    assert_post_import_boundary_current,
     assert_post_import_equivalent,
     assert_runtime_unchanged,
+    assert_update_rollback_equivalent,
     build_import_template,
     build_parameters_to_reuse,
     build_resources_to_import,
@@ -42,6 +45,7 @@ from adoption import (
     source_recovery_evidence_is_exact,
     validate_import_artifacts,
     validate_import_change_set,
+    validate_import_preview_snapshot,
     validate_built_template,
     validate_hardening_function_transition,
     validate_hardening_parameter_transition,
@@ -52,6 +56,7 @@ from adoption import (
     validate_stack_names,
     validate_update_artifacts,
     validate_update_change_set,
+    validate_update_rollback_snapshot,
 )
 
 
@@ -728,7 +733,12 @@ def collect_snapshot(
     *,
     ownership_phase: str = "pre",
 ) -> dict[str, Any]:
-    if ownership_phase not in {"pre", "post"}:
+    if ownership_phase not in {
+        "pre",
+        "preview",
+        "post",
+        "update-rollback",
+    }:
         raise AdoptionError("snapshot ownership phase is invalid")
     caller = cli.json("sts", "get-caller-identity", "--region", config.region)
     arn = caller.get("Arn") if isinstance(caller, Mapping) else None
@@ -1058,10 +1068,13 @@ def collect_snapshot(
             "resources": target_resources,
         },
     }
-    if ownership_phase == "pre":
-        validate_snapshot(snapshot)
-    else:
-        validate_post_import_snapshot(snapshot)
+    validators = {
+        "pre": validate_snapshot,
+        "preview": validate_import_preview_snapshot,
+        "post": validate_post_import_snapshot,
+        "update-rollback": validate_update_rollback_snapshot,
+    }
+    validators[ownership_phase](snapshot)
     return snapshot
 
 
@@ -1928,19 +1941,20 @@ def _parser() -> argparse.ArgumentParser:
         command.add_argument("--baseline")
         if name == "prepare":
             command.add_argument("--artifact-bucket", required=True)
-    post_import = subcommands.add_parser("verify-post-import")
-    for argument in (
-        "region",
-        "source-stack",
-        "target-stack",
-        "baseline",
-        "api",
-        "authorizer",
-        "integration",
-        "function",
-        "workdir",
-    ):
-        post_import.add_argument(f"--{argument}", required=True)
+    for verifier_name in ("verify-post-import", "verify-update-rollback"):
+        verifier = subcommands.add_parser(verifier_name)
+        for argument in (
+            "region",
+            "source-stack",
+            "target-stack",
+            "baseline",
+            "api",
+            "authorizer",
+            "integration",
+            "function",
+            "workdir",
+        ):
+            verifier.add_argument(f"--{argument}", required=True)
     recovery = subcommands.add_parser("recovery-report")
     for argument in ("region", "source-stack", "target-stack", "workdir"):
         recovery.add_argument(f"--{argument}", required=True)
@@ -2017,15 +2031,23 @@ def _read_json_file(path: Path, description: str) -> Any:
 def main(argv: list[str] | None = None) -> int:
     args = _parser().parse_args(argv)
     cli = AwsCli()
-    if args.command == "verify-post-import":
+    if args.command in {"verify-post-import", "verify-update-rollback"}:
         validate_stack_names(args.source_stack, args.target_stack)
+        rollback_verification = args.command == "verify-update-rollback"
         baseline = _read_json_file(
             Path(args.baseline),
-            "sanitized pre-import baseline",
+            (
+                "sanitized IMPORT_COMPLETE baseline"
+                if rollback_verification
+                else "sanitized pre-import baseline"
+            ),
         )
         if not isinstance(baseline, Mapping):
-            raise AdoptionError("sanitized pre-import baseline is malformed")
-        validate_snapshot(baseline)
+            raise AdoptionError("sanitized verification baseline is malformed")
+        if rollback_verification:
+            validate_post_import_snapshot(baseline)
+        else:
+            validate_snapshot(baseline)
         if (
             baseline.get("region") != args.region
             or baseline.get("stack", {}).get("name") != args.source_stack
@@ -2039,7 +2061,7 @@ def main(argv: list[str] | None = None) -> int:
             or baseline.get("function", {}).get("FunctionName")
             != args.function
         ):
-            raise AdoptionError("post-import verification scope differs from baseline")
+            raise AdoptionError("verification scope differs from baseline")
         workdir = Path(args.workdir)
         observed = collect_snapshot(
             cli,
@@ -2052,11 +2074,20 @@ def main(argv: list[str] | None = None) -> int:
                 args.function,
                 workdir,
             ),
-            ownership_phase="post",
+            ownership_phase=(
+                "update-rollback" if rollback_verification else "post"
+            ),
         )
-        assert_post_import_equivalent(baseline, observed)
+        if rollback_verification:
+            assert_update_rollback_equivalent(baseline, observed)
+        else:
+            assert_post_import_equivalent(baseline, observed)
         workdir.mkdir(parents=True, exist_ok=True)
-        path = workdir / "post-import-evidence.json"
+        path = workdir / (
+            "update-rollback-evidence.json"
+            if rollback_verification
+            else "post-import-evidence.json"
+        )
         path.write_text(
             json.dumps(_json_safe(observed), sort_keys=True, indent=2) + "\n",
             encoding="utf-8",
@@ -2244,40 +2275,46 @@ def main(argv: list[str] | None = None) -> int:
         if args.expected_type == "IMPORT"
         else "post-import-evidence.json"
     )
-    audited = json.loads(snapshot_path.read_text(encoding="utf-8"))
+    audited = _read_json_file(snapshot_path, "saved validation evidence")
+    if not isinstance(audited, Mapping):
+        raise AdoptionError("saved validation evidence is malformed")
     if args.expected_type == "UPDATE":
         validate_post_import_snapshot(audited)
         if args.expect_role_reconciliation == "true":
             raise AdoptionError(
                 "query-stack UPDATE role reconciliation is disabled"
             )
-    must_recollect = args.expected_type == "IMPORT"
-    if must_recollect:
-        if not all(
-            isinstance(value, str) and value
-            for value in (
-                args.api,
-                args.authorizer,
-                args.integration,
-                args.function,
-            )
-        ):
-            raise AdoptionError(
-                "--api, --authorizer, --integration and --function are required for live recollection"
-            )
-        fresh = collect_snapshot(
-            cli,
-            AuditConfig(
-                args.region,
-                args.source_stack,
-                args.api,
-                args.authorizer,
-                args.integration,
-                args.function,
-                workdir,
-            ),
+    if not all(
+        isinstance(value, str) and value
+        for value in (
+            args.api,
+            args.authorizer,
+            args.integration,
+            args.function,
         )
-        assert_runtime_unchanged(audited, fresh)
+    ):
+        raise AdoptionError(
+            "--api, --authorizer, --integration and --function are required for live recollection"
+        )
+    fresh = collect_snapshot(
+        cli,
+        AuditConfig(
+            args.region,
+            args.source_stack,
+            args.api,
+            args.authorizer,
+            args.integration,
+            args.function,
+            workdir,
+        ),
+        ownership_phase=(
+            "preview" if args.expected_type == "IMPORT" else "post"
+        ),
+    )
+    if args.expected_type == "IMPORT":
+        assert_import_preview_equivalent(audited, fresh)
+    else:
+        assert_post_import_boundary_current(audited, fresh)
         audited = fresh
     processed_response = cli.json("cloudformation", "get-template", "--stack-name", args.stack, "--change-set-name", args.change_set, "--template-stage", "Processed", "--region", args.region)
     processed = _parse_processed_template(

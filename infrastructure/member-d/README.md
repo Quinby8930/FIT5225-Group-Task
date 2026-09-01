@@ -43,6 +43,12 @@ a fresh audit into `resources-to-import.json`; the operator never hand-enters
 the 19 identifiers. Cross-stack bindings are ordinary, validator-checked role
 ARN/API/authorizer parameters, not `Fn::GetAtt` or exports.
 
+After the IMPORT preview exists, validation performs a second explicit
+preview-phase collection. The target must be exactly an empty
+`REVIEW_IN_PROGRESS` shell, all 19 resources must still be unmanaged, and the
+source/Lambda/API boundary must match the original absent-target audit. Import
+artifacts remain bound to that original audit rather than the preview snapshot.
+
 After a separately approved IMPORT and mandatory post-import evidence gate,
 `query-adoption.yaml` is the normal-UPDATE source. The first UPDATE validator
 allows exactly:
@@ -56,10 +62,30 @@ It forbids Remove/Replace, wildcard permissions, source-stack resources and a
 notifications continue to use the database-owned notifications table; email
 activation needs a separately approved IAM/SNS design.
 
+The UPDATE Change Set validator recollects fresh `IMPORT_COMPLETE` evidence and
+requires exact equality with `post-import-evidence.json` across both ownership
+boundaries, Lambda, API/authorizer, Integration and all 16 managed routes. The
+fresh evidence supplies existing role/API/authorizer/core-table values. Query
+input bucket, storage-delete function and inference URL remain explicit
+operator-reviewed new inputs; this does not add a Media Stack dependency.
+
 `InternalApiKey` appears only in this later update template as a `NoEcho`
 parameter. Its value must be entered only in the CloudFormation Console during
 that separately approved phase—never in CLI arguments, environment variables,
 files, logs, screenshots, Git or chat.
+
+AWS Lambda does not offer server-side projection for this read. The trusted AWS
+CLI child process receives the complete function configuration, then CLI-side
+JMESPath `--query` removes secret values before stdout reaches Python. Python,
+artifacts, logs, screenshots, argv and operator UI therefore do not receive,
+store or display the value. This child-process trust boundary still requires
+explicit user acceptance before any future AWS step.
+
+If the first UPDATE reaches `UPDATE_ROLLBACK_COMPLETE`, the read-only
+`verify-update-rollback` command must compare the exact 19-resource ownership
+and complete sanitized Lambda/API evidence with the saved `IMPORT_COMPLETE`
+baseline. `verify-post-import` is intentionally not relaxed and continues to
+accept only `IMPORT_COMPLETE`.
 
 ## Object and species-directory model
 
