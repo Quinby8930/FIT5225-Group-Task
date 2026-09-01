@@ -803,11 +803,24 @@ def _validate_change_set_args(
     ("status", "managed", "action", "cleanup_candidate"),
     [
         (None, set(), "prepare", False),
+        (None, {"QueryFunction"}, "stop", False),
         ("REVIEW_IN_PROGRESS", set(), "inspect", True),
         (
             "IMPORT_COMPLETE",
             _EXPECTED_IMPORT_RESOURCES,
             "post-import-evidence",
+            False,
+        ),
+        (
+            "IMPORT_COMPLETE",
+            _EXPECTED_IMPORT_RESOURCES - {"QueryFunction"},
+            "stop",
+            False,
+        ),
+        (
+            "IMPORT_COMPLETE",
+            _EXPECTED_IMPORT_RESOURCES | {"UnexpectedLogicalId"},
+            "stop",
             False,
         ),
         (
@@ -834,15 +847,32 @@ def _validate_change_set_args(
             "verify-runtime-and-ownership",
             False,
         ),
+        (
+            "UPDATE_ROLLBACK_COMPLETE",
+            _EXPECTED_IMPORT_RESOURCES - {"ReservationsTable"},
+            "stop",
+            False,
+        ),
+        (
+            "UPDATE_ROLLBACK_COMPLETE",
+            _EXPECTED_IMPORT_RESOURCES | {"UnexpectedLogicalId"},
+            "stop",
+            False,
+        ),
     ],
     ids=(
         "target-absent",
+        "target-absent-with-managed-resource",
         "review-empty-shell",
         "import-complete",
+        "import-complete-partial-ownership",
+        "import-complete-extra-ownership",
         "import-rollback-empty-shell",
         "import-rollback-owned-resource",
         "import-rollback-failed",
         "update-rollback-complete",
+        "update-rollback-complete-partial-ownership",
+        "update-rollback-complete-extra-ownership",
     ),
 )
 def test_query_adoption_contract_classifies_target_stack_recovery_state(

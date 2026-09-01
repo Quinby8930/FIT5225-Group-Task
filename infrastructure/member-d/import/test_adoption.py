@@ -53,6 +53,27 @@ _EXPECTED_IMPORT_RESOURCES = {
     "FailFileRoute",
     "AuthorizeAssetsRoute",
 }
+_EXPECTED_IMPORT_RESOURCE_TYPES = {
+    "ReservationsTable": "AWS::DynamoDB::Table",
+    "QueryFunction": "AWS::Lambda::Function",
+    "QueryIntegration": "AWS::ApiGatewayV2::Integration",
+    "AuthTestRoute": "AWS::ApiGatewayV2::Route",
+    "QueryByTagsRoute": "AWS::ApiGatewayV2::Route",
+    "QueryBySpeciesRoute": "AWS::ApiGatewayV2::Route",
+    "QueryByThumbnailRoute": "AWS::ApiGatewayV2::Route",
+    "QueryByFileRoute": "AWS::ApiGatewayV2::Route",
+    "EditTagsRoute": "AWS::ApiGatewayV2::Route",
+    "DeleteFilesRoute": "AWS::ApiGatewayV2::Route",
+    "SubscribeRoute": "AWS::ApiGatewayV2::Route",
+    "UnsubscribeRoute": "AWS::ApiGatewayV2::Route",
+    "SubscriptionsRoute": "AWS::ApiGatewayV2::Route",
+    "NotificationsRoute": "AWS::ApiGatewayV2::Route",
+    "ReserveUploadRoute": "AWS::ApiGatewayV2::Route",
+    "AcquireProcessingRoute": "AWS::ApiGatewayV2::Route",
+    "CompleteFileRoute": "AWS::ApiGatewayV2::Route",
+    "FailFileRoute": "AWS::ApiGatewayV2::Route",
+    "AuthorizeAssetsRoute": "AWS::ApiGatewayV2::Route",
+}
 _EXPECTED_IMPORT_PARAMETER_VALUES = {
     "ExistingQueryLambdaRoleArn": (
         "arn:aws:iam::111122223333:role/"
@@ -305,6 +326,20 @@ def _query_adoption_import_parameters():
     ]
 
 
+def _query_adoption_import_changes():
+    return [
+        {
+            "ResourceChange": {
+                "Action": "Import",
+                "LogicalResourceId": item["LogicalResourceId"],
+                "ResourceType": item["ResourceType"],
+                "Replacement": "False",
+            }
+        }
+        for item in build_resources_to_import(valid_snapshot())
+    ]
+
+
 def test_query_adoption_contract_has_exact_disjoint_stack_ownership():
     assert adoption.SOURCE_STACK_NAME == _EXPECTED_SOURCE_STACK
     assert adoption.TARGET_STACK_NAME == _EXPECTED_TARGET_STACK
@@ -352,6 +387,10 @@ def test_query_adoption_contract_builds_standalone_nineteen_resource_template():
     )
 
     assert set(template["Resources"]) == _EXPECTED_IMPORT_RESOURCES
+    assert {
+        logical_id: resource["Type"]
+        for logical_id, resource in template["Resources"].items()
+    } == _EXPECTED_IMPORT_RESOURCE_TYPES
     assert template["Parameters"] == {
         name: {"Type": "String"}
         for name in _EXPECTED_IMPORT_PARAMETER_VALUES
@@ -400,6 +439,16 @@ def test_query_adoption_contract_binds_exact_three_audited_parameters():
     assert "InternalApiKey" not in str(parameters)
 
 
+def test_query_adoption_contract_manifest_has_exact_nineteen_resource_types():
+    manifest = build_resources_to_import(valid_snapshot())
+
+    assert len(manifest) == 19
+    assert {
+        item["LogicalResourceId"]: item["ResourceType"]
+        for item in manifest
+    } == _EXPECTED_IMPORT_RESOURCE_TYPES
+
+
 def test_query_adoption_contract_accepts_exact_initial_import_artifacts():
     adoption.validate_initial_import_contract(
         _query_adoption_import_template(),
@@ -410,18 +459,38 @@ def test_query_adoption_contract_accepts_exact_initial_import_artifacts():
 
 
 @pytest.mark.parametrize(
+    "prohibited_logical_id",
+    [
+        "FilesTable",
+        "SubscriptionsTable",
+        "NotificationsTable",
+        "QueryLambdaRole",
+    ],
+)
+def test_query_adoption_contract_rejects_each_original_stack_resource_at_same_count(
+    prohibited_logical_id,
+):
+    template = _query_adoption_import_template()
+    replacement = template["Resources"].pop("ReservationsTable")
+    template["Resources"][prohibited_logical_id] = replacement
+
+    assert len(template["Resources"]) == 19
+
+    with pytest.raises(
+        AdoptionError,
+        match=rf"original|prohibited|{prohibited_logical_id}",
+    ):
+        adoption.validate_initial_import_contract(
+            template,
+            build_resources_to_import(valid_snapshot()),
+            _query_adoption_import_parameters(),
+            valid_snapshot(),
+        )
+
+
+@pytest.mark.parametrize(
     "mutation",
     [
-        lambda template: template["Resources"].update(
-            {
-                "FilesTable": {
-                    "Type": "AWS::DynamoDB::Table",
-                    "DeletionPolicy": "Retain",
-                    "UpdateReplacePolicy": "Retain",
-                    "Properties": {"TableName": "PacificBioArchiveFiles"},
-                }
-            }
-        ),
         lambda template: template.update(
             {"Outputs": {"Forbidden": {"Value": "not-permitted"}}}
         ),
@@ -429,9 +498,9 @@ def test_query_adoption_contract_accepts_exact_initial_import_artifacts():
             {"InternalApiKey": {"Type": "String", "NoEcho": True}}
         ),
     ],
-    ids=("original-stack-resource", "output", "secret-parameter"),
+    ids=("output", "secret-parameter"),
 )
-def test_query_adoption_contract_rejects_prohibited_import_template_content(
+def test_query_adoption_contract_rejects_prohibited_import_template_section(
     mutation,
 ):
     template = _query_adoption_import_template()
@@ -444,6 +513,60 @@ def test_query_adoption_contract_rejects_prohibited_import_template_content(
         adoption.validate_initial_import_contract(
             template,
             build_resources_to_import(valid_snapshot()),
+            _query_adoption_import_parameters(),
+            valid_snapshot(),
+        )
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        lambda template: template["Resources"]["QueryFunction"].update(
+            {"Type": "AWS::SNS::Topic"}
+        ),
+        lambda template: template["Resources"].update(
+            {
+                "UnknownLogicalId": template["Resources"].pop(
+                    "QueryFunction"
+                )
+            }
+        ),
+    ],
+    ids=("wrong-resource-type", "unknown-logical-id"),
+)
+def test_query_adoption_contract_rejects_template_type_or_logical_id(mutation):
+    template = _query_adoption_import_template()
+    mutation(template)
+
+    with pytest.raises(AdoptionError, match="type|logical|unknown|resource"):
+        adoption.validate_initial_import_contract(
+            template,
+            build_resources_to_import(valid_snapshot()),
+            _query_adoption_import_parameters(),
+            valid_snapshot(),
+        )
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        lambda manifest: manifest[0].update(
+            {"ResourceType": "AWS::SNS::Topic"}
+        ),
+        lambda manifest: manifest[0].update(
+            {"LogicalResourceId": "UnknownLogicalId"}
+        ),
+    ],
+    ids=("wrong-resource-type", "unknown-logical-id"),
+)
+def test_query_adoption_contract_rejects_manifest_type_or_logical_id(mutation):
+    manifest = build_resources_to_import(valid_snapshot())
+    mutation(manifest)
+
+    with pytest.raises(AdoptionError, match="type|logical|unknown|resource"):
+        adoption.validate_initial_import_contract(
+            _query_adoption_import_template(),
+            manifest,
             _query_adoption_import_parameters(),
             valid_snapshot(),
         )
@@ -500,48 +623,106 @@ def test_query_adoption_contract_accepts_exact_unmanaged_owner_set():
     )
 
 
-def test_query_adoption_contract_requires_import_change_set_type():
-    snapshot = valid_snapshot()
-    expected = build_resources_to_import(snapshot)
-    changes = [
-        {
-            "ResourceChange": {
-                "Action": "Import",
-                "LogicalResourceId": item["LogicalResourceId"],
-                "ResourceType": item["ResourceType"],
-                "Replacement": "False",
-            }
-        }
-        for item in expected
-    ]
+@pytest.mark.parametrize("mutation", ["missing", "unexpected"])
+def test_query_adoption_contract_requires_exact_nineteen_owner_keys(mutation):
+    owners = {logical_id: None for logical_id in _EXPECTED_IMPORT_RESOURCES}
+    if mutation == "missing":
+        owners.pop("QueryFunction")
+    else:
+        owners["UnexpectedLogicalId"] = None
 
+    with pytest.raises(AdoptionError, match="owner|logical|19|resource"):
+        adoption.validate_import_owners(owners)
+
+
+def test_query_adoption_contract_accepts_explicit_import_change_set_type():
+    adoption.validate_import_change_set(
+        _query_adoption_import_changes(),
+        build_resources_to_import(valid_snapshot()),
+        change_set_type="IMPORT",
+    )
+
+
+@pytest.mark.parametrize(
+    "change_set_type",
+    ["CREATE", "UPDATE", "import", None, False],
+    ids=("create", "update", "lowercase", "none", "boolean"),
+)
+def test_query_adoption_contract_rejects_invalid_import_change_set_type(
+    change_set_type,
+):
     with pytest.raises(AdoptionError, match="IMPORT|type"):
         adoption.validate_import_change_set(
-            changes,
-            expected,
-            change_set_type="UPDATE",
+            _query_adoption_import_changes(),
+            build_resources_to_import(valid_snapshot()),
+            change_set_type=change_set_type,
+        )
+
+
+def test_query_adoption_contract_rejects_missing_import_change_set_type():
+    with pytest.raises(TypeError):
+        adoption.validate_import_change_set(
+            _query_adoption_import_changes(),
+            build_resources_to_import(valid_snapshot()),
         )
 
 
 @pytest.mark.parametrize("action", ["Add", "Modify", "Remove", "Dynamic"])
 def test_query_adoption_contract_rejects_every_non_import_action(action):
-    snapshot = valid_snapshot()
-    expected = build_resources_to_import(snapshot)
-    changes = [
-        {
-            "ResourceChange": {
-                "Action": "Import",
-                "LogicalResourceId": item["LogicalResourceId"],
-                "ResourceType": item["ResourceType"],
-                "Replacement": "False",
-            }
-        }
-        for item in expected
-    ]
+    expected = build_resources_to_import(valid_snapshot())
+    changes = _query_adoption_import_changes()
     changes[0]["ResourceChange"]["Action"] = action
 
     with pytest.raises(AdoptionError, match="19 Import|action"):
-        adoption.validate_import_change_set(changes, expected)
+        adoption.validate_import_change_set(
+            changes,
+            expected,
+            change_set_type="IMPORT",
+        )
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("ResourceType", "AWS::SNS::Topic"),
+        ("LogicalResourceId", "UnknownLogicalId"),
+    ],
+    ids=("wrong-resource-type", "unknown-logical-id"),
+)
+def test_query_adoption_contract_rejects_change_set_resource_type_or_logical_id(
+    field,
+    value,
+):
+    expected = build_resources_to_import(valid_snapshot())
+    changes = _query_adoption_import_changes()
+    changes[0]["ResourceChange"][field] = value
+
+    with pytest.raises(AdoptionError, match="type|logical|unknown|resource"):
+        adoption.validate_import_change_set(
+            changes,
+            expected,
+            change_set_type="IMPORT",
+        )
+
+
+@pytest.mark.parametrize(
+    "replacement",
+    [None, True, "True", "Conditional"],
+    ids=("missing", "boolean-true", "string-true", "conditional"),
+)
+def test_query_adoption_contract_rejects_every_non_false_replacement(
+    replacement,
+):
+    expected = build_resources_to_import(valid_snapshot())
+    changes = _query_adoption_import_changes()
+    changes[0]["ResourceChange"]["Replacement"] = replacement
+
+    with pytest.raises(AdoptionError, match="Replacement|False|replacement"):
+        adoption.validate_import_change_set(
+            changes,
+            expected,
+            change_set_type="IMPORT",
+        )
 
 
 def _route_scoped_lambda_policy(snapshot, *, removed_legacy_count):
