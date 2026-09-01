@@ -61,6 +61,31 @@ test("FastAPI nested detail code and payload survive the API boundary", async ()
   assert.deepEqual(error.payload, payload);
 });
 
+test("FastAPI validation errors become a useful query input message", async () => {
+  installStorage();
+  const payload = {
+    detail: [
+      {
+        type: "missing",
+        loc: ["body", "file"],
+        msg: "Field required",
+        input: null,
+      },
+    ],
+  };
+
+  const error = await captureApiError(
+    new Response(JSON.stringify(payload), { status: 422 })
+  );
+
+  assert.ok(error instanceof ApiError);
+  assert.equal(error.status, 422);
+  assert.equal(
+    error.message,
+    "Check the selected file, tags, or thumbnail reference and try again."
+  );
+});
+
 test("non-JSON server failure becomes a controlled ApiError", async () => {
   installStorage();
 

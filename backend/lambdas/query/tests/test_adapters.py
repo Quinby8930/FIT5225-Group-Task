@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+from datetime import datetime, timezone
 import json
+import sys
+from types import ModuleType
 from urllib.error import HTTPError
 from urllib.parse import urlsplit
 from urllib.request import Request
@@ -10,8 +13,92 @@ from uuid import UUID
 
 import pytest
 
+from app.notification_client import SNSNotificationPublisher
+from app.schemas import Notification
 from app.storage_client import LambdaStorageClient, StorageClientError
 from app.tag_detector import RemoteTagDetector, TagDetectionError, _NoRedirectHandler
+
+
+class FakeSNSClient:
+    def __init__(self, error=None):
+        self.error = error
+        self.calls = []
+
+    def publish(self, **kwargs):
+        self.calls.append(kwargs)
+        if self.error is not None:
+            raise self.error
+        return {"MessageId": "message-1"}
+
+
+def _sns_publisher(monkeypatch, client, **kwargs):
+    boto3 = ModuleType("boto3")
+
+    def build_client(service_name, *, region_name):
+        assert service_name == "sns"
+        assert region_name == "ap-southeast-2"
+        return client
+
+    boto3.client = build_client
+    monkeypatch.setitem(sys.modules, "boto3", boto3)
+    return SNSNotificationPublisher(region="ap-southeast-2", **kwargs)
+
+
+def _notification(user_id="user-1"):
+    return Notification(
+        notification_id="notification-1",
+        user_id=user_id,
+        file_id="file-1",
+        species="wombat",
+        object_key=f"originals/{user_id}/file-1/wombat.jpg",
+        created_at=datetime(2026, 9, 1, 12, 0, tzinfo=timezone.utc),
+    )
+
+
+def test_sns_notification_publisher_selects_the_topic_from_user_id(monkeypatch):
+    sns = FakeSNSClient()
+    publisher = _sns_publisher(
+        monkeypatch,
+        sns,
+        topic_arn_template="arn:aws:sns:ap-southeast-2:123456789012:alerts-{user_id}",
+    )
+
+    publisher.publish(_notification("user-42"))
+
+    assert sns.calls[0]["TopicArn"] == (
+        "arn:aws:sns:ap-southeast-2:123456789012:alerts-user-42"
+    )
+
+
+def test_sns_notification_publisher_message_identifies_user_species_and_file(
+    monkeypatch,
+):
+    sns = FakeSNSClient()
+    publisher = _sns_publisher(
+        monkeypatch,
+        sns,
+        topic_arn="arn:aws:sns:ap-southeast-2:123456789012:archive-alerts",
+    )
+
+    publisher.publish(_notification())
+
+    message = json.loads(sns.calls[0]["Message"])
+    assert {
+        "user_id": message["user_id"],
+        "species": message["species"],
+        "file_id": message["file_id"],
+    } == {"user_id": "user-1", "species": "wombat", "file_id": "file-1"}
+
+
+def test_sns_notification_publisher_propagates_publish_failure(monkeypatch):
+    publisher = _sns_publisher(
+        monkeypatch,
+        FakeSNSClient(error=RuntimeError("SNS unavailable")),
+        topic_arn="arn:aws:sns:ap-southeast-2:123456789012:archive-alerts",
+    )
+
+    with pytest.raises(RuntimeError, match="SNS unavailable"):
+        publisher.publish(_notification())
 
 
 class FakePayload:

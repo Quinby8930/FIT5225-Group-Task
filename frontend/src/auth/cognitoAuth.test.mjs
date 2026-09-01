@@ -13,6 +13,7 @@ import {
   inspectAuthSession,
   inspectStoredAuthSession,
   saveTokens,
+  signInWithGoogle,
 } from "./cognitoAuth.js";
 
 const PKCE_STORAGE_KEY = "pacificBioArchive.pkce";
@@ -86,6 +87,20 @@ test("login and signup create complete PKCE S256 authorization transactions", as
 
   installBrowserStubs();
   assertPkceAuthorizationUrl(await buildSignUpUrl(TEST_CONFIG), "/signup");
+});
+
+test("Google login sends Cognito the Google identity provider hint", async () => {
+  installBrowserStubs();
+  let assignedUrl = null;
+  globalThis.window = {
+    location: {
+      assign(url) { assignedUrl = String(url); },
+    },
+  };
+
+  await signInWithGoogle();
+
+  assert.equal(new URL(assignedUrl).searchParams.get("identity_provider"), "Google");
 });
 
 test("concurrent callback handling shares one token exchange per authorization code", async () => {

@@ -34,6 +34,9 @@ function errorMessage(payload, status) {
   if (typeof payload?.message === "string") return payload.message;
   if (typeof payload?.detail?.message === "string") return payload.detail.message;
   if (typeof payload?.detail === "string") return payload.detail;
+  if (status === 422) {
+    return "Check the selected file, tags, or thumbnail reference and try again.";
+  }
   return `API request failed: ${status}`;
 }
 
