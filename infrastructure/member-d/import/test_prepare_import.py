@@ -23,6 +23,7 @@ from adoption import (
     AdoptionError,
     CodeArtifact,
     build_import_template,
+    build_parameters_to_reuse,
     build_resources_to_import,
     validate_import_change_set,
     validate_update_change_set,
@@ -127,8 +128,16 @@ class FakeAwsCli:
             return {"Arn": self.caller_arn, "Account": "111122223333"}
         if "describe-stacks" in command:
             if "--query" in args:
+                query = args[args.index("--query") + 1]
+                if query == (
+                    "Stacks[0].{StackName:StackName,StackStatus:StackStatus}"
+                ):
+                    return {
+                        "StackName": "PacificBioArchive-Database",
+                        "StackStatus": "UPDATE_ROLLBACK_COMPLETE",
+                    }
                 return {
-                    "StackName": "PacificBioArchive-Database",
+                    "StackName": "PacificBioArchive-QueryAdoption",
                     "ParameterNames": ["InternalApiKey"],
                 }
             return {"Stacks": [{"StackName": "PacificBioArchive-Database", "StackStatus": "UPDATE_ROLLBACK_COMPLETE", "Parameters": [{"ParameterKey": "InternalApiKey", "ParameterValue": "internal-secret"}]}]}
@@ -581,9 +590,7 @@ def _write_change_set_validation_files(workdir):
             "import-version-1",
         ),
     )
-    import_parameters = [
-        {"ParameterKey": "InternalApiKey", "UsePreviousValue": True}
-    ]
+    import_parameters = build_parameters_to_reuse(snapshot)
     built = _built_update_template()
     packaging_cli = FakeAwsCli(uploaded_checksum="from-put-object")
     artifact = prepare_import.package_update_function(
@@ -701,7 +708,7 @@ class CandidateChangeSetCli(FakeAwsCli):
                 "ParameterNames:Parameters[].ParameterKey}"
             ):
                 return {
-                    "StackName": "PacificBioArchive-Database",
+                    "StackName": "PacificBioArchive-QueryAdoption",
                     "ParameterNames": deepcopy(self.stack_parameter_names) or None,
                 }
             if query == "Stacks[0].Parameters":
@@ -739,6 +746,8 @@ def _validate_change_set_args(
         "--region",
         "ap-southeast-2",
         "--stack",
+        "PacificBioArchive-QueryAdoption",
+        "--source-stack",
         "PacificBioArchive-Database",
         "--change-set",
         f"member-d-{expected_type.lower()}",
@@ -1617,14 +1626,18 @@ def test_backup_rejects_uploaded_checksum_mismatch():
 def test_change_set_must_contain_exactly_nineteen_imports():
     expected = build_resources_to_import(valid_snapshot())
     changes = [{"ResourceChange": {"Action": "Import", "LogicalResourceId": item["LogicalResourceId"], "ResourceType": item["ResourceType"], "Replacement": "False"}} for item in expected]
-    validate_import_change_set(changes, expected)
+    validate_import_change_set(changes, expected, change_set_type="IMPORT")
 
 
 @pytest.mark.parametrize("action", ["Add", "Modify", "Remove", "Dynamic"])
 def test_change_set_rejects_every_non_import_action(action):
     expected = build_resources_to_import(valid_snapshot())
     with pytest.raises(AdoptionError, match="19 Import"):
-        validate_import_change_set([{"ResourceChange": {"Action": action, "LogicalResourceId": "QueryFunction", "ResourceType": "AWS::Lambda::Function", "Replacement": "False"}}], expected)
+        validate_import_change_set(
+            [{"ResourceChange": {"Action": action, "LogicalResourceId": "QueryFunction", "ResourceType": "AWS::Lambda::Function", "Replacement": "False"}}],
+            expected,
+            change_set_type="IMPORT",
+        )
 
 
 def test_processed_update_reuses_function_and_has_no_implicit_role():
@@ -2238,7 +2251,7 @@ def test_prepare_accepts_direct_code_query_and_writes_sanitized_artifacts(
         assert "internal-secret" not in text
         assert "X-Amz-Signature" not in text
     parameters = json.loads((tmp_path / "import-parameters.json").read_text(encoding="utf-8"))
-    assert parameters == [{"ParameterKey": "InternalApiKey", "UsePreviousValue": True}]
+    assert parameters == build_parameters_to_reuse(valid_snapshot())
     template = json.loads((tmp_path / "import-template.json").read_text(encoding="utf-8"))
     function_properties = template["Resources"]["QueryFunction"]["Properties"]
     assert {"KmsKeyArn", "CodeSigningConfigArn", "ReservedConcurrentExecutions"}.isdisjoint(function_properties)
@@ -2248,13 +2261,10 @@ def test_prepare_accepts_direct_code_query_and_writes_sanitized_artifacts(
     assert "X-Amz-Signature" not in captured.out + captured.err
 
 
-def test_prepare_with_missing_internal_key_writes_no_parameter_value(tmp_path):
+def test_prepare_with_missing_internal_key_writes_audited_parameter_values(tmp_path):
     class MissingInternalKeyStackCli(FakeAwsCli):
         def json(self, *args):
             response = super().json(*args)
-            if args[:2] == ("cloudformation", "describe-stacks"):
-                response = deepcopy(response)
-                response["Stacks"][0]["Parameters"] = []
             if (
                 args[:2] == ("cloudformation", "get-template")
                 and "--change-set-name" not in args
@@ -2279,7 +2289,7 @@ def test_prepare_with_missing_internal_key_writes_no_parameter_value(tmp_path):
 
     assert json.loads(
         (tmp_path / "import-parameters.json").read_text(encoding="utf-8")
-    ) == []
+    ) == build_parameters_to_reuse(valid_snapshot())
     template = json.loads(
         (tmp_path / "import-template.json").read_text(encoding="utf-8")
     )
@@ -2591,7 +2601,7 @@ def test_collection_preserves_every_supported_integration_property(tmp_path):
         CodeArtifact("private-artifacts", "backups/code.zip", "version-1"),
     )
     expected_properties = {
-        "ApiId": "2dd2aqb32j",
+        "ApiId": {"Ref": "ExistingHttpApiId"},
         **{key: value for key, value in supported.items() if key != "IntegrationId"},
     }
     assert template["Resources"]["QueryIntegration"]["Properties"] == (
@@ -2905,7 +2915,7 @@ def test_update_rejects_internal_key_reference_outside_query_environment(leak):
         )
 
 
-def test_import_artifacts_accept_exact_local_template_and_use_previous():
+def test_import_artifacts_accept_exact_local_template_and_audited_values():
     snapshot = valid_snapshot()
     local = build_import_template(
         snapshot,
@@ -2915,9 +2925,7 @@ def test_import_artifacts_accept_exact_local_template_and_use_previous():
             "import-version-1",
         ),
     )
-    parameters = [
-        {"ParameterKey": "InternalApiKey", "UsePreviousValue": True}
-    ]
+    parameters = build_parameters_to_reuse(snapshot)
 
     adoption.validate_import_artifacts(
         deepcopy(local),
@@ -2929,7 +2937,7 @@ def test_import_artifacts_accept_exact_local_template_and_use_previous():
     )
 
 
-def test_import_artifacts_accept_no_parameters_when_internal_key_is_missing():
+def test_import_artifacts_ignore_missing_source_internal_key_registration():
     snapshot = valid_snapshot()
     snapshot["stack"]["parameters"] = []
     snapshot["stack"]["template"].pop("Parameters")
@@ -2945,8 +2953,8 @@ def test_import_artifacts_accept_no_parameters_when_internal_key_is_missing():
     adoption.validate_import_artifacts(
         deepcopy(local),
         local,
-        [],
-        [],
+        build_parameters_to_reuse(snapshot),
+        build_parameters_to_reuse(snapshot),
         snapshot,
         "private-artifacts",
     )
@@ -3026,6 +3034,7 @@ def test_import_change_set_rejects_query_role_modify_with_missing_internal_key()
         adoption.validate_import_change_set(
             changes,
             build_resources_to_import(snapshot),
+            change_set_type="IMPORT",
         )
 
 
@@ -3036,7 +3045,11 @@ def test_missing_internal_key_import_still_contains_exactly_nineteen_imports():
     expected = build_resources_to_import(snapshot)
     changes = _import_changes(snapshot)
 
-    adoption.validate_import_change_set(changes, expected)
+    adoption.validate_import_change_set(
+        changes,
+        expected,
+        change_set_type="IMPORT",
+    )
 
     assert len(changes) == 19
     assert all(
@@ -3146,7 +3159,7 @@ def test_import_artifacts_reject_processed_template_injection(section):
         )
 
 
-def test_real_import_failure_regression_rejects_parameter_registration_even_with_equal_outputs():
+def test_import_rejects_source_parameter_or_output_injection():
     snapshot = valid_snapshot()
     snapshot["stack"]["parameters"] = []
     snapshot["stack"]["template"].pop("Parameters")
@@ -3174,14 +3187,12 @@ def test_real_import_failure_regression_rejects_parameter_registration_even_with
             "MinLength": 1,
         }
     }
-    assert one_step_candidate["Outputs"] == local["Outputs"]
-
     with pytest.raises(AdoptionError, match="processed|template|injection"):
         adoption.validate_import_artifacts(
             one_step_candidate,
             local,
-            [],
-            [],
+            build_parameters_to_reuse(snapshot),
+            build_parameters_to_reuse(snapshot),
             snapshot,
             "private-artifacts",
         )
@@ -3682,7 +3693,7 @@ def test_change_set_validator_uses_explicit_workdir_and_candidate_template(tmp_p
             calls.append(args)
             if args[:2] == ("cloudformation", "describe-stacks"):
                 return {
-                    "StackName": "PacificBioArchive-Database",
+                    "StackName": "PacificBioArchive-QueryAdoption",
                     "ParameterNames": ["InternalApiKey"],
                 }
             if args[:2] == ("cloudformation", "describe-change-set"):
@@ -3743,7 +3754,13 @@ def test_change_set_validator_uses_explicit_workdir_and_candidate_template(tmp_p
         "_verify_committed_file",
         lambda *_args: None,
     )
-    monkeypatch.setattr(prepare_import, "validate_import_change_set", lambda changes, expected: calls.append(("import", expected)))
+    monkeypatch.setattr(
+        prepare_import,
+        "validate_import_change_set",
+        lambda changes, expected, **kwargs: calls.append(
+            ("import", expected, kwargs)
+        ),
+    )
     monkeypatch.setattr(
         prepare_import,
         "validate_update_change_set",
@@ -3796,7 +3813,8 @@ def test_change_set_validator_requires_complete_available_candidate(
         prepare_import.main([
             "validate-change-set",
             "--region", "ap-southeast-2",
-            "--stack", "stack",
+            "--stack", "PacificBioArchive-QueryAdoption",
+            "--source-stack", "PacificBioArchive-Database",
             "--change-set", "candidate",
             "--expected-type", "UPDATE",
             "--workdir", str(tmp_path),

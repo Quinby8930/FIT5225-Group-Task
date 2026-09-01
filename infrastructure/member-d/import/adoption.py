@@ -10,6 +10,7 @@ import binascii
 from copy import deepcopy
 from dataclasses import dataclass
 import re
+from types import MappingProxyType
 from typing import Any, Mapping
 
 
@@ -49,6 +50,41 @@ ROUTES_BY_LOGICAL_ID: dict[str, RouteContract] = {
     "FailFileRoute": RouteContract("PUT /internal/files/{file_id}/failed", "NONE"),
     "AuthorizeAssetsRoute": RouteContract("POST /internal/assets/authorize", "NONE"),
 }
+
+SOURCE_STACK_NAME = "PacificBioArchive-Database"
+TARGET_STACK_NAME = "PacificBioArchive-QueryAdoption"
+ORIGINAL_STACK_LOGICAL_IDS = frozenset(
+    {
+        "FilesTable",
+        "SubscriptionsTable",
+        "NotificationsTable",
+        "QueryLambdaRole",
+    }
+)
+IMPORT_LOGICAL_IDS = frozenset(
+    {
+        "ReservationsTable",
+        "QueryFunction",
+        "QueryIntegration",
+        *ROUTES_BY_LOGICAL_ID,
+    }
+)
+IMPORT_RESOURCE_TYPES = MappingProxyType(
+    {
+        "ReservationsTable": "AWS::DynamoDB::Table",
+        "QueryFunction": "AWS::Lambda::Function",
+        "QueryIntegration": "AWS::ApiGatewayV2::Integration",
+        **{
+            logical_id: "AWS::ApiGatewayV2::Route"
+            for logical_id in ROUTES_BY_LOGICAL_ID
+        },
+    }
+)
+IMPORT_PARAMETER_NAMES = (
+    "ExistingQueryLambdaRoleArn",
+    "ExistingHttpApiId",
+    "ExistingJwtAuthorizerId",
+)
 
 OPTIONS_ROUTES_BY_LOGICAL_ID: dict[str, RouteContract] = {
     "AuthTestOptionsRoute": RouteContract("OPTIONS /auth-test", "NONE"),
@@ -96,13 +132,8 @@ _FUNCTION_PROPERTIES = (
     "DeadLetterConfig", "TracingConfig", "LoggingConfig", "CodeSigningConfigArn",
     "RuntimeManagementConfig", "ReservedConcurrentExecutions",
 )
-_BASE_MANAGED = {"FilesTable", "SubscriptionsTable", "NotificationsTable", "QueryLambdaRole"}
-_ADOPTED_LOGICAL_IDS = {
-    "ReservationsTable",
-    "QueryFunction",
-    "QueryIntegration",
-    *ROUTES_BY_LOGICAL_ID,
-}
+_BASE_MANAGED = ORIGINAL_STACK_LOGICAL_IDS
+_ADOPTED_LOGICAL_IDS = IMPORT_LOGICAL_IDS
 _INTEGRATION_KEYS = {"IntegrationId", "IntegrationType", "IntegrationSubtype", "IntegrationMethod", "PayloadFormatVersion", "IntegrationUri", "ConnectionType", "ConnectionId", "ContentHandlingStrategy", "CredentialsArn", "Description", "PassthroughBehavior", "RequestParameters", "RequestTemplates", "ResponseParameters", "TemplateSelectionExpression", "TlsConfig", "TimeoutInMillis"}
 _ROUTE_KEYS = {"RouteId", "RouteKey", "Target", "AuthorizationType", "AuthorizerId", "ApiKeyRequired", "AuthorizationScopes", "ModelSelectionExpression", "OperationName", "RequestModels", "RequestParameters", "RouteResponseSelectionExpression"}
 _HISTORICAL_LAMBDA_PERMISSIONS = (
@@ -120,6 +151,19 @@ _INTERNAL_API_KEY_PARAMETER = {
 def _require(condition: bool, message: str) -> None:
     if not condition:
         raise AdoptionError(message)
+
+
+def validate_stack_names(source_stack: str, target_stack: str) -> None:
+    """Require the approved, disjoint source and query-adoption stacks."""
+    _require(
+        source_stack == SOURCE_STACK_NAME,
+        f"source stack must be {SOURCE_STACK_NAME}",
+    )
+    _require(
+        target_stack == TARGET_STACK_NAME,
+        f"target stack must be {TARGET_STACK_NAME}",
+    )
+    _require(source_stack != target_stack, "source and target stacks must differ")
 
 
 def _find_parameter_reference_paths(
@@ -749,13 +793,20 @@ def validate_snapshot(snapshot: Mapping[str, Any]) -> None:
     _require(arn != f"arn:aws:iam::{account}:root", "Root caller is not permitted")
     _require(isinstance(account, str) and isinstance(arn, str) and arn == f"arn:aws:iam::{account}:user/fit5225-cli-deployer", "caller must be exact IAM user/fit5225-cli-deployer")
     stack = snapshot.get("stack", {})
-    _require(isinstance(stack, Mapping) and stack.get("status") in _STABLE_STACK_STATUSES, "stack is not in an import-safe stable state")
+    _require(
+        isinstance(stack, Mapping)
+        and stack.get("name") == SOURCE_STACK_NAME
+        and stack.get("status") in _STABLE_STACK_STATUSES,
+        "source stack identity or status is not import-safe",
+    )
     managed = stack.get("managed")
-    _require(isinstance(managed, Mapping) and set(managed) in (_BASE_MANAGED, _BASE_MANAGED | _ADOPTED_LOGICAL_IDS), "managed resource set mismatch")
+    _require(
+        isinstance(managed, Mapping) and set(managed) == _BASE_MANAGED,
+        "source stack managed resource set must contain exactly the four original resources",
+    )
     template = stack.get("template", {})
     resources = template.get("Resources", {}) if isinstance(template, Mapping) else {}
     _require(isinstance(resources, Mapping) and resources.get("QueryLambdaRole", {}).get("Type") == "AWS::IAM::Role", "stack-owned QueryLambdaRole missing")
-    _internal_api_key_is_registered(stack)
     role_name = "PacificBioArchive-QueryLambdaRole"
     processed_role_name = resources["QueryLambdaRole"].get("Properties", {}).get("RoleName")
     role_snapshot = snapshot.get("role", {})
@@ -813,25 +864,6 @@ def validate_snapshot(snapshot: Mapping[str, Any]) -> None:
             _require(route.get("AuthorizerId") == "7ir7fs", f"route authorizer mismatch for {contract.route_key}")
         else:
             _require(route.get("AuthorizerId") in (None, ""), f"internal route authorizer mismatch for {contract.route_key}")
-    if "ReservationsTable" in managed:
-        expected_physical_ids = {
-            "ReservationsTable": reservations_table["TableName"],
-            "QueryFunction": function["FunctionName"],
-            "QueryIntegration": integration["IntegrationId"],
-            **{
-                logical_id: routes[contract.route_key]["RouteId"]
-                for logical_id, contract in ROUTES_BY_LOGICAL_ID.items()
-            },
-        }
-        _require(
-            all(
-                managed.get(logical_id) == physical_id
-                for logical_id, physical_id in expected_physical_ids.items()
-            ),
-            "adopted resource physical identity mismatch",
-        )
-
-
 def build_resources_to_import(snapshot: Mapping[str, Any]) -> list[dict[str, Any]]:
     validate_snapshot(snapshot)
     api_id = snapshot["api"]["id"]
@@ -853,21 +885,12 @@ def _retained(resource_type: str, properties: Mapping[str, Any]) -> dict[str, An
 def _function_properties(
     function: Mapping[str, Any],
     artifact: CodeArtifact,
-    *,
-    include_internal_api_key: bool,
 ) -> dict[str, Any]:
     properties: dict[str, Any] = {
         "FunctionName": function["FunctionName"], "Runtime": function["Runtime"], "Handler": function["Handler"],
-        "Role": {"Fn::GetAtt": ["QueryLambdaRole", "Arn"]}, "Timeout": function["Timeout"], "MemorySize": function["MemorySize"],
+        "Role": {"Ref": "ExistingQueryLambdaRoleArn"}, "Timeout": function["Timeout"], "MemorySize": function["MemorySize"],
         "Code": {"S3Bucket": artifact.bucket, "S3Key": artifact.key, "S3ObjectVersion": artifact.version_id},
     }
-    if include_internal_api_key:
-        properties["Environment"] = {
-            "Variables": {
-                **dict(function["safe_environment"]),
-                "INTERNAL_API_KEY": {"Ref": "InternalApiKey"},
-            }
-        }
     for key in _FUNCTION_PROPERTIES[4:]:
         if not _is_unconfigured_function_property(key, function[key]):
             properties[key] = deepcopy(function[key])
@@ -877,9 +900,7 @@ def _function_properties(
 def build_import_template(snapshot: Mapping[str, Any], artifact: CodeArtifact) -> dict[str, Any]:
     validate_snapshot(snapshot)
     _require(all((artifact.bucket, artifact.key, artifact.version_id)), "artifact is incomplete")
-    template = deepcopy(snapshot["stack"]["template"])
-    internal_key_registered = _internal_api_key_is_registered(snapshot["stack"])
-    resources = template.setdefault("Resources", {})
+    resources: dict[str, Any] = {}
     table = snapshot["reservations_table"]
     resources["ReservationsTable"] = _retained(
         "AWS::DynamoDB::Table",
@@ -892,30 +913,138 @@ def build_import_template(snapshot: Mapping[str, Any], artifact: CodeArtifact) -
     )
     resources["QueryFunction"] = _retained(
         "AWS::Lambda::Function",
-        _function_properties(
-            snapshot["function"],
-            artifact,
-            include_internal_api_key=internal_key_registered,
-        ),
+        _function_properties(snapshot["function"], artifact),
     )
-    api_id = snapshot["api"]["id"]
     integration = snapshot["integration"]
-    integration_properties = {"ApiId": api_id, **{key: deepcopy(value) for key, value in integration.items() if key != "IntegrationId"}}
+    integration_properties = {
+        "ApiId": {"Ref": "ExistingHttpApiId"},
+        **{
+            key: deepcopy(value)
+            for key, value in integration.items()
+            if key != "IntegrationId"
+        },
+    }
     resources["QueryIntegration"] = _retained("AWS::ApiGatewayV2::Integration", integration_properties)
     for logical_id, contract in ROUTES_BY_LOGICAL_ID.items():
-        properties: dict[str, Any] = {"ApiId": api_id, "RouteKey": contract.route_key, "Target": {"Fn::Join": ["", ["integrations/", {"Ref": "QueryIntegration"}]]}, "AuthorizationType": contract.authorization_type}
+        properties: dict[str, Any] = {"ApiId": {"Ref": "ExistingHttpApiId"}, "RouteKey": contract.route_key, "Target": {"Fn::Join": ["", ["integrations/", {"Ref": "QueryIntegration"}]]}, "AuthorizationType": contract.authorization_type}
         if contract.authorization_type == "JWT":
-            properties["AuthorizerId"] = snapshot["api"]["authorizer"]["AuthorizerId"]
+            properties["AuthorizerId"] = {"Ref": "ExistingJwtAuthorizerId"}
         live_route = _route_lookup(snapshot)[contract.route_key]
         properties.update({key: deepcopy(value) for key, value in live_route.items() if key not in {"RouteId", "RouteKey", "Target", "AuthorizationType", "AuthorizerId"} and value is not None})
         resources[logical_id] = _retained("AWS::ApiGatewayV2::Route", properties)
-    return template
+    return {
+        "AWSTemplateFormatVersion": "2010-09-09",
+        "Description": "Dedicated import model for the Pacific Bio Archive query service",
+        "Parameters": {
+            name: {"Type": "String"} for name in IMPORT_PARAMETER_NAMES
+        },
+        "Resources": resources,
+    }
 
 
 def build_parameters_to_reuse(snapshot: Mapping[str, Any]) -> list[dict[str, Any]]:
+    """Compatibility name for explicit, audited IMPORT parameter values."""
     validate_snapshot(snapshot)
-    names = _stack_parameter_names(snapshot["stack"])
-    return [{"ParameterKey": name, "UsePreviousValue": True} for name in sorted(names)]
+    values = {
+        "ExistingQueryLambdaRoleArn": snapshot["function"]["Role"],
+        "ExistingHttpApiId": snapshot["api"]["id"],
+        "ExistingJwtAuthorizerId": snapshot["api"]["authorizer"][
+            "AuthorizerId"
+        ],
+    }
+    return [
+        {"ParameterKey": name, "ParameterValue": values[name]}
+        for name in IMPORT_PARAMETER_NAMES
+    ]
+
+
+def validate_initial_import_contract(
+    template: Mapping[str, Any],
+    manifest: list[Mapping[str, Any]],
+    parameters: list[Mapping[str, Any]],
+    snapshot: Mapping[str, Any],
+) -> None:
+    """Bind every initial IMPORT artifact to one audited standalone model."""
+    validate_snapshot(snapshot)
+    _require(isinstance(template, Mapping), "import template is unavailable")
+    _require(
+        set(template)
+        == {"AWSTemplateFormatVersion", "Description", "Parameters", "Resources"},
+        "import template contains a prohibited Output, Metadata, Transform, or section",
+    )
+    _require(
+        template.get("Parameters")
+        == {name: {"Type": "String"} for name in IMPORT_PARAMETER_NAMES},
+        "import template parameter definitions differ from the audited contract",
+    )
+    resources = template.get("Resources")
+    _require(
+        isinstance(resources, Mapping) and set(resources) == IMPORT_LOGICAL_IDS,
+        "import template resource logical IDs include an original or unknown resource",
+    )
+    _require(
+        {
+            logical_id: resource.get("Type")
+            for logical_id, resource in resources.items()
+            if isinstance(resource, Mapping)
+        }
+        == dict(IMPORT_RESOURCE_TYPES),
+        "import template resource type or logical ID mismatch",
+    )
+    _require(
+        all(
+            isinstance(resource, Mapping)
+            and resource.get("DeletionPolicy") == "Retain"
+            and resource.get("UpdateReplacePolicy") == "Retain"
+            for resource in resources.values()
+        ),
+        "every import resource must use Retain policies",
+    )
+    code = (
+        resources.get("QueryFunction", {})
+        .get("Properties", {})
+        .get("Code")
+    )
+    _require(
+        isinstance(code, Mapping)
+        and set(code) == {"S3Bucket", "S3Key", "S3ObjectVersion"}
+        and all(
+            isinstance(code.get(key), str) and bool(code.get(key))
+            for key in code
+        ),
+        "QueryFunction import artifact is malformed",
+    )
+    expected_template = build_import_template(
+        snapshot,
+        CodeArtifact(code["S3Bucket"], code["S3Key"], code["S3ObjectVersion"]),
+    )
+    _require(
+        template == expected_template,
+        "import template properties or audited references differ from the contract",
+    )
+    expected_manifest = build_resources_to_import(snapshot)
+    _require(
+        isinstance(manifest, list) and manifest == expected_manifest,
+        "import manifest resource type, logical ID, or primary identifier mismatch",
+    )
+    expected_parameters = build_parameters_to_reuse(snapshot)
+    _require(
+        isinstance(parameters, list) and parameters == expected_parameters,
+        "import parameter values differ from the audited contract",
+    )
+
+
+def validate_import_owners(owners: Mapping[str, str | None]) -> None:
+    """Require all and only the 19 candidates to be unmanaged."""
+    _require(
+        isinstance(owners, Mapping) and set(owners) == IMPORT_LOGICAL_IDS,
+        "resource owner mapping must contain exactly the 19 import logical IDs",
+    )
+    for logical_id, owner in owners.items():
+        _require(
+            owner is None,
+            f"resource owner for {logical_id} must be absent before import",
+        )
 
 
 def _runtime_fingerprint(snapshot: Mapping[str, Any]) -> dict[str, Any]:
@@ -946,22 +1075,81 @@ def assert_runtime_unchanged(before: Mapping[str, Any], after: Mapping[str, Any]
     _require(_runtime_fingerprint(before) == _runtime_fingerprint(after), "runtime changed after import")
 
 
-def validate_import_change_set(changes: list[Mapping[str, Any]], expected: list[Mapping[str, Any]]) -> None:
+def validate_import_change_set(
+    changes: list[Mapping[str, Any]],
+    expected: list[Mapping[str, Any]],
+    *,
+    change_set_type: str,
+) -> None:
+    _require(change_set_type == "IMPORT", "change set type must be exactly IMPORT")
     expected_pairs = {(item["LogicalResourceId"], item["ResourceType"]) for item in expected}
+    _require(
+        len(expected) == 19
+        and len(expected_pairs) == 19
+        and dict(expected_pairs) == dict(IMPORT_RESOURCE_TYPES),
+        "expected import resource type or logical ID mismatch",
+    )
     actual_pairs = set()
     for change in changes:
         resource_change = change.get("ResourceChange", {})
-        if resource_change.get("Action") != "Import" or resource_change.get("Replacement") not in ("False", False, None):
+        replacement_is_safe = (
+            "Replacement" not in resource_change
+            or resource_change.get("Replacement") == "False"
+        )
+        if not replacement_is_safe or isinstance(
+            resource_change.get("Replacement"), bool
+        ):
+            raise AdoptionError(
+                'Import Replacement must be omitted or the exact string "False"'
+            )
+        if resource_change.get("Action") != "Import":
             raise AdoptionError("change set must contain exactly 19 Import actions")
         actual_pairs.add((resource_change.get("LogicalResourceId"), resource_change.get("ResourceType")))
+    _require(
+        actual_pairs == expected_pairs,
+        "change set resource type or logical ID differs from the import contract",
+    )
     _require(
         len(expected) == 19
         and len(expected_pairs) == 19
         and len(changes) == 19
-        and actual_pairs == expected_pairs
         and len(actual_pairs) == 19,
         "change set must contain exactly 19 Import actions",
     )
+
+
+def classify_recovery_state(
+    status: str | None,
+    managed_logical_ids: set[str],
+) -> dict[str, Any]:
+    """Classify recovery without ever authorizing a destructive operation."""
+    managed = set(managed_logical_ids)
+    exact_import_boundary = managed == IMPORT_LOGICAL_IDS
+    empty_shell = not managed and status in {
+        "REVIEW_IN_PROGRESS",
+        "IMPORT_ROLLBACK_COMPLETE",
+    }
+    if status is None:
+        action = "prepare" if not managed else "stop"
+    elif status == "REVIEW_IN_PROGRESS":
+        action = "inspect" if not managed else "stop"
+    elif status == "IMPORT_COMPLETE":
+        action = "post-import-evidence" if exact_import_boundary else "stop"
+    elif status == "IMPORT_ROLLBACK_COMPLETE":
+        action = "recovery-report" if not managed else "stop"
+    elif status == "IMPORT_ROLLBACK_FAILED":
+        action = "freeze"
+    elif status == "UPDATE_ROLLBACK_COMPLETE":
+        action = (
+            "verify-runtime-and-ownership" if exact_import_boundary else "stop"
+        )
+    else:
+        action = "stop"
+    return {
+        "action": action,
+        "empty_shell_cleanup_candidate": empty_shell,
+        "deletion_requires_separate_approval": empty_shell,
+    }
 
 
 def _role_continuity_with_retain(audited: Mapping[str, Any], current: Mapping[str, Any]) -> bool:
@@ -1547,34 +1735,31 @@ def validate_import_artifacts(
         "IMPORT local or processed template differs from audited reconstruction",
     )
     expected_parameters = build_parameters_to_reuse(audited)
+    validate_initial_import_contract(
+        local_template,
+        build_resources_to_import(audited),
+        local_parameters,
+        audited,
+    )
     _require(
         isinstance(local_parameters, list)
         and local_parameters == expected_parameters,
         "generated import parameters are unavailable",
     )
-    expected_keys: set[str] = set()
-    for item in expected_parameters:
-        _require(
-            isinstance(item, Mapping)
-            and set(item) == {"ParameterKey", "UsePreviousValue"}
-            and isinstance(item.get("ParameterKey"), str)
-            and bool(item.get("ParameterKey"))
-            and item.get("UsePreviousValue") is True
-            and item["ParameterKey"] not in expected_keys,
-            "generated import parameters are malformed",
-        )
-        expected_keys.add(item["ParameterKey"])
+    expected_by_key = {
+        item["ParameterKey"]: item["ParameterValue"]
+        for item in expected_parameters
+    }
     actual = _change_set_parameter_map(change_set_parameters)
     _require(
-        set(actual) == expected_keys
+        set(actual) == set(expected_by_key)
         and all(
-            set(actual[name]) == {"ParameterKey", "UsePreviousValue"}
-            and
-            actual[name].get("UsePreviousValue") is True
-            and "ParameterValue" not in actual[name]
-            for name in expected_keys
+            set(actual[name]) == {"ParameterKey", "ParameterValue"}
+            and actual[name].get("ParameterValue") == expected_by_key[name]
+            and "UsePreviousValue" not in actual[name]
+            for name in expected_by_key
         ),
-        "IMPORT must reuse every existing parameter without a value override",
+        "IMPORT parameters must be the exact audited non-secret values",
     )
     return artifact
 

@@ -30,6 +30,8 @@ from adoption import (
     AdoptionError,
     CodeArtifact,
     ROUTES_BY_LOGICAL_ID,
+    SOURCE_STACK_NAME,
+    TARGET_STACK_NAME,
     assert_runtime_unchanged,
     build_import_template,
     build_parameters_to_reuse,
@@ -41,6 +43,7 @@ from adoption import (
     validate_hardening_parameter_transition,
     validate_lambda_policy_after_update,
     validate_snapshot,
+    validate_stack_names,
     validate_update_artifacts,
     validate_update_change_set,
 )
@@ -602,11 +605,23 @@ def collect_snapshot(cli: AwsCli, config: AuditConfig) -> dict[str, Any]:
         raise AdoptionError("Root caller is not permitted")
     if not isinstance(account, str) or arn != f"arn:aws:iam::{account}:user/fit5225-cli-deployer":
         raise AdoptionError("caller must be exact IAM user/fit5225-cli-deployer")
-    stacks = cli.json("cloudformation", "describe-stacks", "--stack-name", config.stack, "--region", config.region)
-    stack_items = stacks.get("Stacks", []) if isinstance(stacks, Mapping) else []
-    if len(stack_items) != 1:
+    stacks = cli.json(
+        "cloudformation",
+        "describe-stacks",
+        "--stack-name",
+        config.stack,
+        "--region",
+        config.region,
+        "--query",
+        "Stacks[0].{StackName:StackName,StackStatus:StackStatus}",
+    )
+    if (
+        not isinstance(stacks, Mapping)
+        or stacks.get("StackName") != config.stack
+        or not isinstance(stacks.get("StackStatus"), str)
+    ):
         raise AdoptionError("stack identity could not be verified")
-    stack_view = stack_items[0]
+    stack_view = stacks
     processed_response = cli.json("cloudformation", "get-template", "--stack-name", config.stack, "--template-stage", "Processed", "--region", config.region)
     template_body = (
         processed_response.get("TemplateBody")
@@ -618,13 +633,7 @@ def collect_snapshot(cli: AwsCli, config: AuditConfig) -> dict[str, Any]:
     resource_summaries = summaries.get("StackResourceSummaries", []) if isinstance(summaries, Mapping) else []
     managed = {item.get("LogicalResourceId"): item.get("PhysicalResourceId") for item in resource_summaries if isinstance(item, Mapping)}
     expected_managed = {"FilesTable", "SubscriptionsTable", "NotificationsTable", "QueryLambdaRole"}
-    adopted_managed = expected_managed | {
-        "ReservationsTable",
-        "QueryFunction",
-        "QueryIntegration",
-        *ROUTES_BY_LOGICAL_ID,
-    }
-    if set(managed) not in (expected_managed, adopted_managed) or any(not managed[key] for key in managed):
+    if set(managed) != expected_managed or any(not managed[key] for key in managed):
         raise AdoptionError("managed resource set mismatch")
     active = cli.json(
         "cloudformation",
@@ -792,9 +801,21 @@ def collect_snapshot(cli: AwsCli, config: AuditConfig) -> dict[str, Any]:
             schemas[resource_type] = json.loads(schema)["primaryIdentifier"] if isinstance(schema, str) else schema["primaryIdentifier"]
         except (KeyError, TypeError, json.JSONDecodeError) as error:
             raise AdoptionError("primary identifier schema is unavailable") from None
+    sanitized_template = deepcopy(dict(template))
+    declared_parameters = sanitized_template.get("Parameters")
+    if isinstance(declared_parameters, Mapping):
+        sanitized_parameters = {
+            key: deepcopy(value)
+            for key, value in declared_parameters.items()
+            if key != "InternalApiKey"
+        }
+        if sanitized_parameters:
+            sanitized_template["Parameters"] = sanitized_parameters
+        else:
+            sanitized_template.pop("Parameters", None)
     snapshot = {
         "caller": {"Arn": arn, "Account": caller.get("Account")}, "region": config.region,
-        "stack": {"name": config.stack, "status": stack_view.get("StackStatus"), "parameters": [parameter.get("ParameterKey") for parameter in stack_view.get("Parameters", []) if isinstance(parameter, Mapping)], "template": dict(template), "managed": managed},
+        "stack": {"name": config.stack, "status": stack_view.get("StackStatus"), "parameters": [], "template": sanitized_template, "managed": managed},
         "api": {"id": config.api, "stage": dict(stage), "authorizer": dict(authorizer), "routes": routes},
         "function": function,
         "integration": dict(integration),
@@ -1569,6 +1590,7 @@ def _parser() -> argparse.ArgumentParser:
     validator = subcommands.add_parser("validate-change-set")
     validator.add_argument("--region", required=True)
     validator.add_argument("--stack", required=True)
+    validator.add_argument("--source-stack", default=SOURCE_STACK_NAME)
     validator.add_argument("--change-set", required=True)
     validator.add_argument("--expected-type", choices=("IMPORT", "UPDATE"), required=True)
     validator.add_argument("--workdir", default=".work")
@@ -1635,6 +1657,7 @@ def main(argv: list[str] | None = None) -> int:
     args = _parser().parse_args(argv)
     cli = AwsCli()
     if args.command in ("audit", "prepare"):
+        validate_stack_names(args.stack, TARGET_STACK_NAME)
         config = AuditConfig(args.region, args.stack, args.api, args.authorizer, args.integration, args.function, Path(args.workdir))
         baseline = Path(args.baseline) if args.baseline else None
         snapshot_path = run_audit(cli, config, baseline=baseline)
@@ -1731,6 +1754,7 @@ def main(argv: list[str] | None = None) -> int:
         print(f"s3://{artifact.bucket}/{artifact.key}?versionId={artifact.version_id}")
         print("no CloudFormation change set was created or executed")
         return 0
+    validate_stack_names(args.source_stack, args.stack)
     change_set = cli.json("cloudformation", "describe-change-set", "--stack-name", args.stack, "--change-set-name", args.change_set, "--region", args.region)
     if (
         change_set.get("Status") != "CREATE_COMPLETE"
@@ -1761,7 +1785,7 @@ def main(argv: list[str] | None = None) -> int:
             cli,
             AuditConfig(
                 args.region,
-                args.stack,
+                args.source_stack,
                 args.api,
                 args.authorizer,
                 args.integration,
@@ -1822,7 +1846,11 @@ def main(argv: list[str] | None = None) -> int:
             raise AdoptionError(
                 "IMPORT artifact version or checksum differs from audited Lambda code"
             )
-        validate_import_change_set(change_set.get("Changes", []), expected)
+        validate_import_change_set(
+            change_set.get("Changes", []),
+            expected,
+            change_set_type=args.expected_type,
+        )
     else:
         if not args.artifact_bucket:
             raise AdoptionError("--artifact-bucket is required for UPDATE validation")

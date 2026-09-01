@@ -1324,7 +1324,11 @@ def test_import_template_retains_every_imported_resource_without_secret_value():
     for logical_id in imported:
         assert template["Resources"][logical_id]["DeletionPolicy"] == "Retain"
         assert template["Resources"][logical_id]["UpdateReplacePolicy"] == "Retain"
-    assert template["Parameters"]["InternalApiKey"] == {"Type": "String", "NoEcho": True, "MinLength": 1}
+    assert template["Parameters"] == {
+        name: {"Type": "String"}
+        for name in _EXPECTED_IMPORT_PARAMETER_VALUES
+    }
+    assert "InternalApiKey" not in str(template)
     rendered = str(template)
     assert "fixture-secret" not in rendered
     assert "POST /upload-url" not in rendered
@@ -1421,7 +1425,10 @@ def test_import_template_keeps_exact_live_lambda_rollback_package():
     assert function["Type"] == "AWS::Lambda::Function"
     assert function["Properties"]["FunctionName"] == "PacificBioArchive-QueryLambda"
     assert function["Properties"]["Code"] == {"S3Bucket": "private-artifacts", "S3Key": "backups/code.zip", "S3ObjectVersion": "version-1"}
-    assert function["Properties"]["Environment"]["Variables"]["INTERNAL_API_KEY"] == {"Ref": "InternalApiKey"}
+    assert function["Properties"]["Role"] == {
+        "Ref": "ExistingQueryLambdaRoleArn"
+    }
+    assert "Environment" not in function["Properties"]
 
 
 def test_import_template_omits_unset_optional_lambda_properties_but_keeps_set_values():
@@ -1454,13 +1461,14 @@ def test_import_template_preserves_explicit_optional_lambda_values_and_role_path
     assert properties["ReservedConcurrentExecutions"] == 0
 
 
-def test_import_parameters_reuse_existing_internal_key_without_reading_it():
+def test_import_parameters_bind_only_exact_audited_non_secret_values():
     parameters = build_parameters_to_reuse(valid_snapshot())
-    assert {"ParameterKey": "InternalApiKey", "UsePreviousValue": True} in parameters
-    assert all("ParameterValue" not in item for item in parameters)
+    assert parameters == _query_adoption_import_parameters()
+    assert "InternalApiKey" not in str(parameters)
+    assert "UsePreviousValue" not in str(parameters)
 
 
-def test_import_template_preserves_missing_internal_key_and_outputs_exactly():
+def test_import_template_discards_source_parameters_and_outputs():
     snapshot = valid_snapshot()
     snapshot["stack"]["parameters"] = []
     snapshot["stack"]["template"].pop("Parameters")
@@ -1476,16 +1484,6 @@ def test_import_template_preserves_missing_internal_key_and_outputs_exactly():
         },
         "TableName": {"Value": {"Ref": "FilesTable"}},
     }
-    original_parameters = deepcopy(
-        snapshot["stack"]["template"].get("Parameters")
-    )
-    original_outputs = deepcopy(snapshot["stack"]["template"]["Outputs"])
-    original_non_resources = {
-        key: deepcopy(value)
-        for key, value in snapshot["stack"]["template"].items()
-        if key != "Resources"
-    }
-
     template = build_import_template(
         snapshot,
         CodeArtifact(
@@ -1495,17 +1493,23 @@ def test_import_template_preserves_missing_internal_key_and_outputs_exactly():
         ),
     )
 
-    assert template.get("Parameters") == original_parameters
-    assert template["Outputs"] == original_outputs
-    assert {
-        key: value for key, value in template.items() if key != "Resources"
-    } == original_non_resources
+    assert set(template) == {
+        "AWSTemplateFormatVersion",
+        "Description",
+        "Parameters",
+        "Resources",
+    }
+    assert template["Parameters"] == {
+        name: {"Type": "String"}
+        for name in _EXPECTED_IMPORT_PARAMETER_VALUES
+    }
+    assert "Outputs" not in template
     assert "Environment" not in template["Resources"]["QueryFunction"]["Properties"]
     assert "InternalApiKey" not in str(template)
 
 
 @pytest.mark.parametrize("keep_empty_section", [False, True])
-def test_missing_internal_key_preserves_parameters_section_shape(keep_empty_section):
+def test_source_parameter_shape_does_not_change_import_parameters(keep_empty_section):
     snapshot = valid_snapshot()
     snapshot["stack"]["parameters"] = []
     if keep_empty_section:
@@ -1518,18 +1522,16 @@ def test_missing_internal_key_preserves_parameters_section_shape(keep_empty_sect
         CodeArtifact("private-artifacts", "backups/code.zip", "version-1"),
     )
 
-    assert ("Parameters" in template) is keep_empty_section
-    assert template.get("Parameters", {}) == {}
+    assert template["Parameters"] == {
+        name: {"Type": "String"}
+        for name in _EXPECTED_IMPORT_PARAMETER_VALUES
+    }
 
 
-def test_missing_internal_key_keeps_role_template_and_parameter_file_secret_free():
+def test_import_omits_source_role_and_parameter_file_is_secret_free():
     snapshot = valid_snapshot()
     snapshot["stack"]["parameters"] = []
     snapshot["stack"]["template"].pop("Parameters")
-    original_role = deepcopy(
-        snapshot["stack"]["template"]["Resources"]["QueryLambdaRole"]
-    )
-
     template = build_import_template(
         snapshot,
         CodeArtifact(
@@ -1539,37 +1541,27 @@ def test_missing_internal_key_keeps_role_template_and_parameter_file_secret_free
         ),
     )
 
-    assert template["Resources"]["QueryLambdaRole"] == original_role
-    assert build_parameters_to_reuse(snapshot) == []
+    assert "QueryLambdaRole" not in template["Resources"]
+    assert build_parameters_to_reuse(snapshot) == (
+        _query_adoption_import_parameters()
+    )
 
 
-def test_post_import_baseline_allows_expected_managed_resource_ownership_only():
-    before = valid_snapshot()
-    after = deepcopy(before)
-    after["stack"]["managed"]["QueryFunction"] = "PacificBioArchive-QueryLambda"
-    after["stack"]["managed"]["QueryIntegration"] = "fbjojun"
-    after["stack"]["managed"]["ReservationsTable"] = "PacificBioArchiveUploadReservations"
-    for logical_id, route in zip(ROUTES_BY_LOGICAL_ID, after["api"]["routes"]):
-        after["stack"]["managed"][logical_id] = route["RouteId"]
-    assert_runtime_unchanged(before, after)
+def test_source_snapshot_rejects_target_stack_resource_ownership():
+    snapshot = valid_snapshot()
+    snapshot["stack"]["managed"]["QueryFunction"] = (
+        "PacificBioArchive-QueryLambda"
+    )
+
+    with pytest.raises(AdoptionError, match="source stack|original resources"):
+        validate_snapshot(snapshot)
 
 
-def test_post_import_baseline_requires_parameter_names_to_remain_unchanged():
+def test_runtime_baseline_accepts_unchanged_source_snapshot():
     before = valid_snapshot()
     before["stack"]["parameters"] = []
     before["stack"]["template"].pop("Parameters")
     after = deepcopy(before)
-    after["stack"]["managed"].update({
-        "QueryFunction": "PacificBioArchive-QueryLambda",
-        "QueryIntegration": "fbjojun",
-        "ReservationsTable": "PacificBioArchiveUploadReservations",
-    })
-    for logical_id, route in zip(
-        ROUTES_BY_LOGICAL_ID,
-        after["api"]["routes"],
-    ):
-        after["stack"]["managed"][logical_id] = route["RouteId"]
-
     assert_runtime_unchanged(before, after)
 
 
@@ -1600,7 +1592,7 @@ def test_post_import_baseline_rejects_parameter_registration_during_import():
     ],
     ids=("name-only", "template-only", "non-noecho-definition"),
 )
-def test_snapshot_rejects_internal_key_registration_mismatch(
+def test_snapshot_ignores_internal_key_registration_state(
     parameter_names,
     parameter_definition,
 ):
@@ -1613,8 +1605,7 @@ def test_snapshot_rejects_internal_key_registration_mismatch(
             "InternalApiKey": parameter_definition
         }
 
-    with pytest.raises(AdoptionError, match="InternalApiKey|NoEcho|parameter"):
-        validate_snapshot(snapshot)
+    validate_snapshot(snapshot)
 
 
 def test_post_import_baseline_rejects_output_change_during_import():
@@ -1631,7 +1622,7 @@ def test_post_import_baseline_rejects_output_change_during_import():
         assert_runtime_unchanged(before, after)
 
 
-def test_post_import_snapshot_rejects_wrong_adopted_physical_identity():
+def test_source_snapshot_rejects_any_adopted_resource_identity():
     snapshot = valid_snapshot()
     snapshot["stack"]["managed"].update({
         "ReservationsTable": "wrong-table",
@@ -1641,7 +1632,7 @@ def test_post_import_snapshot_rejects_wrong_adopted_physical_identity():
     for logical_id, route in zip(ROUTES_BY_LOGICAL_ID, snapshot["api"]["routes"]):
         snapshot["stack"]["managed"][logical_id] = route["RouteId"]
 
-    with pytest.raises(AdoptionError, match="physical identity"):
+    with pytest.raises(AdoptionError, match="source stack|original resources"):
         validate_snapshot(snapshot)
 
 
