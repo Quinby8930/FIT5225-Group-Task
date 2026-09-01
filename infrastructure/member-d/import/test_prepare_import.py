@@ -571,7 +571,6 @@ def _import_changes(snapshot):
 
 def _json_safe_snapshot(snapshot):
     result = deepcopy(snapshot)
-    result["owned_physical_ids"] = sorted(result["owned_physical_ids"])
     return result
 
 
@@ -714,14 +713,16 @@ class CandidateChangeSetCli(FakeAwsCli):
             if query == "Stacks[0].Parameters":
                 return _current_hardening_parameters()
         if args[:2] == ("cloudformation", "describe-change-set"):
-            return {
-                # DescribeChangeSet does not return ChangeSetType. The requested
-                # validation mode is the only trustworthy type contract here.
+            response = {
                 "Status": self.status,
                 "ExecutionStatus": self.execution_status,
                 "Changes": deepcopy(self.changes),
                 "Parameters": deepcopy(self.parameters),
+                "StackName": "PacificBioArchive-QueryAdoption",
             }
+            if self.change_set_type is not None:
+                response["ChangeSetType"] = self.change_set_type
+            return response
         if (
             args[:2] == ("cloudformation", "get-template")
             and "--change-set-name" in args
@@ -1834,8 +1835,14 @@ def test_collection_rejects_reservations_table_owned_by_another_stack(tmp_path):
             if "list-stacks" in command:
                 return {
                     "StackSummaries": [
-                        {"StackName": "PacificBioArchive-Database"},
-                        {"StackName": "OtherStack"},
+                        {
+                            "StackName": "PacificBioArchive-Database",
+                            "StackStatus": "UPDATE_ROLLBACK_COMPLETE",
+                        },
+                        {
+                            "StackName": "OtherStack",
+                            "StackStatus": "UPDATE_COMPLETE",
+                        },
                     ]
                 }
             if "list-stack-resources" in command and "OtherStack" in args:
@@ -1849,8 +1856,70 @@ def test_collection_rejects_reservations_table_owned_by_another_stack(tmp_path):
                 }
             return super().json(*args)
 
-    with pytest.raises(AdoptionError, match="already owned"):
+    with pytest.raises(AdoptionError, match="owner|owned|ReservationsTable"):
         collect_snapshot(OtherStackOwnsTableCli(), fixture_config(tmp_path))
+
+
+def test_query_adoption_owner_evidence_rejects_later_page_foreign_owner(
+    tmp_path,
+):
+    class LaterPageOwnerCli(FakeAwsCli):
+        def json(self, *args):
+            if args[:2] == ("cloudformation", "list-stacks"):
+                if "--starting-token" in args:
+                    return {
+                        "StackSummaries": [{
+                            "StackName": "ForeignStack",
+                            "StackStatus": "UPDATE_COMPLETE",
+                        }]
+                    }
+                return {
+                    "StackSummaries": [{
+                        "StackName": "PacificBioArchive-Database",
+                        "StackStatus": "UPDATE_ROLLBACK_COMPLETE",
+                    }],
+                    "NextToken": "second-page",
+                }
+            if (
+                args[:2] == ("cloudformation", "list-stack-resources")
+                and "ForeignStack" in args
+            ):
+                if "--starting-token" not in args:
+                    return {
+                        "StackResourceSummaries": [],
+                        "NextToken": "foreign-resource-second-page",
+                    }
+                return {
+                    "StackResourceSummaries": [{
+                        "LogicalResourceId": "ForeignFunction",
+                        "PhysicalResourceId": "PacificBioArchive-QueryLambda",
+                    }]
+                }
+            return super().json(*args)
+
+    with pytest.raises(AdoptionError, match="owner|owned|QueryFunction"):
+        collect_snapshot(LaterPageOwnerCli(), fixture_config(tmp_path))
+
+
+def test_query_adoption_owner_evidence_rejects_missing_stack_listing(tmp_path):
+    class MissingOwnerEvidenceCli(FakeAwsCli):
+        def json(self, *args):
+            if args[:2] == ("cloudformation", "list-stacks"):
+                return {}
+            return super().json(*args)
+
+    with pytest.raises(AdoptionError, match="owner|stack|evidence|malformed"):
+        collect_snapshot(MissingOwnerEvidenceCli(), fixture_config(tmp_path))
+
+
+def test_query_adoption_owner_evidence_records_exact_unmanaged_mapping(
+    tmp_path,
+):
+    snapshot = collect_snapshot(FakeAwsCli(), fixture_config(tmp_path))
+
+    assert snapshot["import_owners"] == {
+        logical_id: None for logical_id in _EXPECTED_IMPORT_RESOURCES
+    }
 
 
 @pytest.mark.parametrize(
@@ -3539,6 +3608,62 @@ def test_import_change_set_main_binds_processed_template_and_local_artifacts(
 
 
 @pytest.mark.parametrize(
+    "described_type",
+    [None, "UPDATE"],
+    ids=("missing", "update"),
+)
+def test_import_change_set_main_requires_described_import_type(
+    tmp_path,
+    monkeypatch,
+    described_type,
+):
+    import prepare_import
+
+    workdir = tmp_path / "import-type-work"
+    files = _write_change_set_validation_files(workdir)
+    cli = CandidateChangeSetCli(
+        change_set_type=described_type,
+        changes=_import_changes(files["snapshot"]),
+        parameters=files["import_parameters"],
+        processed=files["import_template"],
+    )
+    monkeypatch.setattr(prepare_import, "AwsCli", lambda: cli)
+    _use_stored_snapshot_as_fresh(monkeypatch, prepare_import, files)
+
+    with pytest.raises(AdoptionError, match="IMPORT|type"):
+        prepare_import.main(_validate_change_set_args(workdir, "IMPORT"))
+
+
+def test_import_change_set_main_rejects_exposed_wrong_target_stack(
+    tmp_path,
+    monkeypatch,
+):
+    import prepare_import
+
+    workdir = tmp_path / "import-target-work"
+    files = _write_change_set_validation_files(workdir)
+
+    class WrongTargetCli(CandidateChangeSetCli):
+        def json(self, *args):
+            response = super().json(*args)
+            if args[:2] == ("cloudformation", "describe-change-set"):
+                response["StackName"] = "ForeignStack"
+            return response
+
+    cli = WrongTargetCli(
+        change_set_type="IMPORT",
+        changes=_import_changes(files["snapshot"]),
+        parameters=files["import_parameters"],
+        processed=files["import_template"],
+    )
+    monkeypatch.setattr(prepare_import, "AwsCli", lambda: cli)
+    _use_stored_snapshot_as_fresh(monkeypatch, prepare_import, files)
+
+    with pytest.raises(AdoptionError, match="target|stack"):
+        prepare_import.main(_validate_change_set_args(workdir, "IMPORT"))
+
+
+@pytest.mark.parametrize(
     ("candidate_kwargs", "error_pattern"),
     [
         (
@@ -3702,6 +3827,8 @@ def test_change_set_validator_uses_explicit_workdir_and_candidate_template(tmp_p
                     "ExecutionStatus": "AVAILABLE",
                     "Changes": [],
                     "Parameters": [],
+                    "ChangeSetType": expected_type,
+                    "StackName": "PacificBioArchive-QueryAdoption",
                 }
             if args[:2] == ("cloudformation", "get-template"):
                 return {"TemplateBody": {"Resources": {}}}
@@ -3803,6 +3930,8 @@ def test_change_set_validator_requires_complete_available_candidate(
                 "ExecutionStatus": execution_status,
                 "Changes": [],
                 "Parameters": [],
+                "ChangeSetType": "UPDATE",
+                "StackName": "PacificBioArchive-QueryAdoption",
             }
 
     monkeypatch.setattr(prepare_import, "AwsCli", lambda: ValidatorCli())

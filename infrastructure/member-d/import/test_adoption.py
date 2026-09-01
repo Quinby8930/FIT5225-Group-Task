@@ -266,7 +266,9 @@ def valid_snapshot():
             "AWS::ApiGatewayV2::Integration": ["/properties/ApiId", "/properties/IntegrationId"],
             "AWS::ApiGatewayV2::Route": ["/properties/ApiId", "/properties/RouteId"],
         },
-        "owned_physical_ids": set(),
+        "import_owners": {
+            logical_id: None for logical_id in _EXPECTED_IMPORT_RESOURCES
+        },
         "role": {
             "role_name": "PacificBioArchive-QueryLambdaRole",
             "account": "111122223333",

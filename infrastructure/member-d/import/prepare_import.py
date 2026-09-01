@@ -41,6 +41,7 @@ from adoption import (
     validate_built_template,
     validate_hardening_function_transition,
     validate_hardening_parameter_transition,
+    validate_import_owners,
     validate_lambda_policy_after_update,
     validate_snapshot,
     validate_stack_names,
@@ -315,7 +316,12 @@ def _base_snapshot(config: AuditConfig, caller: Mapping[str, Any], function: Map
         "function": dict(function),
         "integration": {"IntegrationId": config.integration, "IntegrationType": "AWS_PROXY", "IntegrationMethod": "POST", "PayloadFormatVersion": "2.0", "IntegrationUri": f"arn:aws:apigateway:{config.region}:lambda:path/2015-03-31/functions/arn:aws:lambda:{config.region}:111122223333:function:{config.function}/invocations"},
         "type_schemas": {"AWS::Lambda::Function": ["/properties/FunctionName"], "AWS::ApiGatewayV2::Integration": ["/properties/ApiId", "/properties/IntegrationId"], "AWS::ApiGatewayV2::Route": ["/properties/ApiId", "/properties/RouteId"]},
-        "owned_physical_ids": set(),
+        "import_owners": {
+            "ReservationsTable": None,
+            "QueryFunction": None,
+            "QueryIntegration": None,
+            **{logical_id: None for logical_id in ROUTES_BY_LOGICAL_ID},
+        },
     }
 
 
@@ -596,6 +602,46 @@ def _collect_reservations_table(
     }
 
 
+def _collect_paginated_items(
+    cli: AwsCli,
+    operation: str,
+    result_key: str,
+    *arguments: str,
+) -> list[Mapping[str, Any]]:
+    """Collect every CloudFormation page or reject incomplete evidence."""
+    items: list[Mapping[str, Any]] = []
+    token: str | None = None
+    seen_tokens: set[str] = set()
+    while True:
+        command = ["cloudformation", operation, *arguments]
+        if token is not None:
+            command.extend(("--starting-token", token))
+        page = cli.json(*command)
+        if (
+            not isinstance(page, Mapping)
+            or result_key not in page
+            or not isinstance(page[result_key], list)
+            or not all(isinstance(item, Mapping) for item in page[result_key])
+        ):
+            raise AdoptionError(
+                f"CloudFormation {operation} owner evidence is malformed"
+            )
+        items.extend(deepcopy(page[result_key]))
+        next_token = page.get("NextToken")
+        if next_token is None:
+            return items
+        if (
+            not isinstance(next_token, str)
+            or not next_token
+            or next_token in seen_tokens
+        ):
+            raise AdoptionError(
+                f"CloudFormation {operation} pagination evidence is malformed"
+            )
+        seen_tokens.add(next_token)
+        token = next_token
+
+
 @_sanitize_audit_errors
 def collect_snapshot(cli: AwsCli, config: AuditConfig) -> dict[str, Any]:
     caller = cli.json("sts", "get-caller-identity", "--region", config.region)
@@ -629,29 +675,87 @@ def collect_snapshot(cli: AwsCli, config: AuditConfig) -> dict[str, Any]:
         else None
     )
     template = _parse_processed_template(template_body)
-    summaries = cli.json("cloudformation", "list-stack-resources", "--stack-name", config.stack, "--region", config.region)
-    resource_summaries = summaries.get("StackResourceSummaries", []) if isinstance(summaries, Mapping) else []
-    managed = {item.get("LogicalResourceId"): item.get("PhysicalResourceId") for item in resource_summaries if isinstance(item, Mapping)}
-    expected_managed = {"FilesTable", "SubscriptionsTable", "NotificationsTable", "QueryLambdaRole"}
-    if set(managed) != expected_managed or any(not managed[key] for key in managed):
-        raise AdoptionError("managed resource set mismatch")
-    active = cli.json(
-        "cloudformation",
-        "list-stacks",
+    resource_summaries = _collect_paginated_items(
+        cli,
+        "list-stack-resources",
+        "StackResourceSummaries",
+        "--stack-name",
+        config.stack,
         "--region",
         config.region,
     )
-    other_stack_physical_ids: set[str] = set()
-    for other in active.get("StackSummaries", []) if isinstance(active, Mapping) else []:
-        other_name = other.get("StackName") if isinstance(other, Mapping) else None
-        other_status = other.get("StackStatus") if isinstance(other, Mapping) else None
+    managed: dict[str, str] = {}
+    for item in resource_summaries:
+        logical_id = item.get("LogicalResourceId")
+        physical_id = item.get("PhysicalResourceId")
         if (
-            other_name
-            and other_name != config.stack
-            and other_status != "DELETE_COMPLETE"
+            not isinstance(logical_id, str)
+            or not logical_id
+            or not isinstance(physical_id, str)
+            or not physical_id
+            or logical_id in managed
         ):
-            other_resources = cli.json("cloudformation", "list-stack-resources", "--stack-name", other_name, "--region", config.region)
-            other_stack_physical_ids.update(str(item.get("PhysicalResourceId")) for item in other_resources.get("StackResourceSummaries", []) if isinstance(item, Mapping) and item.get("PhysicalResourceId"))
+            raise AdoptionError("source stack resource evidence is malformed")
+        managed[logical_id] = physical_id
+    expected_managed = {"FilesTable", "SubscriptionsTable", "NotificationsTable", "QueryLambdaRole"}
+    if set(managed) != expected_managed:
+        raise AdoptionError("managed resource set mismatch")
+    active_summaries = _collect_paginated_items(
+        cli,
+        "list-stacks",
+        "StackSummaries",
+        "--region",
+        config.region,
+    )
+    active_stacks: dict[str, str] = {}
+    for item in active_summaries:
+        stack_name = item.get("StackName")
+        stack_status = item.get("StackStatus")
+        if (
+            not isinstance(stack_name, str)
+            or not stack_name
+            or not isinstance(stack_status, str)
+            or not stack_status
+            or stack_name in active_stacks
+        ):
+            raise AdoptionError("CloudFormation stack owner evidence is malformed")
+        active_stacks[stack_name] = stack_status
+    if active_stacks.get(config.stack) != stack_view.get("StackStatus"):
+        raise AdoptionError("source stack owner evidence is incomplete")
+
+    physical_owners: dict[str, set[str]] = {}
+    for stack_name, stack_status in active_stacks.items():
+        if stack_status == "DELETE_COMPLETE":
+            continue
+        stack_resources = (
+            resource_summaries
+            if stack_name == config.stack
+            else _collect_paginated_items(
+                cli,
+                "list-stack-resources",
+                "StackResourceSummaries",
+                "--stack-name",
+                stack_name,
+                "--region",
+                config.region,
+            )
+        )
+        stack_logical_ids: set[str] = set()
+        for resource in stack_resources:
+            logical_id = resource.get("LogicalResourceId")
+            physical_id = resource.get("PhysicalResourceId")
+            if (
+                not isinstance(logical_id, str)
+                or not logical_id
+                or logical_id in stack_logical_ids
+                or not isinstance(physical_id, str)
+                or not physical_id
+            ):
+                raise AdoptionError(
+                    "CloudFormation stack resource owner evidence is malformed"
+                )
+            stack_logical_ids.add(logical_id)
+            physical_owners.setdefault(physical_id, set()).add(stack_name)
     reservations_table = _collect_reservations_table(cli, config)
     fields = ["FunctionName", "Runtime", "Handler", "Role", "Timeout", "MemorySize", "Description", "SnapStart", "PackageType", "Architectures", "Layers", "EphemeralStorage", "VpcConfig", "FileSystemConfigs", "KmsKeyArn", "DeadLetterConfig", "TracingConfig", "LoggingConfig", "CodeSigningConfigArn", "RuntimeManagementConfig", "ReservedConcurrentExecutions", "CodeSha256", "RevisionId"]
     safe_variables = ",".join(
@@ -780,14 +884,34 @@ def collect_snapshot(cli: AwsCli, config: AuditConfig) -> dict[str, Any]:
     authorizer = next((item for item in authorizers if item.get("AuthorizerId") == config.authorizer), None)
     if not isinstance(authorizer, Mapping):
         raise AdoptionError("API authorizer is unavailable")
-    candidate_ids = {
-        _RESERVATIONS_TABLE_NAME,
-        config.function,
-        config.integration,
+    candidate_physical_ids = {
+        "ReservationsTable": _RESERVATIONS_TABLE_NAME,
+        "QueryFunction": config.function,
+        "QueryIntegration": config.integration,
     }
-    contracted_keys = {contract.route_key for contract in ROUTES_BY_LOGICAL_ID.values()}
-    candidate_ids.update(str(route.get("RouteId")) for route in routes if route.get("RouteKey") in contracted_keys and route.get("RouteId"))
-    owned_physical_ids = other_stack_physical_ids & candidate_ids
+    for logical_id, contract in ROUTES_BY_LOGICAL_ID.items():
+        matching_routes = [
+            route for route in routes if route.get("RouteKey") == contract.route_key
+        ]
+        route_id = (
+            matching_routes[0].get("RouteId")
+            if len(matching_routes) == 1
+            else None
+        )
+        if not isinstance(route_id, str) or not route_id:
+            raise AdoptionError(
+                f"owner evidence is missing route {contract.route_key}"
+            )
+        candidate_physical_ids[logical_id] = route_id
+    import_owners: dict[str, str | None] = {}
+    for logical_id, physical_id in candidate_physical_ids.items():
+        owners = physical_owners.get(physical_id, set())
+        if len(owners) > 1:
+            raise AdoptionError(
+                f"duplicate resource owner evidence for {logical_id}"
+            )
+        import_owners[logical_id] = next(iter(owners)) if owners else None
+    validate_import_owners(import_owners)
     schemas: dict[str, Any] = {}
     for resource_type in (
         "AWS::DynamoDB::Table",
@@ -821,7 +945,7 @@ def collect_snapshot(cli: AwsCli, config: AuditConfig) -> dict[str, Any]:
         "integration": dict(integration),
         "reservations_table": reservations_table,
         "type_schemas": schemas,
-        "owned_physical_ids": owned_physical_ids, "role": role_view,
+        "import_owners": import_owners, "role": role_view,
     }
     validate_snapshot(snapshot)
     return snapshot
@@ -1756,6 +1880,14 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     validate_stack_names(args.source_stack, args.stack)
     change_set = cli.json("cloudformation", "describe-change-set", "--stack-name", args.stack, "--change-set-name", args.change_set, "--region", args.region)
+    described_type = change_set.get("ChangeSetType")
+    if described_type != args.expected_type:
+        raise AdoptionError(
+            f"described change set type must be exactly {args.expected_type}"
+        )
+    described_stack = change_set.get("StackName")
+    if described_stack is not None and described_stack != args.stack:
+        raise AdoptionError("described change set target stack differs")
     if (
         change_set.get("Status") != "CREATE_COMPLETE"
         or change_set.get("ExecutionStatus") != "AVAILABLE"
@@ -1849,7 +1981,7 @@ def main(argv: list[str] | None = None) -> int:
         validate_import_change_set(
             change_set.get("Changes", []),
             expected,
-            change_set_type=args.expected_type,
+            change_set_type=described_type,
         )
     else:
         if not args.artifact_bucket:

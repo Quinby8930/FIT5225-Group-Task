@@ -829,7 +829,7 @@ def validate_snapshot(snapshot: Mapping[str, Any]) -> None:
     _require(isinstance(schemas, Mapping), "primary identifier schemas missing")
     for resource_type, expected in _REQUIRED_TYPE_SCHEMAS.items():
         _require(schemas.get(resource_type) == expected, f"primary identifier schema mismatch for {resource_type}")
-    _require(not snapshot.get("owned_physical_ids"), "candidate resource is already owned by another stack")
+    validate_import_owners(snapshot.get("import_owners"))
     reservations_table = snapshot.get("reservations_table")
     _require(isinstance(reservations_table, Mapping), "ReservationsTable is missing")
     _validate_reservations_table(
