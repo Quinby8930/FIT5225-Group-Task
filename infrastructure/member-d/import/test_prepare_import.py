@@ -38,6 +38,7 @@ from prepare_import import (
     _parse_processed_template,
 )
 from test_adoption import (
+    _EXPECTED_IMPORT_RESOURCES,
     _maintained_role_target,
     _route_scoped_lambda_policy,
     _update_processed,
@@ -796,6 +797,91 @@ def _validate_change_set_args(
     else:
         args.extend(["--artifact-bucket", "private-artifacts"])
     return args
+
+
+@pytest.mark.parametrize(
+    ("status", "managed", "action", "cleanup_candidate"),
+    [
+        (None, set(), "prepare", False),
+        ("REVIEW_IN_PROGRESS", set(), "inspect", True),
+        (
+            "IMPORT_COMPLETE",
+            _EXPECTED_IMPORT_RESOURCES,
+            "post-import-evidence",
+            False,
+        ),
+        (
+            "IMPORT_ROLLBACK_COMPLETE",
+            set(),
+            "recovery-report",
+            True,
+        ),
+        (
+            "IMPORT_ROLLBACK_COMPLETE",
+            {"QueryFunction"},
+            "stop",
+            False,
+        ),
+        (
+            "IMPORT_ROLLBACK_FAILED",
+            set(),
+            "freeze",
+            False,
+        ),
+        (
+            "UPDATE_ROLLBACK_COMPLETE",
+            _EXPECTED_IMPORT_RESOURCES,
+            "verify-runtime-and-ownership",
+            False,
+        ),
+    ],
+    ids=(
+        "target-absent",
+        "review-empty-shell",
+        "import-complete",
+        "import-rollback-empty-shell",
+        "import-rollback-owned-resource",
+        "import-rollback-failed",
+        "update-rollback-complete",
+    ),
+)
+def test_query_adoption_contract_classifies_target_stack_recovery_state(
+    status,
+    managed,
+    action,
+    cleanup_candidate,
+):
+    classification = adoption.classify_recovery_state(status, set(managed))
+
+    assert classification == {
+        "action": action,
+        "empty_shell_cleanup_candidate": cleanup_candidate,
+        "deletion_requires_separate_approval": cleanup_candidate,
+    }
+
+
+@pytest.mark.parametrize(
+    ("status", "managed"),
+    [
+        (None, set()),
+        ("REVIEW_IN_PROGRESS", {"QueryFunction"}),
+        ("IMPORT_ROLLBACK_COMPLETE", {"ReservationsTable"}),
+        ("IMPORT_ROLLBACK_FAILED", set()),
+    ],
+    ids=(
+        "absent-is-not-a-shell",
+        "review-with-owned-resource",
+        "rollback-with-owned-resource",
+        "failed-rollback-never-cleanup",
+    ),
+)
+def test_query_adoption_contract_never_classifies_unsafe_state_as_empty_shell(
+    status,
+    managed,
+):
+    classification = adoption.classify_recovery_state(status, set(managed))
+
+    assert classification["empty_shell_cleanup_candidate"] is False
 
 
 def test_update_contracts_match_the_maintained_template_source():

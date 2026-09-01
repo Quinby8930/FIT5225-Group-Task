@@ -7,6 +7,8 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).parent))
 
+import adoption
+
 from adoption import (
     AdoptionError,
     CodeArtifact,
@@ -20,6 +22,45 @@ from adoption import (
     validate_snapshot,
     validate_lambda_policy_after_update,
 )
+
+
+_EXPECTED_SOURCE_STACK = "PacificBioArchive-Database"
+_EXPECTED_TARGET_STACK = "PacificBioArchive-QueryAdoption"
+_EXPECTED_ORIGINAL_STACK_RESOURCES = {
+    "FilesTable",
+    "SubscriptionsTable",
+    "NotificationsTable",
+    "QueryLambdaRole",
+}
+_EXPECTED_IMPORT_RESOURCES = {
+    "ReservationsTable",
+    "QueryFunction",
+    "QueryIntegration",
+    "AuthTestRoute",
+    "QueryByTagsRoute",
+    "QueryBySpeciesRoute",
+    "QueryByThumbnailRoute",
+    "QueryByFileRoute",
+    "EditTagsRoute",
+    "DeleteFilesRoute",
+    "SubscribeRoute",
+    "UnsubscribeRoute",
+    "SubscriptionsRoute",
+    "NotificationsRoute",
+    "ReserveUploadRoute",
+    "AcquireProcessingRoute",
+    "CompleteFileRoute",
+    "FailFileRoute",
+    "AuthorizeAssetsRoute",
+}
+_EXPECTED_IMPORT_PARAMETER_VALUES = {
+    "ExistingQueryLambdaRoleArn": (
+        "arn:aws:iam::111122223333:role/"
+        "PacificBioArchive-QueryLambdaRole"
+    ),
+    "ExistingHttpApiId": "2dd2aqb32j",
+    "ExistingJwtAuthorizerId": "7ir7fs",
+}
 
 
 def _historical_lambda_permissions(
@@ -220,6 +261,287 @@ def valid_snapshot():
             }},
         },
     }
+
+
+def _query_adoption_import_template():
+    snapshot = valid_snapshot()
+    template = build_import_template(
+        snapshot,
+        CodeArtifact(
+            "private-artifacts",
+            "backups/code.zip",
+            "version-1",
+        ),
+    )
+    template.pop("Outputs", None)
+    template["Parameters"] = {
+        name: {"Type": "String"}
+        for name in _EXPECTED_IMPORT_PARAMETER_VALUES
+    }
+    template["Resources"] = {
+        logical_id: resource
+        for logical_id, resource in template["Resources"].items()
+        if logical_id in _EXPECTED_IMPORT_RESOURCES
+    }
+    function = template["Resources"]["QueryFunction"]["Properties"]
+    function["Role"] = {"Ref": "ExistingQueryLambdaRoleArn"}
+    function.pop("Environment", None)
+    integration = template["Resources"]["QueryIntegration"]["Properties"]
+    integration["ApiId"] = {"Ref": "ExistingHttpApiId"}
+    for logical_id in ROUTES_BY_LOGICAL_ID:
+        route = template["Resources"][logical_id]["Properties"]
+        route["ApiId"] = {"Ref": "ExistingHttpApiId"}
+        if route["AuthorizationType"] == "JWT":
+            route["AuthorizerId"] = {
+                "Ref": "ExistingJwtAuthorizerId"
+            }
+    return template
+
+
+def _query_adoption_import_parameters():
+    return [
+        {"ParameterKey": name, "ParameterValue": value}
+        for name, value in _EXPECTED_IMPORT_PARAMETER_VALUES.items()
+    ]
+
+
+def test_query_adoption_contract_has_exact_disjoint_stack_ownership():
+    assert adoption.SOURCE_STACK_NAME == _EXPECTED_SOURCE_STACK
+    assert adoption.TARGET_STACK_NAME == _EXPECTED_TARGET_STACK
+    assert set(adoption.ORIGINAL_STACK_LOGICAL_IDS) == (
+        _EXPECTED_ORIGINAL_STACK_RESOURCES
+    )
+    assert set(adoption.IMPORT_LOGICAL_IDS) == _EXPECTED_IMPORT_RESOURCES
+    assert _EXPECTED_ORIGINAL_STACK_RESOURCES.isdisjoint(
+        _EXPECTED_IMPORT_RESOURCES
+    )
+
+
+def test_query_adoption_contract_accepts_only_exact_source_and_target_names():
+    adoption.validate_stack_names(
+        _EXPECTED_SOURCE_STACK,
+        _EXPECTED_TARGET_STACK,
+    )
+
+
+@pytest.mark.parametrize(
+    ("source_stack", "target_stack"),
+    [
+        ("WrongSource", _EXPECTED_TARGET_STACK),
+        (_EXPECTED_SOURCE_STACK, "WrongTarget"),
+        (_EXPECTED_SOURCE_STACK, _EXPECTED_SOURCE_STACK),
+    ],
+    ids=("wrong-source", "wrong-target", "same-stack"),
+)
+def test_query_adoption_contract_rejects_wrong_or_equal_stack_names(
+    source_stack,
+    target_stack,
+):
+    with pytest.raises(AdoptionError, match="source|target|stack"):
+        adoption.validate_stack_names(source_stack, target_stack)
+
+
+def test_query_adoption_contract_builds_standalone_nineteen_resource_template():
+    template = build_import_template(
+        valid_snapshot(),
+        CodeArtifact(
+            "private-artifacts",
+            "backups/code.zip",
+            "version-1",
+        ),
+    )
+
+    assert set(template["Resources"]) == _EXPECTED_IMPORT_RESOURCES
+    assert template["Parameters"] == {
+        name: {"Type": "String"}
+        for name in _EXPECTED_IMPORT_PARAMETER_VALUES
+    }
+    assert "Outputs" not in template
+    assert "InternalApiKey" not in str(template)
+    assert {"Metadata", "Transform"}.isdisjoint(template)
+    assert _EXPECTED_ORIGINAL_STACK_RESOURCES.isdisjoint(
+        template["Resources"]
+    )
+    function = template["Resources"]["QueryFunction"]
+    assert function["Properties"]["Role"] == {
+        "Ref": "ExistingQueryLambdaRoleArn"
+    }
+    assert "Environment" not in function["Properties"]
+    assert template["Resources"]["QueryIntegration"]["Properties"][
+        "ApiId"
+    ] == {"Ref": "ExistingHttpApiId"}
+    routes = {
+        logical_id: template["Resources"][logical_id]["Properties"]
+        for logical_id in ROUTES_BY_LOGICAL_ID
+    }
+    assert all(
+        route["ApiId"] == {"Ref": "ExistingHttpApiId"}
+        for route in routes.values()
+    )
+    assert all(
+        route["AuthorizerId"] == {
+            "Ref": "ExistingJwtAuthorizerId"
+        }
+        for route in routes.values()
+        if route["AuthorizationType"] == "JWT"
+    )
+    assert all(
+        resource["DeletionPolicy"] == "Retain"
+        and resource["UpdateReplacePolicy"] == "Retain"
+        for resource in template["Resources"].values()
+    )
+
+
+def test_query_adoption_contract_binds_exact_three_audited_parameters():
+    parameters = build_parameters_to_reuse(valid_snapshot())
+
+    assert parameters == _query_adoption_import_parameters()
+    assert all(set(item) == {"ParameterKey", "ParameterValue"} for item in parameters)
+    assert "InternalApiKey" not in str(parameters)
+
+
+def test_query_adoption_contract_accepts_exact_initial_import_artifacts():
+    adoption.validate_initial_import_contract(
+        _query_adoption_import_template(),
+        build_resources_to_import(valid_snapshot()),
+        _query_adoption_import_parameters(),
+        valid_snapshot(),
+    )
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        lambda template: template["Resources"].update(
+            {
+                "FilesTable": {
+                    "Type": "AWS::DynamoDB::Table",
+                    "DeletionPolicy": "Retain",
+                    "UpdateReplacePolicy": "Retain",
+                    "Properties": {"TableName": "PacificBioArchiveFiles"},
+                }
+            }
+        ),
+        lambda template: template.update(
+            {"Outputs": {"Forbidden": {"Value": "not-permitted"}}}
+        ),
+        lambda template: template["Parameters"].update(
+            {"InternalApiKey": {"Type": "String", "NoEcho": True}}
+        ),
+    ],
+    ids=("original-stack-resource", "output", "secret-parameter"),
+)
+def test_query_adoption_contract_rejects_prohibited_import_template_content(
+    mutation,
+):
+    template = _query_adoption_import_template()
+    mutation(template)
+
+    with pytest.raises(
+        AdoptionError,
+        match="original|resource|Output|InternalApiKey|secret|parameter",
+    ):
+        adoption.validate_initial_import_contract(
+            template,
+            build_resources_to_import(valid_snapshot()),
+            _query_adoption_import_parameters(),
+            valid_snapshot(),
+        )
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        lambda parameters: parameters.pop(),
+        lambda parameters: parameters.append(
+            {"ParameterKey": "UnexpectedParameter", "ParameterValue": "x"}
+        ),
+        lambda parameters: parameters[0].update(
+            {"ParameterValue": "arn:aws:iam::999988887777:role/foreign"}
+        ),
+        lambda parameters: parameters[1].update(
+            {"UsePreviousValue": True}
+        ),
+    ],
+    ids=("missing", "extra", "value-mismatch", "use-previous"),
+)
+def test_query_adoption_contract_rejects_import_parameter_mismatch(mutation):
+    parameters = _query_adoption_import_parameters()
+    mutation(parameters)
+
+    with pytest.raises(AdoptionError, match="parameter|audit|value"):
+        adoption.validate_initial_import_contract(
+            _query_adoption_import_template(),
+            build_resources_to_import(valid_snapshot()),
+            parameters,
+            valid_snapshot(),
+        )
+
+
+@pytest.mark.parametrize(
+    "owner",
+    [
+        _EXPECTED_SOURCE_STACK,
+        _EXPECTED_TARGET_STACK,
+        "ForeignStack",
+    ],
+)
+def test_query_adoption_contract_rejects_any_existing_resource_owner(owner):
+    owners = {logical_id: None for logical_id in _EXPECTED_IMPORT_RESOURCES}
+    owners["QueryFunction"] = owner
+
+    with pytest.raises(AdoptionError, match="owner|managed|QueryFunction"):
+        adoption.validate_import_owners(owners)
+
+
+def test_query_adoption_contract_accepts_exact_unmanaged_owner_set():
+    adoption.validate_import_owners(
+        {logical_id: None for logical_id in _EXPECTED_IMPORT_RESOURCES}
+    )
+
+
+def test_query_adoption_contract_requires_import_change_set_type():
+    snapshot = valid_snapshot()
+    expected = build_resources_to_import(snapshot)
+    changes = [
+        {
+            "ResourceChange": {
+                "Action": "Import",
+                "LogicalResourceId": item["LogicalResourceId"],
+                "ResourceType": item["ResourceType"],
+                "Replacement": "False",
+            }
+        }
+        for item in expected
+    ]
+
+    with pytest.raises(AdoptionError, match="IMPORT|type"):
+        adoption.validate_import_change_set(
+            changes,
+            expected,
+            change_set_type="UPDATE",
+        )
+
+
+@pytest.mark.parametrize("action", ["Add", "Modify", "Remove", "Dynamic"])
+def test_query_adoption_contract_rejects_every_non_import_action(action):
+    snapshot = valid_snapshot()
+    expected = build_resources_to_import(snapshot)
+    changes = [
+        {
+            "ResourceChange": {
+                "Action": "Import",
+                "LogicalResourceId": item["LogicalResourceId"],
+                "ResourceType": item["ResourceType"],
+                "Replacement": "False",
+            }
+        }
+        for item in expected
+    ]
+    changes[0]["ResourceChange"]["Action"] = action
+
+    with pytest.raises(AdoptionError, match="19 Import|action"):
+        adoption.validate_import_change_set(changes, expected)
 
 
 def _route_scoped_lambda_policy(snapshot, *, removed_legacy_count):
