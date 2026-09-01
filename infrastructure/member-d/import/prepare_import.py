@@ -32,10 +32,13 @@ from adoption import (
     ROUTES_BY_LOGICAL_ID,
     SOURCE_STACK_NAME,
     TARGET_STACK_NAME,
+    assert_post_import_equivalent,
     assert_runtime_unchanged,
     build_import_template,
     build_parameters_to_reuse,
     build_resources_to_import,
+    classify_recovery_state,
+    expected_imported_physical_ids,
     validate_import_artifacts,
     validate_import_change_set,
     validate_built_template,
@@ -43,6 +46,7 @@ from adoption import (
     validate_hardening_parameter_transition,
     validate_import_owners,
     validate_lambda_policy_after_update,
+    validate_post_import_snapshot,
     validate_snapshot,
     validate_stack_names,
     validate_update_artifacts,
@@ -642,8 +646,89 @@ def _collect_paginated_items(
         token = next_token
 
 
+def _collect_provisioned_concurrency(
+    cli: AwsCli,
+    config: AuditConfig,
+) -> list[dict[str, Any]]:
+    """Collect every Lambda provisioned-concurrency page canonically."""
+    configurations: list[dict[str, Any]] = []
+    marker: str | None = None
+    seen_markers: set[str] = set()
+    seen_arns: set[str] = set()
+    required_keys = {
+        "FunctionArn",
+        "RequestedProvisionedConcurrentExecutions",
+        "AvailableProvisionedConcurrentExecutions",
+        "AllocatedProvisionedConcurrentExecutions",
+        "Status",
+        "LastModified",
+    }
+    allowed_keys = required_keys | {"StatusReason"}
+    while True:
+        command = [
+            "lambda",
+            "list-provisioned-concurrency-configs",
+            "--function-name",
+            config.function,
+            "--region",
+            config.region,
+        ]
+        if marker is not None:
+            command.extend(("--marker", marker))
+        page = cli.json(*command)
+        raw_items = (
+            page.get("ProvisionedConcurrencyConfigs")
+            if isinstance(page, Mapping)
+            else None
+        )
+        if not isinstance(raw_items, list):
+            raise AdoptionError(
+                "Lambda provisioned concurrency evidence is malformed"
+            )
+        for raw in raw_items:
+            if (
+                not isinstance(raw, Mapping)
+                or not required_keys <= set(raw)
+                or not set(raw) <= allowed_keys
+            ):
+                raise AdoptionError(
+                    "Lambda provisioned concurrency evidence is malformed"
+                )
+            function_arn = raw.get("FunctionArn")
+            if (
+                not isinstance(function_arn, str)
+                or not function_arn
+                or function_arn in seen_arns
+            ):
+                raise AdoptionError(
+                    "Lambda provisioned concurrency evidence is malformed"
+                )
+            seen_arns.add(function_arn)
+            configurations.append(deepcopy(dict(raw)))
+        next_marker = page.get("NextMarker")
+        if next_marker is None:
+            return sorted(configurations, key=lambda item: item["FunctionArn"])
+        if (
+            not isinstance(next_marker, str)
+            or not next_marker
+            or next_marker in seen_markers
+        ):
+            raise AdoptionError(
+                "Lambda provisioned concurrency pagination evidence is malformed"
+            )
+        seen_markers.add(next_marker)
+        marker = next_marker
+
+
 @_sanitize_audit_errors
-def collect_snapshot(cli: AwsCli, config: AuditConfig) -> dict[str, Any]:
+def collect_snapshot(
+    cli: AwsCli,
+    config: AuditConfig,
+    *,
+    ownership_phase: str = "pre",
+) -> dict[str, Any]:
+    if ownership_phase not in {"pre", "post"}:
+        raise AdoptionError("snapshot ownership phase is invalid")
     caller = cli.json("sts", "get-caller-identity", "--region", config.region)
     arn = caller.get("Arn") if isinstance(caller, Mapping) else None
     account = caller.get("Account") if isinstance(caller, Mapping) else None
@@ -724,6 +809,7 @@ def collect_snapshot(cli: AwsCli, config: AuditConfig) -> dict[str, Any]:
         raise AdoptionError("source stack owner evidence is incomplete")
 
     physical_owners: dict[str, set[str]] = {}
+    target_resources: dict[str, dict[str, str]] = {}
     for stack_name, stack_status in active_stacks.items():
         if stack_status == "DELETE_COMPLETE":
             continue
@@ -756,6 +842,16 @@ def collect_snapshot(cli: AwsCli, config: AuditConfig) -> dict[str, Any]:
                 )
             stack_logical_ids.add(logical_id)
             physical_owners.setdefault(physical_id, set()).add(stack_name)
+            if stack_name == TARGET_STACK_NAME:
+                resource_type = resource.get("ResourceType")
+                if not isinstance(resource_type, str) or not resource_type:
+                    raise AdoptionError(
+                        "target stack resource type evidence is malformed"
+                    )
+                target_resources[logical_id] = {
+                    "physical_id": physical_id,
+                    "resource_type": resource_type,
+                }
     reservations_table = _collect_reservations_table(cli, config)
     fields = ["FunctionName", "Runtime", "Handler", "Role", "Timeout", "MemorySize", "Description", "SnapStart", "PackageType", "Architectures", "Layers", "EphemeralStorage", "VpcConfig", "FileSystemConfigs", "KmsKeyArn", "DeadLetterConfig", "TracingConfig", "LoggingConfig", "CodeSigningConfigArn", "RuntimeManagementConfig", "ReservedConcurrentExecutions", "CodeSha256", "RevisionId"]
     safe_variables = ",".join(
@@ -784,13 +880,23 @@ def collect_snapshot(cli: AwsCli, config: AuditConfig) -> dict[str, Any]:
         function["resource_policy"] = json.loads(policy_response["Policy"])
     except (KeyError, TypeError, json.JSONDecodeError) as error:
         raise AdoptionError("Lambda resource policy is unavailable") from None
+    policy_revision = (
+        policy_response.get("RevisionId")
+        if isinstance(policy_response, Mapping)
+        else None
+    )
+    if not isinstance(policy_revision, str) or not policy_revision:
+        raise AdoptionError("Lambda resource policy revision is unavailable")
+    function["resource_policy_revision_id"] = policy_revision
     concurrency = cli.json("lambda", "get-function-concurrency", "--function-name", config.function, "--region", config.region)
     function["ReservedConcurrentExecutions"] = concurrency.get("ReservedConcurrentExecutions") if isinstance(concurrency, Mapping) else None
+    function["provisioned_concurrency"] = _collect_provisioned_concurrency(
+        cli,
+        config,
+    )
     runtime_management = cli.json("lambda", "get-runtime-management-config", "--function-name", config.function, "--region", config.region)
     if isinstance(runtime_management, Mapping) and runtime_management:
         function["RuntimeManagementConfig"] = _sanitized_runtime_management(runtime_management)
-    # The signed deployment URL is deliberately held only in this local object.
-    cli.json("lambda", "get-function", "--function-name", config.function, "--region", config.region, "--query", "Code")
     role_name = str(function.get("Role", "")).rsplit("/", 1)[-1]
     if managed.get("QueryLambdaRole") != role_name:
         raise AdoptionError("QueryLambdaRole physical identity differs from Lambda role")
@@ -911,7 +1017,6 @@ def collect_snapshot(cli: AwsCli, config: AuditConfig) -> dict[str, Any]:
                 f"duplicate resource owner evidence for {logical_id}"
             )
         import_owners[logical_id] = next(iter(owners)) if owners else None
-    validate_import_owners(import_owners)
     schemas: dict[str, Any] = {}
     for resource_type in (
         "AWS::DynamoDB::Table",
@@ -946,8 +1051,16 @@ def collect_snapshot(cli: AwsCli, config: AuditConfig) -> dict[str, Any]:
         "reservations_table": reservations_table,
         "type_schemas": schemas,
         "import_owners": import_owners, "role": role_view,
+        "target_stack": {
+            "name": TARGET_STACK_NAME,
+            "status": active_stacks.get(TARGET_STACK_NAME),
+            "resources": target_resources,
+        },
     }
-    validate_snapshot(snapshot)
+    if ownership_phase == "pre":
+        validate_snapshot(snapshot)
+    else:
+        validate_post_import_snapshot(snapshot)
     return snapshot
 
 
@@ -984,6 +1097,106 @@ def collect_stack_parameter_names(
     ):
         raise AdoptionError("stack parameter names are unavailable or duplicated")
     return set(names)
+
+
+@_sanitize_audit_errors
+def collect_recovery_ownership(
+    cli: AwsCli,
+    region: str,
+    source_stack: str,
+    target_stack: str,
+    baseline: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Collect sanitized ownership only; never inspect runtime or secrets."""
+    validate_stack_names(source_stack, target_stack)
+    validate_snapshot(baseline)
+    adoption_expected = {
+        logical_id: dict(evidence)
+        for logical_id, evidence in expected_imported_physical_ids(
+            baseline
+        ).items()
+    }
+    summaries = _collect_paginated_items(
+        cli,
+        "list-stacks",
+        "StackSummaries",
+        "--region",
+        region,
+    )
+    active: dict[str, str] = {}
+    for summary in summaries:
+        name = summary.get("StackName")
+        status = summary.get("StackStatus")
+        if (
+            not isinstance(name, str)
+            or not name
+            or not isinstance(status, str)
+            or not status
+            or name in active
+        ):
+            raise AdoptionError("recovery stack evidence is malformed")
+        if status != "DELETE_COMPLETE":
+            active[name] = status
+    if source_stack not in active:
+        raise AdoptionError("source stack recovery evidence is unavailable")
+
+    owners_by_physical_id: dict[str, set[str]] = {}
+    target_resources: dict[str, dict[str, str]] = {}
+    for stack_name in active:
+        resources = _collect_paginated_items(
+            cli,
+            "list-stack-resources",
+            "StackResourceSummaries",
+            "--stack-name",
+            stack_name,
+            "--region",
+            region,
+        )
+        seen_logical_ids: set[str] = set()
+        for resource in resources:
+            logical_id = resource.get("LogicalResourceId")
+            physical_id = resource.get("PhysicalResourceId")
+            if (
+                not isinstance(logical_id, str)
+                or not logical_id
+                or logical_id in seen_logical_ids
+                or not isinstance(physical_id, str)
+                or not physical_id
+            ):
+                raise AdoptionError("recovery resource evidence is malformed")
+            seen_logical_ids.add(logical_id)
+            owners_by_physical_id.setdefault(physical_id, set()).add(stack_name)
+            if stack_name == target_stack:
+                resource_type = resource.get("ResourceType")
+                if not isinstance(resource_type, str) or not resource_type:
+                    raise AdoptionError(
+                        "target recovery resource type evidence is malformed"
+                    )
+                target_resources[logical_id] = {
+                    "physical_id": physical_id,
+                    "resource_type": resource_type,
+                }
+
+    import_owners: dict[str, str | None] = {}
+    for logical_id, evidence in adoption_expected.items():
+        owners = owners_by_physical_id.get(evidence["physical_id"], set())
+        if len(owners) > 1:
+            raise AdoptionError(
+                f"duplicate recovery owner evidence for {logical_id}"
+            )
+        import_owners[logical_id] = next(iter(owners)) if owners else None
+    return {
+        "source_stack": {
+            "name": source_stack,
+            "status": active[source_stack],
+        },
+        "target_stack": {
+            "name": target_stack,
+            "status": active.get(target_stack),
+            "resources": target_resources,
+        },
+        "import_owners": import_owners,
+    }
 
 
 def _json_safe(value: Any) -> Any:
@@ -1711,6 +1924,26 @@ def _parser() -> argparse.ArgumentParser:
         command.add_argument("--baseline")
         if name == "prepare":
             command.add_argument("--artifact-bucket", required=True)
+    post_import = subcommands.add_parser("verify-post-import")
+    for argument in (
+        "region",
+        "source-stack",
+        "target-stack",
+        "baseline",
+        "api",
+        "authorizer",
+        "integration",
+        "function",
+        "workdir",
+    ):
+        post_import.add_argument(f"--{argument}", required=True)
+    recovery = subcommands.add_parser("recovery-report")
+    for argument in ("region", "source-stack", "target-stack", "workdir"):
+        recovery.add_argument(f"--{argument}", required=True)
+    recovery.add_argument(
+        "--import-change-set-creation-failed",
+        action="store_true",
+    )
     validator = subcommands.add_parser("validate-change-set")
     validator.add_argument("--region", required=True)
     validator.add_argument("--stack", required=True)
@@ -1780,6 +2013,102 @@ def _read_json_file(path: Path, description: str) -> Any:
 def main(argv: list[str] | None = None) -> int:
     args = _parser().parse_args(argv)
     cli = AwsCli()
+    if args.command == "verify-post-import":
+        validate_stack_names(args.source_stack, args.target_stack)
+        baseline = _read_json_file(
+            Path(args.baseline),
+            "sanitized pre-import baseline",
+        )
+        if not isinstance(baseline, Mapping):
+            raise AdoptionError("sanitized pre-import baseline is malformed")
+        validate_snapshot(baseline)
+        if (
+            baseline.get("region") != args.region
+            or baseline.get("stack", {}).get("name") != args.source_stack
+            or baseline.get("api", {}).get("id") != args.api
+            or baseline.get("api", {}).get("authorizer", {}).get(
+                "AuthorizerId"
+            )
+            != args.authorizer
+            or baseline.get("integration", {}).get("IntegrationId")
+            != args.integration
+            or baseline.get("function", {}).get("FunctionName")
+            != args.function
+        ):
+            raise AdoptionError("post-import verification scope differs from baseline")
+        workdir = Path(args.workdir)
+        observed = collect_snapshot(
+            cli,
+            AuditConfig(
+                args.region,
+                args.source_stack,
+                args.api,
+                args.authorizer,
+                args.integration,
+                args.function,
+                workdir,
+            ),
+            ownership_phase="post",
+        )
+        assert_post_import_equivalent(baseline, observed)
+        workdir.mkdir(parents=True, exist_ok=True)
+        path = workdir / "post-import-evidence.json"
+        path.write_text(
+            json.dumps(_json_safe(observed), sort_keys=True, indent=2) + "\n",
+            encoding="utf-8",
+        )
+        print(path)
+        return 0
+    if args.command == "recovery-report":
+        validate_stack_names(args.source_stack, args.target_stack)
+        workdir = Path(args.workdir)
+        baseline = _read_json_file(
+            workdir / "sanitized-snapshot.json",
+            "sanitized pre-import baseline",
+        )
+        if not isinstance(baseline, Mapping):
+            raise AdoptionError("sanitized pre-import baseline is malformed")
+        ownership = collect_recovery_ownership(
+            cli,
+            args.region,
+            args.source_stack,
+            args.target_stack,
+            baseline,
+        )
+        managed = set(ownership["target_stack"]["resources"])
+        managed.update(
+            logical_id
+            for logical_id, owner in ownership["import_owners"].items()
+            if owner is not None
+        )
+        expected_target = expected_imported_physical_ids(baseline)
+        exact_target_owners = {
+            logical_id: TARGET_STACK_NAME for logical_id in expected_target
+        }
+        if ownership["target_stack"]["status"] == "IMPORT_COMPLETE" and (
+            ownership["target_stack"]["resources"] != expected_target
+            or ownership["import_owners"] != exact_target_owners
+        ):
+            managed.add("__unsafe_ownership_evidence__")
+        classification = classify_recovery_state(
+            ownership["target_stack"]["status"],
+            managed,
+            import_change_set_creation_failed=(
+                args.import_change_set_creation_failed
+            ),
+        )
+        report = {
+            "classification": classification,
+            "ownership": ownership,
+        }
+        workdir.mkdir(parents=True, exist_ok=True)
+        path = workdir / "recovery-report.json"
+        path.write_text(
+            json.dumps(_json_safe(report), sort_keys=True, indent=2) + "\n",
+            encoding="utf-8",
+        )
+        print(json.dumps(_json_safe(report), sort_keys=True))
+        return 0
     if args.command in ("audit", "prepare"):
         validate_stack_names(args.stack, TARGET_STACK_NAME)
         config = AuditConfig(args.region, args.stack, args.api, args.authorizer, args.integration, args.function, Path(args.workdir))

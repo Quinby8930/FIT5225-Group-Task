@@ -24,6 +24,22 @@ from adoption import (
 )
 
 
+def _missing_post_import_feature(*_args, **_kwargs):
+    pytest.fail("post-import evidence gate is not implemented")
+
+
+assert_post_import_equivalent = getattr(
+    adoption,
+    "assert_post_import_equivalent",
+    _missing_post_import_feature,
+)
+expected_imported_physical_ids = getattr(
+    adoption,
+    "expected_imported_physical_ids",
+    _missing_post_import_feature,
+)
+
+
 _EXPECTED_SOURCE_STACK = "PacificBioArchive-Database"
 _EXPECTED_TARGET_STACK = "PacificBioArchive-QueryAdoption"
 _EXPECTED_ORIGINAL_STACK_RESOURCES = {
@@ -224,6 +240,8 @@ def valid_snapshot():
             "resource_policy": {
                 "Statement": _historical_lambda_permissions()
             },
+            "resource_policy_revision_id": "fixture-policy-revision",
+            "provisioned_concurrency": [],
         },
         "integration": {
             "IntegrationId": "fbjojun", "IntegrationType": "AWS_PROXY",
@@ -269,6 +287,11 @@ def valid_snapshot():
         "import_owners": {
             logical_id: None for logical_id in _EXPECTED_IMPORT_RESOURCES
         },
+        "target_stack": {
+            "name": "PacificBioArchive-QueryAdoption",
+            "status": None,
+            "resources": {},
+        },
         "role": {
             "role_name": "PacificBioArchive-QueryLambdaRole",
             "account": "111122223333",
@@ -284,6 +307,273 @@ def valid_snapshot():
             }},
         },
     }
+
+
+def post_import_snapshot():
+    snapshot = valid_snapshot()
+    expected = expected_imported_physical_ids(snapshot)
+    snapshot["import_owners"] = {
+        logical_id: _EXPECTED_TARGET_STACK for logical_id in expected
+    }
+    snapshot["target_stack"] = {
+        "name": _EXPECTED_TARGET_STACK,
+        "status": "IMPORT_COMPLETE",
+        "resources": deepcopy(expected),
+    }
+    return snapshot
+
+
+def test_post_import_gate_accepts_exact_ownership_only_transition():
+    assert_post_import_equivalent(valid_snapshot(), post_import_snapshot())
+
+
+def test_expected_imported_physical_ids_are_exact_and_typed():
+    expected = expected_imported_physical_ids(valid_snapshot())
+
+    assert expected == {
+        "ReservationsTable": {
+            "physical_id": "PacificBioArchiveUploadReservations",
+            "resource_type": "AWS::DynamoDB::Table",
+        },
+        "QueryFunction": {
+            "physical_id": "PacificBioArchive-QueryLambda",
+            "resource_type": "AWS::Lambda::Function",
+        },
+        "QueryIntegration": {
+            "physical_id": "fbjojun",
+            "resource_type": "AWS::ApiGatewayV2::Integration",
+        },
+        **{
+            logical_id: {
+                "physical_id": f"route{index:02d}",
+                "resource_type": "AWS::ApiGatewayV2::Route",
+            }
+            for index, logical_id in enumerate(ROUTES_BY_LOGICAL_ID, start=1)
+        },
+    }
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        lambda snapshot: snapshot["target_stack"].update({"name": "WrongStack"}),
+        lambda snapshot: snapshot["target_stack"].update({"status": "UPDATE_COMPLETE"}),
+        lambda snapshot: snapshot["target_stack"]["resources"]["QueryFunction"].update(
+            {"resource_type": "AWS::Lambda::Version"}
+        ),
+        lambda snapshot: snapshot["target_stack"]["resources"]["QueryFunction"].update(
+            {"physical_id": "wrong-function"}
+        ),
+        lambda snapshot: snapshot["target_stack"]["resources"].pop("QueryFunction"),
+        lambda snapshot: snapshot["target_stack"]["resources"].update(
+            {"Unexpected": {"physical_id": "x", "resource_type": "AWS::S3::Bucket"}}
+        ),
+        lambda snapshot: snapshot["import_owners"].update({"QueryFunction": "OtherStack"}),
+        lambda snapshot: snapshot["import_owners"].pop("QueryFunction"),
+    ],
+    ids=(
+        "wrong-target-name",
+        "wrong-target-status",
+        "wrong-resource-type",
+        "wrong-physical-id",
+        "partial-target",
+        "extra-target",
+        "foreign-owner",
+        "partial-owners",
+    ),
+)
+def test_post_import_gate_rejects_invalid_ownership_evidence(mutation):
+    observed = post_import_snapshot()
+    mutation(observed)
+
+    with pytest.raises(AdoptionError):
+        assert_post_import_equivalent(valid_snapshot(), observed)
+
+
+_POST_IMPORT_FUNCTION_FIELDS = (
+    "FunctionName",
+    "Runtime",
+    "Handler",
+    "Role",
+    "Timeout",
+    "MemorySize",
+    "Description",
+    "Tags",
+    "SnapStart",
+    "PackageType",
+    "Architectures",
+    "Layers",
+    "EphemeralStorage",
+    "VpcConfig",
+    "FileSystemConfigs",
+    "KmsKeyArn",
+    "DeadLetterConfig",
+    "TracingConfig",
+    "LoggingConfig",
+    "CodeSigningConfigArn",
+    "RuntimeManagementConfig",
+    "ReservedConcurrentExecutions",
+    "CodeSha256",
+    "RevisionId",
+    "resource_policy",
+    "resource_policy_revision_id",
+    "provisioned_concurrency",
+)
+
+
+@pytest.mark.parametrize("field", _POST_IMPORT_FUNCTION_FIELDS)
+def test_post_import_gate_rejects_each_lambda_field_mutation(field):
+    before = valid_snapshot()
+    observed = post_import_snapshot()
+    observed["function"][field] = {"changed": True}
+
+    with pytest.raises(AdoptionError):
+        assert_post_import_equivalent(before, observed)
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        lambda function: function["environment_names"].remove("INTERNAL_API_KEY"),
+        lambda function: function["environment_names"].append("UNEXPECTED_SECRET"),
+        lambda function: function["safe_environment"].update({"REPO_BACKEND": "changed"}),
+        lambda function: function["safe_environment"].pop("CORS_ORIGINS"),
+    ],
+    ids=("missing-name", "extra-name", "changed-safe-value", "missing-safe-value"),
+)
+def test_post_import_gate_rejects_environment_evidence_mutation(mutation):
+    observed = post_import_snapshot()
+    mutation(observed["function"])
+
+    with pytest.raises(AdoptionError):
+        assert_post_import_equivalent(valid_snapshot(), observed)
+
+
+_COMPLETE_INTEGRATION = {
+    "IntegrationId": "fbjojun",
+    "IntegrationType": "AWS_PROXY",
+    "IntegrationSubtype": "",
+    "IntegrationMethod": "POST",
+    "PayloadFormatVersion": "2.0",
+    "IntegrationUri": "arn:aws:apigateway:ap-southeast-2:lambda:path/2015-03-31/functions/arn:aws:lambda:ap-southeast-2:111122223333:function:PacificBioArchive-QueryLambda/invocations",
+    "ConnectionType": "INTERNET",
+    "ConnectionId": None,
+    "ContentHandlingStrategy": None,
+    "CredentialsArn": None,
+    "Description": "query integration",
+    "PassthroughBehavior": None,
+    "RequestParameters": {"append:header.x-test": "'safe'"},
+    "RequestTemplates": {},
+    "ResponseParameters": {},
+    "TemplateSelectionExpression": None,
+    "TlsConfig": {"ServerNameToVerify": "example.invalid"},
+    "TimeoutInMillis": 29000,
+}
+
+
+@pytest.mark.parametrize("field", tuple(_COMPLETE_INTEGRATION))
+def test_post_import_gate_rejects_each_captured_integration_field_mutation(field):
+    before = valid_snapshot()
+    observed = post_import_snapshot()
+    before["integration"] = deepcopy(_COMPLETE_INTEGRATION)
+    observed["integration"] = deepcopy(_COMPLETE_INTEGRATION)
+    observed["integration"][field] = "changed"
+
+    with pytest.raises(AdoptionError):
+        assert_post_import_equivalent(before, observed)
+
+
+_COMPLETE_ROUTE_FIELDS = {
+    "ApiKeyRequired": False,
+    "AuthorizationScopes": ["query:read"],
+    "ModelSelectionExpression": "$request.body.action",
+    "OperationName": "QueryRoute",
+    "RequestModels": {"application/json": "model"},
+    "RequestParameters": {"route.request.header.x-test": {"Required": False}},
+    "RouteResponseSelectionExpression": "$default",
+}
+
+
+@pytest.mark.parametrize("logical_id", tuple(ROUTES_BY_LOGICAL_ID))
+@pytest.mark.parametrize(
+    "field",
+    (
+        "RouteId",
+        "RouteKey",
+        "Target",
+        "AuthorizationType",
+        "AuthorizerId",
+        *_COMPLETE_ROUTE_FIELDS,
+    ),
+)
+def test_post_import_gate_rejects_every_captured_field_for_each_route(
+    logical_id,
+    field,
+):
+    before = valid_snapshot()
+    observed = post_import_snapshot()
+    route_key = ROUTES_BY_LOGICAL_ID[logical_id].route_key
+    before_route = next(route for route in before["api"]["routes"] if route["RouteKey"] == route_key)
+    observed_route = next(route for route in observed["api"]["routes"] if route["RouteKey"] == route_key)
+    before_route.update(deepcopy(_COMPLETE_ROUTE_FIELDS))
+    observed_route.update(deepcopy(_COMPLETE_ROUTE_FIELDS))
+    observed_route[field] = "changed"
+
+    with pytest.raises(AdoptionError):
+        assert_post_import_equivalent(before, observed)
+
+
+def test_post_import_gate_ignores_unrelated_api_route():
+    observed = post_import_snapshot()
+    observed["api"]["routes"].append(
+        {
+            "RouteId": "member-b-route",
+            "RouteKey": "GET /member-b",
+            "Target": "integrations/member-b",
+            "AuthorizationType": "NONE",
+        }
+    )
+
+    assert_post_import_equivalent(valid_snapshot(), observed)
+
+
+def test_failed_import_change_set_creation_requires_fresh_review_and_discard():
+    classification = adoption.classify_recovery_state(
+        None,
+        set(),
+        import_change_set_creation_failed=True,
+    )
+
+    assert classification == {
+        "action": "re-audit-and-review",
+        "empty_shell_cleanup_candidate": False,
+        "deletion_requires_separate_approval": False,
+        "discard_stale_artifacts": True,
+    }
+
+
+@pytest.mark.parametrize(
+    ("status", "managed"),
+    [
+        ("IMPORT_IN_PROGRESS", set()),
+        ("UPDATE_IN_PROGRESS", _EXPECTED_IMPORT_RESOURCES),
+        ("CREATE_IN_PROGRESS", set()),
+        ("UNKNOWN_FUTURE_STATE", _EXPECTED_IMPORT_RESOURCES),
+    ],
+)
+def test_in_progress_and_unknown_recovery_states_never_proceed(status, managed):
+    assert adoption.classify_recovery_state(status, set(managed))["action"] == "stop"
+
+
+def test_failed_creation_flag_cannot_override_a_present_or_partial_target():
+    classification = adoption.classify_recovery_state(
+        "IMPORT_IN_PROGRESS",
+        {"QueryFunction"},
+        import_change_set_creation_failed=True,
+    )
+
+    assert classification["action"] == "stop"
+    assert classification["discard_stale_artifacts"] is True
 
 
 def _query_adoption_import_template():

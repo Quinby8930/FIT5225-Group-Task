@@ -633,6 +633,68 @@ def _validate_function(
         isinstance(function.get("RevisionId"), str) and function["RevisionId"],
         "function revision is unavailable",
     )
+    _require(
+        isinstance(function.get("resource_policy_revision_id"), str)
+        and bool(function["resource_policy_revision_id"]),
+        "function resource policy revision is unavailable",
+    )
+    provisioned = function.get("provisioned_concurrency")
+    _require(
+        isinstance(provisioned, list),
+        "function provisioned concurrency evidence is unavailable",
+    )
+    canonical_provisioned: list[str] = []
+    seen_function_arns: set[str] = set()
+    required_provisioned_keys = {
+        "FunctionArn",
+        "RequestedProvisionedConcurrentExecutions",
+        "AvailableProvisionedConcurrentExecutions",
+        "AllocatedProvisionedConcurrentExecutions",
+        "Status",
+        "LastModified",
+    }
+    allowed_provisioned_keys = required_provisioned_keys | {"StatusReason"}
+    for configuration in provisioned:
+        _require(
+            isinstance(configuration, Mapping)
+            and required_provisioned_keys <= set(configuration)
+            and set(configuration) <= allowed_provisioned_keys,
+            "function provisioned concurrency evidence is malformed",
+        )
+        function_arn = configuration.get("FunctionArn")
+        _require(
+            isinstance(function_arn, str)
+            and bool(function_arn)
+            and function_arn.startswith(
+                f"arn:aws:lambda:{region}:{account}:function:"
+                "PacificBioArchive-QueryLambda:"
+            )
+            and function_arn not in seen_function_arns,
+            "function provisioned concurrency identity is malformed",
+        )
+        seen_function_arns.add(function_arn)
+        for field in (
+            "RequestedProvisionedConcurrentExecutions",
+            "AvailableProvisionedConcurrentExecutions",
+            "AllocatedProvisionedConcurrentExecutions",
+        ):
+            value = configuration.get(field)
+            _require(
+                type(value) is int and value >= 0,
+                "function provisioned concurrency count is malformed",
+            )
+        _require(
+            isinstance(configuration.get("Status"), str)
+            and bool(configuration["Status"])
+            and isinstance(configuration.get("LastModified"), str)
+            and bool(configuration["LastModified"]),
+            "function provisioned concurrency status is malformed",
+        )
+        canonical_provisioned.append(function_arn)
+    _require(
+        canonical_provisioned == sorted(canonical_provisioned),
+        "function provisioned concurrency evidence is not canonical",
+    )
     names = function.get("environment_names")
     safe = function.get("safe_environment")
     _require(isinstance(names, list) and set(names) == _EXPECTED_ENVIRONMENT_NAMES and len(names) == len(_EXPECTED_ENVIRONMENT_NAMES), "function environment names cannot be preserved")
@@ -785,8 +847,8 @@ def validate_lambda_policy_after_update(
     )
 
 
-def validate_snapshot(snapshot: Mapping[str, Any]) -> None:
-    """Reject any state that cannot be imported without changing live traffic."""
+def _validate_snapshot_common(snapshot: Mapping[str, Any]) -> None:
+    """Validate strict source/runtime evidence shared by both ownership phases."""
     caller = snapshot.get("caller", {})
     arn = caller.get("Arn") if isinstance(caller, Mapping) else None
     account = caller.get("Account") if isinstance(caller, Mapping) else None
@@ -829,7 +891,6 @@ def validate_snapshot(snapshot: Mapping[str, Any]) -> None:
     _require(isinstance(schemas, Mapping), "primary identifier schemas missing")
     for resource_type, expected in _REQUIRED_TYPE_SCHEMAS.items():
         _require(schemas.get(resource_type) == expected, f"primary identifier schema mismatch for {resource_type}")
-    validate_import_owners(snapshot.get("import_owners"))
     reservations_table = snapshot.get("reservations_table")
     _require(isinstance(reservations_table, Mapping), "ReservationsTable is missing")
     _validate_reservations_table(
@@ -864,6 +925,96 @@ def validate_snapshot(snapshot: Mapping[str, Any]) -> None:
             _require(route.get("AuthorizerId") == "7ir7fs", f"route authorizer mismatch for {contract.route_key}")
         else:
             _require(route.get("AuthorizerId") in (None, ""), f"internal route authorizer mismatch for {contract.route_key}")
+
+
+def expected_imported_physical_ids(
+    snapshot: Mapping[str, Any],
+) -> dict[str, dict[str, str]]:
+    """Return the exact physical/type evidence for the 19 imported resources."""
+    routes = _route_lookup(snapshot)
+    result = {
+        "ReservationsTable": {
+            "physical_id": snapshot.get("reservations_table", {}).get("TableName"),
+            "resource_type": "AWS::DynamoDB::Table",
+        },
+        "QueryFunction": {
+            "physical_id": snapshot.get("function", {}).get("FunctionName"),
+            "resource_type": "AWS::Lambda::Function",
+        },
+        "QueryIntegration": {
+            "physical_id": snapshot.get("integration", {}).get("IntegrationId"),
+            "resource_type": "AWS::ApiGatewayV2::Integration",
+        },
+    }
+    for logical_id, contract in ROUTES_BY_LOGICAL_ID.items():
+        route = routes.get(contract.route_key, {})
+        result[logical_id] = {
+            "physical_id": route.get("RouteId"),
+            "resource_type": "AWS::ApiGatewayV2::Route",
+        }
+    _require(
+        set(result) == IMPORT_LOGICAL_IDS
+        and all(
+            isinstance(item.get("physical_id"), str)
+            and bool(item["physical_id"])
+            and item.get("resource_type") == IMPORT_RESOURCE_TYPES[logical_id]
+            for logical_id, item in result.items()
+        ),
+        "expected imported physical identifier evidence is incomplete",
+    )
+    return result
+
+
+def _validate_target_stack(
+    snapshot: Mapping[str, Any],
+    *,
+    post_import: bool,
+) -> None:
+    target = snapshot.get("target_stack")
+    _require(isinstance(target, Mapping), "target stack evidence is missing")
+    _require(
+        target.get("name") == TARGET_STACK_NAME,
+        "target stack name differs from the approved target",
+    )
+    resources = target.get("resources")
+    _require(isinstance(resources, Mapping), "target stack resources are missing")
+    if not post_import:
+        _require(
+            target.get("status") is None and not resources,
+            "target stack must be absent with zero managed resources before import",
+        )
+        validate_import_owners(snapshot.get("import_owners"))
+        return
+    expected = expected_imported_physical_ids(snapshot)
+    _require(
+        target.get("status") == "IMPORT_COMPLETE",
+        "target stack must be IMPORT_COMPLETE after import",
+    )
+    _require(
+        dict(resources) == expected,
+        "target stack logical, physical, or resource type mappings differ",
+    )
+    owners = snapshot.get("import_owners")
+    _require(
+        isinstance(owners, Mapping)
+        and set(owners) == IMPORT_LOGICAL_IDS
+        and all(owner == TARGET_STACK_NAME for owner in owners.values()),
+        "post-import owner mapping must contain exactly the target stack",
+    )
+
+
+def validate_snapshot(snapshot: Mapping[str, Any]) -> None:
+    """Reject any pre-import state that cannot preserve live traffic."""
+    _validate_snapshot_common(snapshot)
+    _validate_target_stack(snapshot, post_import=False)
+
+
+def validate_post_import_snapshot(snapshot: Mapping[str, Any]) -> None:
+    """Require strict shared evidence plus the completed 19-resource import."""
+    _validate_snapshot_common(snapshot)
+    _validate_target_stack(snapshot, post_import=True)
+
+
 def build_resources_to_import(snapshot: Mapping[str, Any]) -> list[dict[str, Any]]:
     validate_snapshot(snapshot)
     api_id = snapshot["api"]["id"]
@@ -1075,6 +1226,19 @@ def assert_runtime_unchanged(before: Mapping[str, Any], after: Mapping[str, Any]
     _require(_runtime_fingerprint(before) == _runtime_fingerprint(after), "runtime changed after import")
 
 
+def assert_post_import_equivalent(
+    before: Mapping[str, Any],
+    observed: Mapping[str, Any],
+) -> None:
+    """Accept only the exact unmanaged-to-target ownership transition."""
+    validate_snapshot(before)
+    validate_post_import_snapshot(observed)
+    _require(
+        _runtime_fingerprint(before) == _runtime_fingerprint(observed),
+        "runtime changed after import",
+    )
+
+
 def validate_import_change_set(
     changes: list[Mapping[str, Any]],
     expected: list[Mapping[str, Any]],
@@ -1121,6 +1285,8 @@ def validate_import_change_set(
 def classify_recovery_state(
     status: str | None,
     managed_logical_ids: set[str],
+    *,
+    import_change_set_creation_failed: bool = False,
 ) -> dict[str, Any]:
     """Classify recovery without ever authorizing a destructive operation."""
     managed = set(managed_logical_ids)
@@ -1129,7 +1295,11 @@ def classify_recovery_state(
         "REVIEW_IN_PROGRESS",
         "IMPORT_ROLLBACK_COMPLETE",
     }
-    if status is None:
+    if import_change_set_creation_failed and status is None and not managed:
+        action = "re-audit-and-review"
+    elif import_change_set_creation_failed:
+        action = "stop"
+    elif status is None:
         action = "prepare" if not managed else "stop"
     elif status == "REVIEW_IN_PROGRESS":
         action = "inspect" if not managed else "stop"
@@ -1145,11 +1315,14 @@ def classify_recovery_state(
         )
     else:
         action = "stop"
-    return {
+    result = {
         "action": action,
         "empty_shell_cleanup_candidate": empty_shell,
         "deletion_requires_separate_approval": empty_shell,
     }
+    if import_change_set_creation_failed:
+        result["discard_stale_artifacts"] = True
+    return result
 
 
 def _role_continuity_with_retain(audited: Mapping[str, Any], current: Mapping[str, Any]) -> bool:

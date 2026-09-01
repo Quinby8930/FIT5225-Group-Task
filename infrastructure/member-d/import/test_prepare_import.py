@@ -44,6 +44,7 @@ from test_adoption import (
     _route_scoped_lambda_policy,
     _update_processed,
     approved_role_drift_snapshot,
+    post_import_snapshot,
     valid_snapshot,
 )
 
@@ -188,9 +189,14 @@ class FakeAwsCli:
         if "lambda list-tags" in command:
             return {"Tags": {}}
         if "get-policy" in command:
-            return {"Policy": json.dumps(valid_snapshot()["function"]["resource_policy"])}
+            return {
+                "Policy": json.dumps(valid_snapshot()["function"]["resource_policy"]),
+                "RevisionId": "fixture-policy-revision",
+            }
         if "get-function-concurrency" in command:
             return {}
+        if "list-provisioned-concurrency-configs" in command:
+            return {"ProvisionedConcurrencyConfigs": []}
         if "get-runtime-management-config" in command:
             return valid_snapshot()["function"]["RuntimeManagementConfig"]
         if "get-role" in command:
@@ -4007,3 +4013,298 @@ def test_collection_rejects_role_shape_when_processed_template_only_has_name(tmp
             return response
     with pytest.raises(AdoptionError, match="live definition"):
         collect_snapshot(NameOnlyRoleCli(), fixture_config(tmp_path))
+
+
+def _target_stack_resource_summaries():
+    expected = adoption.expected_imported_physical_ids(valid_snapshot())
+    return [
+        {
+            "LogicalResourceId": logical_id,
+            "PhysicalResourceId": evidence["physical_id"],
+            "ResourceType": evidence["resource_type"],
+        }
+        for logical_id, evidence in expected.items()
+    ]
+
+
+class PostImportCli(FakeAwsCli):
+    def json(self, *args):
+        if args[:2] == ("cloudformation", "list-stacks"):
+            self.calls.append(args)
+            return {
+                "StackSummaries": [
+                    {
+                        "StackName": "PacificBioArchive-Database",
+                        "StackStatus": "UPDATE_ROLLBACK_COMPLETE",
+                    },
+                    {
+                        "StackName": "PacificBioArchive-QueryAdoption",
+                        "StackStatus": "IMPORT_COMPLETE",
+                    },
+                ]
+            }
+        if (
+            args[:2] == ("cloudformation", "list-stack-resources")
+            and "PacificBioArchive-QueryAdoption" in args
+        ):
+            self.calls.append(args)
+            return {
+                "StackResourceSummaries": _target_stack_resource_summaries()
+            }
+        return super().json(*args)
+
+    def run(self, *args):
+        raise AssertionError(f"write boundary must not be called: {args}")
+
+
+def test_collection_preserves_policy_revision_separately(tmp_path):
+    snapshot = collect_snapshot(FakeAwsCli(), fixture_config(tmp_path))
+
+    assert snapshot["function"]["resource_policy_revision_id"] == (
+        "fixture-policy-revision"
+    )
+    assert "RevisionId" not in snapshot["function"]["resource_policy"]
+
+
+def test_collection_safe_environment_query_never_selects_secret_value(tmp_path):
+    cli = FakeAwsCli()
+
+    collect_snapshot(cli, fixture_config(tmp_path))
+
+    configuration_call = next(
+        call
+        for call in cli.calls
+        if call[:2] == ("lambda", "get-function-configuration")
+    )
+    query = configuration_call[configuration_call.index("--query") + 1]
+    assert "keys(Environment.Variables)" in query
+    assert "Environment.Variables.INTERNAL_API_KEY" not in query
+
+
+def test_collection_paginates_and_canonicalizes_provisioned_concurrency(tmp_path):
+    class PaginatedConcurrencyCli(FakeAwsCli):
+        def json(self, *args):
+            if args[:2] == ("lambda", "list-provisioned-concurrency-configs"):
+                self.calls.append(args)
+                if "--marker" in args:
+                    return {
+                        "ProvisionedConcurrencyConfigs": [
+                            {
+                                "FunctionArn": (
+                                    "arn:aws:lambda:ap-southeast-2:111122223333:"
+                                    "function:PacificBioArchive-QueryLambda:blue"
+                                ),
+                                "RequestedProvisionedConcurrentExecutions": 2,
+                                "AvailableProvisionedConcurrentExecutions": 2,
+                                "AllocatedProvisionedConcurrentExecutions": 2,
+                                "Status": "READY",
+                                "StatusReason": "ready",
+                                "LastModified": "2026-09-01T00:00:00+00:00",
+                            }
+                        ]
+                    }
+                return {
+                    "ProvisionedConcurrencyConfigs": [
+                        {
+                            "FunctionArn": (
+                                "arn:aws:lambda:ap-southeast-2:111122223333:"
+                                "function:PacificBioArchive-QueryLambda:green"
+                            ),
+                            "RequestedProvisionedConcurrentExecutions": 1,
+                            "AvailableProvisionedConcurrentExecutions": 1,
+                            "AllocatedProvisionedConcurrentExecutions": 1,
+                            "Status": "READY",
+                            "StatusReason": "ready",
+                            "LastModified": "2026-09-01T00:00:01+00:00",
+                        }
+                    ],
+                    "NextMarker": "second-page",
+                }
+            return super().json(*args)
+
+    cli = PaginatedConcurrencyCli()
+    snapshot = collect_snapshot(cli, fixture_config(tmp_path))
+
+    assert [
+        item["FunctionArn"]
+        for item in snapshot["function"]["provisioned_concurrency"]
+    ] == [
+        "arn:aws:lambda:ap-southeast-2:111122223333:function:PacificBioArchive-QueryLambda:blue",
+        "arn:aws:lambda:ap-southeast-2:111122223333:function:PacificBioArchive-QueryLambda:green",
+    ]
+    calls = [
+        call
+        for call in cli.calls
+        if call[:2] == ("lambda", "list-provisioned-concurrency-configs")
+    ]
+    assert len(calls) == 2
+    assert calls[1][calls[1].index("--marker") + 1] == "second-page"
+
+
+@pytest.mark.parametrize(
+    "page",
+    [
+        {},
+        {"ProvisionedConcurrencyConfigs": "not-a-list"},
+        {"ProvisionedConcurrencyConfigs": [{}]},
+        {"ProvisionedConcurrencyConfigs": [], "NextMarker": ""},
+    ],
+)
+def test_collection_rejects_incomplete_provisioned_concurrency_evidence(
+    tmp_path,
+    page,
+):
+    class MalformedConcurrencyCli(FakeAwsCli):
+        def json(self, *args):
+            if args[:2] == ("lambda", "list-provisioned-concurrency-configs"):
+                self.calls.append(args)
+                return deepcopy(page)
+            return super().json(*args)
+
+    with pytest.raises(AdoptionError, match="provisioned concurrency|pagination"):
+        collect_snapshot(MalformedConcurrencyCli(), fixture_config(tmp_path))
+
+
+def test_post_import_collection_rejects_duplicate_physical_owner(tmp_path):
+    class DuplicateOwnerCli(PostImportCli):
+        def json(self, *args):
+            if args[:2] == ("cloudformation", "list-stacks"):
+                response = super().json(*args)
+                response["StackSummaries"].append(
+                    {"StackName": "ForeignStack", "StackStatus": "UPDATE_COMPLETE"}
+                )
+                return response
+            if (
+                args[:2] == ("cloudformation", "list-stack-resources")
+                and "ForeignStack" in args
+            ):
+                self.calls.append(args)
+                return {
+                    "StackResourceSummaries": [
+                        {
+                            "LogicalResourceId": "ForeignFunction",
+                            "PhysicalResourceId": "PacificBioArchive-QueryLambda",
+                            "ResourceType": "AWS::Lambda::Function",
+                        }
+                    ]
+                }
+            return super().json(*args)
+
+    with pytest.raises(AdoptionError, match="duplicate|owner"):
+        collect_snapshot(
+            DuplicateOwnerCli(),
+            fixture_config(tmp_path),
+            ownership_phase="post",
+        )
+
+
+def test_verify_post_import_cli_writes_sanitized_evidence_after_read_only_gate(
+    tmp_path,
+    monkeypatch,
+):
+    import prepare_import
+
+    baseline = tmp_path / "baseline.json"
+    baseline_snapshot = collect_snapshot(FakeAwsCli(), fixture_config(tmp_path))
+    baseline.write_text(json.dumps(baseline_snapshot), encoding="utf-8")
+    cli = PostImportCli()
+    monkeypatch.setattr(prepare_import, "AwsCli", lambda: cli)
+
+    assert prepare_import.main(
+        [
+            "verify-post-import",
+            "--region", "ap-southeast-2",
+            "--source-stack", "PacificBioArchive-Database",
+            "--target-stack", "PacificBioArchive-QueryAdoption",
+            "--baseline", str(baseline),
+            "--api", "2dd2aqb32j",
+            "--authorizer", "7ir7fs",
+            "--integration", "fbjojun",
+            "--function", "PacificBioArchive-QueryLambda",
+            "--workdir", str(tmp_path),
+        ]
+    ) == 0
+    evidence = json.loads(
+        (tmp_path / "post-import-evidence.json").read_text(encoding="utf-8")
+    )
+    assert evidence["target_stack"] == {
+        "name": "PacificBioArchive-QueryAdoption",
+        "status": "IMPORT_COMPLETE",
+        "resources": adoption.expected_imported_physical_ids(evidence),
+    }
+    assert set(evidence["import_owners"].values()) == {
+        "PacificBioArchive-QueryAdoption"
+    }
+    assert "internal-secret" not in json.dumps(evidence)
+    assert all(
+        call[0] not in {"put-object", "create-change-set", "execute-change-set", "delete-stack"}
+        for call in cli.calls
+        if call
+    )
+
+
+def test_recovery_report_cli_records_only_classification_and_ownership(
+    tmp_path,
+    monkeypatch,
+    capsys,
+):
+    import prepare_import
+
+    cli = PostImportCli()
+    monkeypatch.setattr(prepare_import, "AwsCli", lambda: cli)
+    (tmp_path / "sanitized-snapshot.json").write_text(
+        json.dumps(valid_snapshot()),
+        encoding="utf-8",
+    )
+
+    assert prepare_import.main(
+        [
+            "recovery-report",
+            "--region", "ap-southeast-2",
+            "--source-stack", "PacificBioArchive-Database",
+            "--target-stack", "PacificBioArchive-QueryAdoption",
+            "--workdir", str(tmp_path),
+        ]
+    ) == 0
+    report = json.loads(
+        (tmp_path / "recovery-report.json").read_text(encoding="utf-8")
+    )
+    assert set(report) == {"classification", "ownership"}
+    assert report["classification"]["action"] == "post-import-evidence"
+    assert report["ownership"]["target_stack"]["status"] == "IMPORT_COMPLETE"
+    assert json.loads(capsys.readouterr().out) == report
+    assert all(call[0] == "cloudformation" for call in cli.calls)
+
+
+def test_recovery_report_failed_creation_absent_target_discards_stale_artifacts(
+    tmp_path,
+    monkeypatch,
+):
+    import prepare_import
+
+    cli = FakeAwsCli()
+    monkeypatch.setattr(prepare_import, "AwsCli", lambda: cli)
+    (tmp_path / "sanitized-snapshot.json").write_text(
+        json.dumps(valid_snapshot()),
+        encoding="utf-8",
+    )
+
+    assert prepare_import.main(
+        [
+            "recovery-report",
+            "--region", "ap-southeast-2",
+            "--source-stack", "PacificBioArchive-Database",
+            "--target-stack", "PacificBioArchive-QueryAdoption",
+            "--workdir", str(tmp_path),
+            "--import-change-set-creation-failed",
+        ]
+    ) == 0
+    report = json.loads(
+        (tmp_path / "recovery-report.json").read_text(encoding="utf-8")
+    )
+    assert report["classification"] == {
+        "action": "re-audit-and-review",
+        "empty_shell_cleanup_candidate": False,
+        "deletion_requires_separate_approval": False,
+        "discard_stale_artifacts": True,
+    }
