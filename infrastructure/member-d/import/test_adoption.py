@@ -1,4 +1,5 @@
 from copy import deepcopy
+from inspect import signature
 from pathlib import Path
 import re
 import sys
@@ -2631,8 +2632,8 @@ def test_role_modify_is_rejected_even_for_retain_only_metadata():
         validate_update_change_set(changes, processed, audited)
 
 
-def test_hardening_only_update_accepts_exact_query_function_modify():
-    changes = [{
+def _query_function_only_change():
+    return [{
         "ResourceChange": {
             "Action": "Modify",
             "LogicalResourceId": "QueryFunction",
@@ -2641,52 +2642,21 @@ def test_hardening_only_update_accepts_exact_query_function_modify():
         }
     }]
 
-    validate_update_change_set(
-        changes,
-        _update_processed(_maintained_role_target()),
-        None,
-        hardening_only=True,
-    )
 
-
-@pytest.mark.parametrize(
-    "change",
-    [
-        {
-            "Action": "Modify",
-            "LogicalResourceId": "ReservationsTable",
-            "ResourceType": "AWS::DynamoDB::Table",
-            "Replacement": "False",
-        },
-        {
-            "Action": "Modify",
-            "LogicalResourceId": "QueryByTagsRoute",
-            "ResourceType": "AWS::ApiGatewayV2::Route",
-            "Replacement": "False",
-        },
-        {
-            "Action": "Add",
-            "LogicalResourceId": "BackdoorRoute",
-            "ResourceType": "AWS::ApiGatewayV2::Route",
-            "Replacement": "False",
-        },
-        {
-            "Action": "Modify",
-            "LogicalResourceId": "QueryFunction",
-            "ResourceType": "AWS::Lambda::Function",
-            "Replacement": "True",
-        },
-    ],
-    ids=("table-modify", "route-modify", "resource-add", "function-replacement"),
-)
-def test_hardening_only_update_rejects_every_other_change(change):
-    with pytest.raises(AdoptionError, match="hardening|QueryFunction|exact"):
+def test_first_update_rejects_lone_query_function_modify():
+    with pytest.raises(AdoptionError, match="exact 37-action"):
         validate_update_change_set(
-            [{"ResourceChange": change}],
+            _query_function_only_change(),
             _update_processed(_maintained_role_target()),
-            None,
-            hardening_only=True,
         )
+
+
+def test_update_validator_has_no_alternate_action_set_parameter():
+    assert set(signature(validate_update_change_set).parameters) == {
+        "changes",
+        "processed",
+        "audited_role",
+    }
 
 
 def _hardening_function_configs():

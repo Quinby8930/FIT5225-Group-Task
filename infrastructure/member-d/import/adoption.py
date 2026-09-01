@@ -2000,8 +2000,6 @@ def validate_update_change_set(
     changes: list[Mapping[str, Any]],
     processed: Mapping[str, Any],
     audited_role: Mapping[str, Any] | None = None,
-    *,
-    hardening_only: bool = False,
 ) -> None:
     resources = processed.get("Resources", {})
     _require(
@@ -2037,23 +2035,6 @@ def validate_update_change_set(
         for logical_id, target in plain_targets.items()
     }
     expected_types["QueryFunction"] = "AWS::Lambda::Function"
-    if hardening_only:
-        _require(
-            len(changes) == 1
-            and isinstance(changes[0], Mapping)
-            and changes[0].get("ResourceChange", {}).get("Action")
-            == "Modify"
-            and changes[0].get("ResourceChange", {}).get(
-                "LogicalResourceId"
-            )
-            == "QueryFunction"
-            and changes[0].get("ResourceChange", {}).get("ResourceType")
-            == "AWS::Lambda::Function"
-            and changes[0].get("ResourceChange", {}).get("Replacement")
-            in ("False", False),
-            "hardening UPDATE must contain exactly one in-place QueryFunction Modify",
-        )
-        return
     expected_changed_ids = additions | {"QueryFunction"}
     _require(
         len(changes) == len(expected_changed_ids),
