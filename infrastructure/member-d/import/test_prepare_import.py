@@ -125,6 +125,11 @@ class FakeAwsCli:
         if "get-caller-identity" in command:
             return {"Arn": self.caller_arn, "Account": "111122223333"}
         if "describe-stacks" in command:
+            if "--query" in args:
+                return {
+                    "StackName": "PacificBioArchive-Database",
+                    "ParameterNames": ["InternalApiKey"],
+                }
             return {"Stacks": [{"StackName": "PacificBioArchive-Database", "StackStatus": "UPDATE_ROLLBACK_COMPLETE", "Parameters": [{"ParameterKey": "InternalApiKey", "ParameterValue": "internal-secret"}]}]}
         if "get-template" in command:
             return {
@@ -149,7 +154,17 @@ class FakeAwsCli:
             type_name = args[args.index("--type-name") + 1]
             return {"Schema": json.dumps({"primaryIdentifier": valid_snapshot()["type_schemas"][type_name]})}
         if "get-function-configuration" in command:
-            configuration = {**valid_snapshot()["function"], "Environment": {"Variables": {**valid_snapshot()["function"]["safe_environment"], "INTERNAL_API_KEY": "internal-secret"}}}
+            configuration = {
+                **valid_snapshot()["function"],
+                "Environment": {
+                    "Names": deepcopy(
+                        valid_snapshot()["function"]["environment_names"]
+                    ),
+                    "Variables": deepcopy(
+                        valid_snapshot()["function"]["safe_environment"]
+                    ),
+                },
+            }
             if self.code_sha:
                 configuration["CodeSha256"] = self.code_sha
             return configuration
@@ -354,6 +369,15 @@ def _explicit_update_parameters():
     parameters.append(
         {"ParameterKey": "InternalApiKey", "UsePreviousValue": True}
     )
+    return parameters
+
+
+def _first_update_parameters(mask="*****"):
+    parameters = _explicit_update_parameters()
+    parameters[-1] = {
+        "ParameterKey": "InternalApiKey",
+        "ParameterValue": mask,
+    }
     return parameters
 
 
@@ -646,6 +670,7 @@ class CandidateChangeSetCli(FakeAwsCli):
         execution_status="AVAILABLE",
         artifact_checksum=_FIXTURE_CODE_SHA256,
         artifact_version="import-version-1",
+        stack_parameter_names=None,
     ):
         super().__init__(
             uploaded_checksum=artifact_checksum,
@@ -659,10 +684,27 @@ class CandidateChangeSetCli(FakeAwsCli):
         self.execution_status = execution_status
         self.artifact_checksum = artifact_checksum
         self.artifact_version = artifact_version
+        self.stack_parameter_names = (
+            ["InternalApiKey"]
+            if stack_parameter_names is None
+            else list(stack_parameter_names)
+        )
         self.calls = []
 
     def json(self, *args):
         self.calls.append(args)
+        if args[:2] == ("cloudformation", "describe-stacks") and "--query" in args:
+            query = args[args.index("--query") + 1]
+            if query == (
+                "Stacks[0].{StackName:StackName,"
+                "ParameterNames:Parameters[].ParameterKey}"
+            ):
+                return {
+                    "StackName": "PacificBioArchive-Database",
+                    "ParameterNames": deepcopy(self.stack_parameter_names) or None,
+                }
+            if query == "Stacks[0].Parameters":
+                return _current_hardening_parameters()
         if args[:2] == ("cloudformation", "describe-change-set"):
             return {
                 # DescribeChangeSet does not return ChangeSetType. The requested
@@ -785,9 +827,12 @@ def test_collection_queries_only_allowlisted_environment_values(tmp_path):
     configuration_calls = [" ".join(call) for call in cli.calls if "get-function-configuration" in call]
     assert len(configuration_calls) == 1
     assert "INTERNAL_API_KEY" not in configuration_calls[0]
+    assert "Environment: Environment" not in configuration_calls[0]
+    assert "Names: keys(Environment.Variables)" in configuration_calls[0]
     assert "Environment.Variables.REPO_BACKEND" in configuration_calls[0]
     assert "Environment.Variables.CORS_ORIGINS" in configuration_calls[0]
     assert "FunctionName: FunctionName" in configuration_calls[0]
+    assert "RevisionId: RevisionId" in configuration_calls[0]
     assert "internal-secret" not in str(snapshot)
 
 
@@ -1991,6 +2036,11 @@ def test_collection_rejects_enabled_reservations_contributor_insights(
 def test_collection_accepts_yaml_processed_template_with_intrinsic_tags(tmp_path):
     yaml_template = """
 AWSTemplateFormatVersion: '2010-09-09'
+Parameters:
+  InternalApiKey:
+    Type: String
+    NoEcho: true
+    MinLength: 1
 Resources:
   FilesTable:
     Type: AWS::DynamoDB::Table
@@ -2089,6 +2139,12 @@ def test_prepare_with_missing_internal_key_writes_no_parameter_value(tmp_path):
             if args[:2] == ("cloudformation", "describe-stacks"):
                 response = deepcopy(response)
                 response["Stacks"][0]["Parameters"] = []
+            if (
+                args[:2] == ("cloudformation", "get-template")
+                and "--change-set-name" not in args
+            ):
+                response = deepcopy(response)
+                response["TemplateBody"].pop("Parameters", None)
             return response
 
     package = lambda_zip_bytes()
@@ -2111,11 +2167,8 @@ def test_prepare_with_missing_internal_key_writes_no_parameter_value(tmp_path):
     template = json.loads(
         (tmp_path / "import-template.json").read_text(encoding="utf-8")
     )
-    assert template["Parameters"]["InternalApiKey"] == {
-        "Type": "String",
-        "NoEcho": True,
-        "MinLength": 1,
-    }
+    assert "InternalApiKey" not in template.get("Parameters", {})
+    assert "Environment" not in template["Resources"]["QueryFunction"]["Properties"]
     assert all(
         "internal-secret" not in path.read_text(encoding="utf-8")
         for path in artifact_paths
@@ -2158,12 +2211,118 @@ def test_sanitized_lambda_strips_output_only_runtime_and_snapstart_fields():
         "FunctionArn": "arn:aws:lambda:ap-southeast-2:111122223333:function:PacificBioArchive-QueryLambda",
         "RuntimeManagementConfig": {"UpdateRuntimeOn": "Auto", "FunctionArn": "output-only"},
         "SnapStart": {"ApplyOn": "None", "OptimizationStatus": "Off"},
-        "Environment": {"Variables": {**valid_snapshot()["function"]["safe_environment"], "INTERNAL_API_KEY": "internal-secret"}},
+        "Environment": {
+            "Names": deepcopy(valid_snapshot()["function"]["environment_names"]),
+            "Variables": deepcopy(valid_snapshot()["function"]["safe_environment"]),
+        },
     }
     result = _sanitized_function(configuration)
     assert "FunctionArn" not in result
     assert result["RuntimeManagementConfig"] == {"UpdateRuntimeOn": "Auto"}
     assert result["SnapStart"] == {"ApplyOn": "None"}
+
+
+def test_sanitized_lambda_rejects_unprojected_environment_without_secret_leak():
+    from prepare_import import _sanitized_function
+
+    secret = "secret-that-must-never-enter-an-error"
+    configuration = valid_snapshot()["function"] | {
+        "Environment": {
+            "Names": deepcopy(valid_snapshot()["function"]["environment_names"]),
+            "Variables": {
+                **valid_snapshot()["function"]["safe_environment"],
+                "INTERNAL_API_KEY": secret,
+            }
+        }
+    }
+
+    with pytest.raises(AdoptionError, match="environment.*malformed") as error:
+        _sanitized_function(configuration)
+    assert secret not in str(error.value)
+
+
+def test_stack_parameter_name_query_returns_names_only():
+    from prepare_import import collect_stack_parameter_names
+
+    class ParameterCli:
+        def __init__(self):
+            self.calls = []
+
+        def json(self, *args):
+            self.calls.append(args)
+            return {
+                "StackName": "PacificBioArchive-Database",
+                "ParameterNames": ["ExistingHttpApiId", "InternalApiKey"],
+            }
+
+    cli = ParameterCli()
+    assert collect_stack_parameter_names(
+        cli,
+        "PacificBioArchive-Database",
+        "ap-southeast-2",
+    ) == {"ExistingHttpApiId", "InternalApiKey"}
+    command = cli.calls[0]
+    query = command[command.index("--query") + 1]
+    assert query == (
+        "Stacks[0].{StackName:StackName,"
+        "ParameterNames:Parameters[].ParameterKey}"
+    )
+    assert "ParameterValue" not in " ".join(command)
+
+
+def test_stack_parameter_name_query_accepts_omitted_parameters_for_known_stack():
+    from prepare_import import collect_stack_parameter_names
+
+    class ParameterCli:
+        def json(self, *_args):
+            return {
+                "StackName": "PacificBioArchive-Database",
+                "ParameterNames": None,
+            }
+
+    assert collect_stack_parameter_names(
+        ParameterCli(),
+        "PacificBioArchive-Database",
+        "ap-southeast-2",
+    ) == set()
+
+
+@pytest.mark.parametrize(
+    "response",
+    [
+        None,
+        {},
+        {
+            "StackName": "wrong-stack",
+            "ParameterNames": [],
+        },
+        {
+            "StackName": "PacificBioArchive-Database",
+            "ParameterNames": ["Duplicate", "Duplicate"],
+        },
+        {
+            "StackName": "PacificBioArchive-Database",
+            "ParameterNames": [""],
+        },
+        {
+            "StackName": "PacificBioArchive-Database",
+            "ParameterNames": {},
+        },
+    ],
+)
+def test_stack_parameter_name_query_fails_closed_on_malformed_shape(response):
+    from prepare_import import collect_stack_parameter_names
+
+    class ParameterCli:
+        def json(self, *_args):
+            return response
+
+    with pytest.raises(AdoptionError, match="unavailable|duplicated"):
+        collect_stack_parameter_names(
+            ParameterCli(),
+            "PacificBioArchive-Database",
+            "ap-southeast-2",
+        )
 
 
 def test_collection_accepts_aws_null_optional_lambda_configuration_and_import_omits_it(
@@ -2541,6 +2700,95 @@ def test_update_artifacts_reject_unapproved_change_set_parameters(mutation):
         )
 
 
+@pytest.mark.parametrize("mask", ["****", "******", "not-masked"])
+def test_first_update_rejects_noncanonical_noecho_mask(mask):
+    with pytest.raises(
+        AdoptionError,
+        match="masked|NoEcho|InternalApiKey|resolved",
+    ):
+        adoption.validate_update_artifacts(
+            _processed_update_template(),
+            _built_update_template(),
+            _packaged_update_template(),
+            _maintained_source_template(),
+            _first_update_parameters(mask),
+            _EXPECTED_UPDATE_PARAMETER_VALUES,
+            _update_artifact(),
+            internal_key_already_exists=False,
+        )
+
+
+@pytest.mark.parametrize(
+    "internal_parameter",
+    [
+        {"ParameterKey": "InternalApiKey", "UsePreviousValue": True},
+        {
+            "ParameterKey": "InternalApiKey",
+            "ParameterValue": "*****",
+            "UsePreviousValue": False,
+        },
+        {
+            "ParameterKey": "InternalApiKey",
+            "ParameterValue": "*****",
+            "ResolvedValue": "must-not-be-present",
+        },
+    ],
+    ids=("use-previous", "mask-plus-use-previous", "resolved-value"),
+)
+def test_first_update_rejects_noncanonical_internal_parameter_shape(
+    internal_parameter,
+):
+    parameters = _explicit_update_parameters()
+    parameters[-1] = internal_parameter
+
+    with pytest.raises(
+        AdoptionError,
+        match="masked|NoEcho|InternalApiKey|resolved",
+    ):
+        adoption.validate_update_artifacts(
+            _processed_update_template(),
+            _built_update_template(),
+            _packaged_update_template(),
+            _maintained_source_template(),
+            parameters,
+            _EXPECTED_UPDATE_PARAMETER_VALUES,
+            _update_artifact(),
+            internal_key_already_exists=False,
+        )
+
+
+@pytest.mark.parametrize(
+    "leak",
+    [
+        {"Ref": "InternalApiKey"},
+        {"Fn::Sub": "secret=${InternalApiKey}"},
+        {"Fn::Sub": ["secret=${InternalApiKey}", {}]},
+    ],
+    ids=("ref", "sub-string", "sub-list"),
+)
+def test_update_rejects_internal_key_reference_outside_query_environment(leak):
+    processed = _processed_update_template()
+    built = _built_update_template()
+    packaged = _packaged_update_template()
+    maintained = _maintained_source_template()
+    for template in (processed, built, packaged, maintained):
+        template.setdefault("Outputs", {})["LeakedInternalApiKey"] = {
+            "Value": deepcopy(leak)
+        }
+
+    with pytest.raises(AdoptionError, match="InternalApiKey|NoEcho|binding"):
+        adoption.validate_update_artifacts(
+            processed,
+            built,
+            packaged,
+            maintained,
+            _first_update_parameters(),
+            _EXPECTED_UPDATE_PARAMETER_VALUES,
+            _update_artifact(),
+            internal_key_already_exists=False,
+        )
+
+
 def test_import_artifacts_accept_exact_local_template_and_use_previous():
     snapshot = valid_snapshot()
     local = build_import_template(
@@ -2565,9 +2813,10 @@ def test_import_artifacts_accept_exact_local_template_and_use_previous():
     )
 
 
-def test_import_artifacts_accept_console_supplied_noecho_parameter_when_missing():
+def test_import_artifacts_accept_no_parameters_when_internal_key_is_missing():
     snapshot = valid_snapshot()
     snapshot["stack"]["parameters"] = []
+    snapshot["stack"]["template"].pop("Parameters")
     local = build_import_template(
         snapshot,
         CodeArtifact(
@@ -2580,7 +2829,7 @@ def test_import_artifacts_accept_console_supplied_noecho_parameter_when_missing(
     adoption.validate_import_artifacts(
         deepcopy(local),
         local,
-        [{"ParameterKey": "InternalApiKey", "ParameterValue": "*****"}],
+        [],
         [],
         snapshot,
         "private-artifacts",
@@ -2590,7 +2839,6 @@ def test_import_artifacts_accept_console_supplied_noecho_parameter_when_missing(
 @pytest.mark.parametrize(
     ("change_set_parameters", "local_parameters"),
     [
-        ([], []),
         (
             [{
                 "ParameterKey": "InternalApiKey",
@@ -2610,7 +2858,6 @@ def test_import_artifacts_accept_console_supplied_noecho_parameter_when_missing(
         ),
     ],
     ids=(
-        "console-value-missing",
         "missing-value-cannot-use-previous",
         "secret-cannot-enter-local-parameter-file",
     ),
@@ -2621,6 +2868,7 @@ def test_missing_internal_key_rejects_unsafe_parameter_sources(
 ):
     snapshot = valid_snapshot()
     snapshot["stack"]["parameters"] = []
+    snapshot["stack"]["template"].pop("Parameters")
     local = build_import_template(
         snapshot,
         CodeArtifact(
@@ -2647,6 +2895,7 @@ def test_missing_internal_key_rejects_unsafe_parameter_sources(
 def test_import_change_set_rejects_query_role_modify_with_missing_internal_key():
     snapshot = valid_snapshot()
     snapshot["stack"]["parameters"] = []
+    snapshot["stack"]["template"].pop("Parameters")
     changes = _import_changes(snapshot)
     changes.append({
         "ResourceChange": {
@@ -2667,6 +2916,7 @@ def test_import_change_set_rejects_query_role_modify_with_missing_internal_key()
 def test_missing_internal_key_import_still_contains_exactly_nineteen_imports():
     snapshot = valid_snapshot()
     snapshot["stack"]["parameters"] = []
+    snapshot["stack"]["template"].pop("Parameters")
     expected = build_resources_to_import(snapshot)
     changes = _import_changes(snapshot)
 
@@ -2684,7 +2934,7 @@ def test_missing_internal_key_import_still_contains_exactly_nineteen_imports():
     )
 
 
-def test_console_supplied_internal_key_is_never_written_or_logged(
+def test_import_rejects_console_supplied_internal_key_without_logging_it(
     tmp_path,
     monkeypatch,
     capsys,
@@ -2695,6 +2945,7 @@ def test_console_supplied_internal_key_is_never_written_or_logged(
     files = _write_change_set_validation_files(workdir)
     snapshot = files["snapshot"]
     snapshot["stack"]["parameters"] = []
+    snapshot["stack"]["template"].pop("Parameters")
     files["snapshot"] = snapshot
     local = build_import_template(
         snapshot,
@@ -2730,9 +2981,8 @@ def test_console_supplied_internal_key_is_never_written_or_logged(
     _use_stored_snapshot_as_fresh(monkeypatch, prepare_import, files)
     monkeypatch.setenv("INTERNAL_API_KEY", "environment-secret-must-be-ignored")
 
-    assert prepare_import.main(
-        _validate_change_set_args(workdir, "IMPORT")
-    ) == 0
+    with pytest.raises(AdoptionError, match="IMPORT|parameter|previous"):
+        prepare_import.main(_validate_change_set_args(workdir, "IMPORT"))
 
     captured = capsys.readouterr()
     assert console_secret not in captured.out + captured.err
@@ -2775,6 +3025,47 @@ def test_import_artifacts_reject_processed_template_injection(section):
             local,
             parameters,
             parameters,
+            snapshot,
+            "private-artifacts",
+        )
+
+
+def test_real_import_failure_regression_rejects_parameter_registration_even_with_equal_outputs():
+    snapshot = valid_snapshot()
+    snapshot["stack"]["parameters"] = []
+    snapshot["stack"]["template"].pop("Parameters")
+    snapshot["stack"]["template"]["Outputs"] = {
+        "NotificationsTableName": {"Value": {"Ref": "NotificationsTable"}},
+        "QueryLambdaRoleArn": {
+            "Value": {"Fn::GetAtt": ["QueryLambdaRole", "Arn"]}
+        },
+        "SubscriptionsTableName": {"Value": {"Ref": "SubscriptionsTable"}},
+        "TableName": {"Value": {"Ref": "FilesTable"}},
+    }
+    local = build_import_template(
+        snapshot,
+        CodeArtifact(
+            "private-artifacts",
+            _FIXTURE_ARTIFACT_KEY,
+            "import-version-1",
+        ),
+    )
+    one_step_candidate = deepcopy(local)
+    one_step_candidate["Parameters"] = {
+        "InternalApiKey": {
+            "Type": "String",
+            "NoEcho": True,
+            "MinLength": 1,
+        }
+    }
+    assert one_step_candidate["Outputs"] == local["Outputs"]
+
+    with pytest.raises(AdoptionError, match="processed|template|injection"):
+        adoption.validate_import_artifacts(
+            one_step_candidate,
+            local,
+            [],
+            [],
             snapshot,
             "private-artifacts",
         )
@@ -2841,6 +3132,135 @@ def test_update_change_set_main_binds_local_packaged_template_and_cli_values(
     assert prepare_import.main(
         _validate_change_set_args(workdir, "UPDATE")
     ) == 0
+
+
+def test_first_update_accepts_console_masked_noecho_when_parameter_was_missing(
+    tmp_path,
+    monkeypatch,
+):
+    import prepare_import
+
+    workdir = tmp_path / "first-update-work"
+    files = _write_change_set_validation_files(workdir)
+    files["snapshot"]["stack"]["parameters"] = []
+    files["snapshot"]["stack"]["template"].pop("Parameters")
+    (workdir / "sanitized-snapshot.json").write_text(
+        json.dumps(_json_safe_snapshot(files["snapshot"])),
+        encoding="utf-8",
+    )
+    parameters = _explicit_update_parameters()
+    parameters[-1] = {
+        "ParameterKey": "InternalApiKey",
+        "ParameterValue": "*****",
+    }
+    cli = CandidateChangeSetCli(
+        change_set_type="UPDATE",
+        changes=_update_changes(),
+        parameters=parameters,
+        processed=files["processed_update"],
+        artifact_checksum=files["update_checksum"],
+        artifact_version=files["update_artifact"].version_id,
+        stack_parameter_names=[],
+    )
+    monkeypatch.setattr(prepare_import, "AwsCli", lambda: cli)
+    _use_packaged_update_artifact(monkeypatch, prepare_import, files)
+    monkeypatch.setattr(
+        prepare_import,
+        "collect_snapshot",
+        lambda _cli, _config: deepcopy(files["snapshot"]),
+    )
+
+    assert prepare_import.main(
+        _validate_change_set_args(workdir, "UPDATE")
+    ) == 0
+    parameter_name_calls = [
+        call
+        for call in cli.calls
+        if call[:2] == ("cloudformation", "describe-stacks")
+        and "--query" in call
+    ]
+    assert len(parameter_name_calls) == 1
+    assert "ParameterValue" not in " ".join(parameter_name_calls[0])
+
+
+def test_first_update_rejects_parameter_state_change_during_validation(
+    tmp_path,
+    monkeypatch,
+):
+    import prepare_import
+
+    workdir = tmp_path / "first-update-race"
+    files = _write_change_set_validation_files(workdir)
+    files["snapshot"]["stack"]["parameters"] = []
+    files["snapshot"]["stack"]["template"].pop("Parameters")
+    (workdir / "sanitized-snapshot.json").write_text(
+        json.dumps(_json_safe_snapshot(files["snapshot"])),
+        encoding="utf-8",
+    )
+    cli = CandidateChangeSetCli(
+        change_set_type="UPDATE",
+        changes=_update_changes(),
+        parameters=_first_update_parameters(),
+        processed=files["processed_update"],
+        artifact_checksum=files["update_checksum"],
+        artifact_version=files["update_artifact"].version_id,
+        stack_parameter_names=["InternalApiKey"],
+    )
+    monkeypatch.setattr(prepare_import, "AwsCli", lambda: cli)
+    _use_packaged_update_artifact(monkeypatch, prepare_import, files)
+    monkeypatch.setattr(
+        prepare_import,
+        "collect_snapshot",
+        lambda _cli, _config: deepcopy(files["snapshot"]),
+    )
+
+    with pytest.raises(AdoptionError, match="parameter names changed"):
+        prepare_import.main(_validate_change_set_args(workdir, "UPDATE"))
+
+
+def test_first_update_plaintext_parameter_is_not_logged_or_persisted(
+    tmp_path,
+    monkeypatch,
+    capsys,
+):
+    import prepare_import
+
+    workdir = tmp_path / "first-update-plaintext"
+    files = _write_change_set_validation_files(workdir)
+    files["snapshot"]["stack"]["parameters"] = []
+    files["snapshot"]["stack"]["template"].pop("Parameters")
+    (workdir / "sanitized-snapshot.json").write_text(
+        json.dumps(_json_safe_snapshot(files["snapshot"])),
+        encoding="utf-8",
+    )
+    secret = "plaintext-console-secret-must-not-leak"
+    cli = CandidateChangeSetCli(
+        change_set_type="UPDATE",
+        changes=_update_changes(),
+        parameters=_first_update_parameters(secret),
+        processed=files["processed_update"],
+        artifact_checksum=files["update_checksum"],
+        artifact_version=files["update_artifact"].version_id,
+        stack_parameter_names=[],
+    )
+    monkeypatch.setattr(prepare_import, "AwsCli", lambda: cli)
+    _use_packaged_update_artifact(monkeypatch, prepare_import, files)
+    monkeypatch.setattr(
+        prepare_import,
+        "collect_snapshot",
+        lambda _cli, _config: deepcopy(files["snapshot"]),
+    )
+
+    with pytest.raises(AdoptionError, match="masked|NoEcho|InternalApiKey"):
+        prepare_import.main(_validate_change_set_args(workdir, "UPDATE"))
+
+    captured = capsys.readouterr()
+    assert secret not in captured.out + captured.err
+    assert all(
+        secret.encode() not in path.read_bytes()
+        for path in workdir.iterdir()
+        if path.is_file()
+    )
 
 
 def test_followup_update_does_not_reconcile_role_from_old_drift_snapshot(
@@ -3144,6 +3564,11 @@ def test_change_set_validator_uses_explicit_workdir_and_candidate_template(tmp_p
     class ValidatorCli:
         def json(self, *args):
             calls.append(args)
+            if args[:2] == ("cloudformation", "describe-stacks"):
+                return {
+                    "StackName": "PacificBioArchive-Database",
+                    "ParameterNames": ["InternalApiKey"],
+                }
             if args[:2] == ("cloudformation", "describe-change-set"):
                 return {
                     "Status": "CREATE_COMPLETE",
@@ -3178,7 +3603,7 @@ def test_change_set_validator_uses_explicit_workdir_and_candidate_template(tmp_p
     monkeypatch.setattr(
         prepare_import,
         "validate_update_artifacts",
-        lambda processed, built, packaged, maintained, actual, expected, artifact: calls.append(
+        lambda processed, built, packaged, maintained, actual, expected, artifact, **kwargs: calls.append(
             (
                 "update-artifacts",
                 processed,
@@ -3188,6 +3613,7 @@ def test_change_set_validator_uses_explicit_workdir_and_candidate_template(tmp_p
                 actual,
                 expected,
                 artifact,
+                kwargs,
             )
         ),
     )

@@ -248,11 +248,30 @@ def _sanitized_api_gateway_resource(value: Any, resource_name: str) -> dict[str,
 def _sanitized_function(configuration: Mapping[str, Any]) -> dict[str, Any]:
     """Derive only names and approved non-secret values, then drop raw env."""
     raw_environment = configuration.get("Environment", {})
-    raw_variables = raw_environment.get("Variables", {}) if isinstance(raw_environment, Mapping) else {}
-    if not isinstance(raw_variables, Mapping):
+    raw_names = (
+        raw_environment.get("Names")
+        if isinstance(raw_environment, Mapping)
+        else None
+    )
+    raw_variables = (
+        raw_environment.get("Variables")
+        if isinstance(raw_environment, Mapping)
+        else None
+    )
+    if (
+        not isinstance(raw_names, list)
+        or not all(isinstance(name, str) and name for name in raw_names)
+        or len(raw_names) != len(set(raw_names))
+        or not isinstance(raw_variables, Mapping)
+        or not set(raw_variables) <= set(_SAFE_ENVIRONMENT_NAMES)
+    ):
         raise AdoptionError("function environment is malformed")
-    names = sorted(raw_variables)
-    safe = {name: raw_variables[name] for name in _SAFE_ENVIRONMENT_NAMES if name in raw_variables}
+    names = sorted(raw_names)
+    safe = {
+        name: value
+        for name, value in raw_variables.items()
+        if value is not None
+    }
     # Construct from explicit fields only so the complete environment map cannot
     # accidentally become part of the snapshot or an exception.
     result = {key: configuration.get(key) for key in (
@@ -260,7 +279,7 @@ def _sanitized_function(configuration: Mapping[str, Any]) -> dict[str, Any]:
         "PackageType", "Architectures", "Layers", "EphemeralStorage", "VpcConfig",
         "FileSystemConfigs", "KmsKeyArn", "DeadLetterConfig", "TracingConfig",
         "LoggingConfig", "CodeSigningConfigArn", "RuntimeManagementConfig",
-        "ReservedConcurrentExecutions", "CodeSha256",
+        "ReservedConcurrentExecutions", "CodeSha256", "RevisionId",
     )}
     result["environment_names"] = names
     result["safe_environment"] = safe
@@ -625,8 +644,18 @@ def collect_snapshot(cli: AwsCli, config: AuditConfig) -> dict[str, Any]:
             other_resources = cli.json("cloudformation", "list-stack-resources", "--stack-name", other_name, "--region", config.region)
             other_stack_physical_ids.update(str(item.get("PhysicalResourceId")) for item in other_resources.get("StackResourceSummaries", []) if isinstance(item, Mapping) and item.get("PhysicalResourceId"))
     reservations_table = _collect_reservations_table(cli, config)
-    fields = ["FunctionName", "Runtime", "Handler", "Role", "Timeout", "MemorySize", "Description", "SnapStart", "PackageType", "Architectures", "Layers", "EphemeralStorage", "VpcConfig", "FileSystemConfigs", "KmsKeyArn", "DeadLetterConfig", "TracingConfig", "LoggingConfig", "CodeSigningConfigArn", "RuntimeManagementConfig", "ReservedConcurrentExecutions", "CodeSha256", "Environment"]
-    query = "{" + ",".join([*(f"{field}: {field}" for field in fields), *(f"{name}: Environment.Variables.{name}" for name in _SAFE_ENVIRONMENT_NAMES)]) + "}"
+    fields = ["FunctionName", "Runtime", "Handler", "Role", "Timeout", "MemorySize", "Description", "SnapStart", "PackageType", "Architectures", "Layers", "EphemeralStorage", "VpcConfig", "FileSystemConfigs", "KmsKeyArn", "DeadLetterConfig", "TracingConfig", "LoggingConfig", "CodeSigningConfigArn", "RuntimeManagementConfig", "ReservedConcurrentExecutions", "CodeSha256", "RevisionId"]
+    safe_variables = ",".join(
+        f"{name}: Environment.Variables.{name}"
+        for name in sorted(_SAFE_ENVIRONMENT_NAMES)
+    )
+    query = (
+        "{"
+        + ",".join(f"{field}: {field}" for field in fields)
+        + ",Environment: {Names: keys(Environment.Variables),Variables: {"
+        + safe_variables
+        + "}}}"
+    )
     configuration = cli.json("lambda", "get-function-configuration", "--function-name", config.function, "--region", config.region, "--query", query)
     function = _sanitized_function(configuration)
     function_arn = configuration.get("FunctionArn")
@@ -775,6 +804,41 @@ def collect_snapshot(cli: AwsCli, config: AuditConfig) -> dict[str, Any]:
     }
     validate_snapshot(snapshot)
     return snapshot
+
+
+@_sanitize_audit_errors
+def collect_stack_parameter_names(
+    cli: AwsCli,
+    stack: str,
+    region: str,
+) -> set[str]:
+    """Read only parameter names so a NoEcho value never enters this process."""
+    response = cli.json(
+        "cloudformation",
+        "describe-stacks",
+        "--stack-name",
+        stack,
+        "--region",
+        region,
+        "--query",
+        "Stacks[0].{StackName:StackName,"
+        "ParameterNames:Parameters[].ParameterKey}",
+    )
+    if (
+        not isinstance(response, Mapping)
+        or response.get("StackName") != stack
+    ):
+        raise AdoptionError("stack parameter names are unavailable or duplicated")
+    names = response.get("ParameterNames")
+    if names is None:
+        names = []
+    if (
+        not isinstance(names, list)
+        or not all(isinstance(name, str) and name for name in names)
+        or len(names) != len(set(names))
+    ):
+        raise AdoptionError("stack parameter names are unavailable or duplicated")
+    return set(names)
 
 
 def _json_safe(value: Any) -> Any:
@@ -1812,6 +1876,17 @@ def main(argv: list[str] | None = None) -> int:
             args.expected_commit,
             dependency_manifest,
         )
+        current_parameter_names = collect_stack_parameter_names(
+            cli,
+            args.stack,
+            args.region,
+        )
+        if must_recollect and current_parameter_names != set(
+            audited.get("stack", {}).get("parameters", [])
+        ):
+            raise AdoptionError(
+                "stack parameter names changed during UPDATE validation"
+            )
         validate_update_artifacts(
             processed,
             built,
@@ -1829,6 +1904,9 @@ def main(argv: list[str] | None = None) -> int:
                 ),
             },
             artifact,
+            internal_key_already_exists=(
+                "InternalApiKey" in current_parameter_names
+            ),
         )
         hardening_only = args.expect_role_reconciliation == "false"
         if hardening_only:

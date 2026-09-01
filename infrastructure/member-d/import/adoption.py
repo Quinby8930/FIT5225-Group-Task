@@ -110,11 +110,51 @@ _HISTORICAL_LAMBDA_PERMISSIONS = (
     ("AllowAuthTestInvoke", "/*/GET/auth-test"),
     ("AllowApiGatewayInvokeAllRoutes-20260829030023", "/*/*"),
 )
+_INTERNAL_API_KEY_PARAMETER = {
+    "Type": "String",
+    "NoEcho": True,
+    "MinLength": 1,
+}
 
 
 def _require(condition: bool, message: str) -> None:
     if not condition:
         raise AdoptionError(message)
+
+
+def _find_parameter_reference_paths(
+    value: Any,
+    reference: str,
+) -> list[tuple[tuple[Any, ...], str]]:
+    """Return direct and ``Fn::Sub`` references to one parameter."""
+    paths: list[tuple[tuple[Any, ...], str]] = []
+    substitution = "${" + reference + "}"
+
+    def visit(candidate: Any, path: tuple[Any, ...]) -> None:
+        if isinstance(candidate, Mapping):
+            if candidate.get("Ref") == reference:
+                kind = "Ref" if candidate == {"Ref": reference} else "RefWithExtraKeys"
+                paths.append((path, kind))
+            fn_sub = candidate.get("Fn::Sub")
+            sub_template = (
+                fn_sub
+                if isinstance(fn_sub, str)
+                else fn_sub[0]
+                if isinstance(fn_sub, list)
+                and fn_sub
+                and isinstance(fn_sub[0], str)
+                else None
+            )
+            if isinstance(sub_template, str) and substitution in sub_template:
+                paths.append((path, "Fn::Sub"))
+            for key, child in candidate.items():
+                visit(child, (*path, key))
+        elif isinstance(candidate, list):
+            for index, child in enumerate(candidate):
+                visit(child, (*path, index))
+
+    visit(value, ())
+    return paths
 
 
 def _is_unconfigured_vpc(value: Any) -> bool:
@@ -181,6 +221,25 @@ def _stack_parameter_names(stack: Mapping[str, Any]) -> set[str]:
         elif isinstance(parameter, Mapping) and isinstance(parameter.get("ParameterKey"), str):
             names.add(parameter["ParameterKey"])
     return names
+
+
+def _internal_api_key_is_registered(stack: Mapping[str, Any]) -> bool:
+    template = stack.get("template")
+    _require(isinstance(template, Mapping), "stack template is unavailable")
+    parameters = template.get("Parameters", {})
+    _require(isinstance(parameters, Mapping), "stack Parameters are malformed")
+    registered = "InternalApiKey" in _stack_parameter_names(stack)
+    declared = "InternalApiKey" in parameters
+    _require(
+        registered == declared,
+        "InternalApiKey stack parameter and template declaration differ",
+    )
+    if registered:
+        _require(
+            parameters["InternalApiKey"] == _INTERNAL_API_KEY_PARAMETER,
+            "InternalApiKey is not the exact NoEcho parameter",
+        )
+    return registered
 
 
 def _route_lookup(snapshot: Mapping[str, Any]) -> dict[str, Mapping[str, Any]]:
@@ -526,6 +585,10 @@ def _validate_function(
     _require(_is_unconfigured_vpc(function.get("VpcConfig")), "function VPC configuration cannot be preserved")
     _require(function.get("FileSystemConfigs") in (None, []), "function file system configuration cannot be preserved")
     _require(function.get("CodeSha256"), "function code digest missing")
+    _require(
+        isinstance(function.get("RevisionId"), str) and function["RevisionId"],
+        "function revision is unavailable",
+    )
     names = function.get("environment_names")
     safe = function.get("safe_environment")
     _require(isinstance(names, list) and set(names) == _EXPECTED_ENVIRONMENT_NAMES and len(names) == len(_EXPECTED_ENVIRONMENT_NAMES), "function environment names cannot be preserved")
@@ -692,6 +755,7 @@ def validate_snapshot(snapshot: Mapping[str, Any]) -> None:
     template = stack.get("template", {})
     resources = template.get("Resources", {}) if isinstance(template, Mapping) else {}
     _require(isinstance(resources, Mapping) and resources.get("QueryLambdaRole", {}).get("Type") == "AWS::IAM::Role", "stack-owned QueryLambdaRole missing")
+    _internal_api_key_is_registered(stack)
     role_name = "PacificBioArchive-QueryLambdaRole"
     processed_role_name = resources["QueryLambdaRole"].get("Properties", {}).get("RoleName")
     role_snapshot = snapshot.get("role", {})
@@ -786,13 +850,24 @@ def _retained(resource_type: str, properties: Mapping[str, Any]) -> dict[str, An
     return {"Type": resource_type, "DeletionPolicy": "Retain", "UpdateReplacePolicy": "Retain", "Properties": dict(properties)}
 
 
-def _function_properties(function: Mapping[str, Any], artifact: CodeArtifact) -> dict[str, Any]:
+def _function_properties(
+    function: Mapping[str, Any],
+    artifact: CodeArtifact,
+    *,
+    include_internal_api_key: bool,
+) -> dict[str, Any]:
     properties: dict[str, Any] = {
         "FunctionName": function["FunctionName"], "Runtime": function["Runtime"], "Handler": function["Handler"],
         "Role": {"Fn::GetAtt": ["QueryLambdaRole", "Arn"]}, "Timeout": function["Timeout"], "MemorySize": function["MemorySize"],
         "Code": {"S3Bucket": artifact.bucket, "S3Key": artifact.key, "S3ObjectVersion": artifact.version_id},
-        "Environment": {"Variables": {**dict(function["safe_environment"]), "INTERNAL_API_KEY": {"Ref": "InternalApiKey"}}},
     }
+    if include_internal_api_key:
+        properties["Environment"] = {
+            "Variables": {
+                **dict(function["safe_environment"]),
+                "INTERNAL_API_KEY": {"Ref": "InternalApiKey"},
+            }
+        }
     for key in _FUNCTION_PROPERTIES[4:]:
         if not _is_unconfigured_function_property(key, function[key]):
             properties[key] = deepcopy(function[key])
@@ -803,7 +878,7 @@ def build_import_template(snapshot: Mapping[str, Any], artifact: CodeArtifact) -
     validate_snapshot(snapshot)
     _require(all((artifact.bucket, artifact.key, artifact.version_id)), "artifact is incomplete")
     template = deepcopy(snapshot["stack"]["template"])
-    template.setdefault("Parameters", {})["InternalApiKey"] = {"Type": "String", "NoEcho": True, "MinLength": 1}
+    internal_key_registered = _internal_api_key_is_registered(snapshot["stack"])
     resources = template.setdefault("Resources", {})
     table = snapshot["reservations_table"]
     resources["ReservationsTable"] = _retained(
@@ -815,7 +890,14 @@ def build_import_template(snapshot: Mapping[str, Any], artifact: CodeArtifact) -
             "KeySchema": deepcopy(table["KeySchema"]),
         },
     )
-    resources["QueryFunction"] = _retained("AWS::Lambda::Function", _function_properties(snapshot["function"], artifact))
+    resources["QueryFunction"] = _retained(
+        "AWS::Lambda::Function",
+        _function_properties(
+            snapshot["function"],
+            artifact,
+            include_internal_api_key=internal_key_registered,
+        ),
+    )
     api_id = snapshot["api"]["id"]
     integration = snapshot["integration"]
     integration_properties = {"ApiId": api_id, **{key: deepcopy(value) for key, value in integration.items() if key != "IntegrationId"}}
@@ -839,6 +921,12 @@ def build_parameters_to_reuse(snapshot: Mapping[str, Any]) -> list[dict[str, Any
 def _runtime_fingerprint(snapshot: Mapping[str, Any]) -> dict[str, Any]:
     routes = _route_lookup(snapshot)
     return {
+        "stack_parameters": sorted(_stack_parameter_names(snapshot["stack"])),
+        "stack_non_resource_template": {
+            key: deepcopy(value)
+            for key, value in snapshot["stack"]["template"].items()
+            if key != "Resources"
+        },
         "reservations_table": deepcopy(snapshot["reservations_table"]),
         "role": deepcopy(snapshot["role"]),
         "function": deepcopy(snapshot["function"]),
@@ -1477,28 +1565,17 @@ def validate_import_artifacts(
         )
         expected_keys.add(item["ParameterKey"])
     actual = _change_set_parameter_map(change_set_parameters)
-    internal_key_already_exists = "InternalApiKey" in expected_keys
-    actual_keys = (
-        expected_keys
-        if internal_key_already_exists
-        else expected_keys | {"InternalApiKey"}
-    )
     _require(
-        set(actual) == actual_keys
+        set(actual) == expected_keys
         and all(
+            set(actual[name]) == {"ParameterKey", "UsePreviousValue"}
+            and
             actual[name].get("UsePreviousValue") is True
             and "ParameterValue" not in actual[name]
             for name in expected_keys
         ),
         "IMPORT must reuse every existing parameter without a value override",
     )
-    if not internal_key_already_exists:
-        internal_key = actual["InternalApiKey"]
-        _require(
-            "ParameterValue" in internal_key
-            and internal_key.get("UsePreviousValue") in (None, False),
-            "missing InternalApiKey must be supplied through the NoEcho console parameter",
-        )
     return artifact
 
 
@@ -1510,6 +1587,8 @@ def validate_update_artifacts(
     change_set_parameters: Any,
     expected_values: Mapping[str, str],
     artifact: CodeArtifact,
+    *,
+    internal_key_already_exists: bool = True,
 ) -> None:
     """Bind UPDATE source -> SAM build -> package -> processed evidence."""
     _require(
@@ -1588,6 +1667,28 @@ def validate_update_artifacts(
         processed_code == expected_code,
         "QueryFunction processed Code differs from packaged artifact",
     )
+    _require(
+        processed.get("Parameters", {}).get("InternalApiKey")
+        == _INTERNAL_API_KEY_PARAMETER,
+        "InternalApiKey is not the exact NoEcho parameter",
+    )
+    _require(
+        _find_parameter_reference_paths(processed, "InternalApiKey")
+        == [
+            (
+                (
+                    "Resources",
+                    "QueryFunction",
+                    "Properties",
+                    "Environment",
+                    "Variables",
+                    "INTERNAL_API_KEY",
+                ),
+                "Ref",
+            )
+        ],
+        "InternalApiKey must have exactly one QueryFunction environment binding",
+    )
 
     required_names = {
         "ExistingHttpApiId",
@@ -1616,11 +1717,19 @@ def validate_update_artifacts(
             f"UPDATE parameter {name} differs from the operator-approved value",
         )
     internal = actual["InternalApiKey"]
-    _require(
-        internal.get("UsePreviousValue") is True
-        and "ParameterValue" not in internal,
-        "InternalApiKey must use its previous NoEcho value",
-    )
+    if internal_key_already_exists:
+        _require(
+            set(internal) == {"ParameterKey", "UsePreviousValue"}
+            and internal.get("UsePreviousValue") is True,
+            "InternalApiKey must use its previous NoEcho value",
+        )
+    else:
+        masked_value = internal.get("ParameterValue")
+        _require(
+            set(internal) == {"ParameterKey", "ParameterValue"}
+            and masked_value == "*****",
+            "missing InternalApiKey must be supplied only as a masked NoEcho console value",
+        )
     _require(
         expected_values["AllowLegacyProcessingCallbacks"] in {"true", "false"},
         "AllowLegacyProcessingCallbacks must be explicitly true or false",

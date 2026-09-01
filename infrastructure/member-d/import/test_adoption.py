@@ -93,6 +93,13 @@ def valid_snapshot():
             "parameters": ["InternalApiKey"],
             "template": {
                 "AWSTemplateFormatVersion": "2010-09-09",
+                "Parameters": {
+                    "InternalApiKey": {
+                        "Type": "String",
+                        "NoEcho": True,
+                        "MinLength": 1,
+                    }
+                },
                 "Resources": {
                     "FilesTable": {"Type": "AWS::DynamoDB::Table"},
                     "SubscriptionsTable": {"Type": "AWS::DynamoDB::Table"},
@@ -140,6 +147,7 @@ def valid_snapshot():
             "RuntimeManagementConfig": {"UpdateRuntimeOn": "Auto"},
             "ReservedConcurrentExecutions": None,
             "CodeSha256": "APsUW+8+ymZvVYmfkaKba20+sWzR3PMJPDimXIiqoIY=",
+            "RevisionId": "fixture-function-revision",
             "environment_names": [
                 "REPO_BACKEND", "DYNAMODB_TABLE", "SUBSCRIPTIONS_TABLE",
                 "INTERNAL_API_KEY", "NOTIFICATIONS_TABLE", "CORS_ORIGINS",
@@ -939,9 +947,31 @@ def test_import_parameters_reuse_existing_internal_key_without_reading_it():
     assert all("ParameterValue" not in item for item in parameters)
 
 
-def test_import_template_adds_noecho_internal_key_when_stack_parameter_is_missing():
+def test_import_template_preserves_missing_internal_key_and_outputs_exactly():
     snapshot = valid_snapshot()
     snapshot["stack"]["parameters"] = []
+    snapshot["stack"]["template"].pop("Parameters")
+    snapshot["stack"]["template"]["Outputs"] = {
+        "NotificationsTableName": {
+            "Value": {"Ref": "NotificationsTable"}
+        },
+        "QueryLambdaRoleArn": {
+            "Value": {"Fn::GetAtt": ["QueryLambdaRole", "Arn"]}
+        },
+        "SubscriptionsTableName": {
+            "Value": {"Ref": "SubscriptionsTable"}
+        },
+        "TableName": {"Value": {"Ref": "FilesTable"}},
+    }
+    original_parameters = deepcopy(
+        snapshot["stack"]["template"].get("Parameters")
+    )
+    original_outputs = deepcopy(snapshot["stack"]["template"]["Outputs"])
+    original_non_resources = {
+        key: deepcopy(value)
+        for key, value in snapshot["stack"]["template"].items()
+        if key != "Resources"
+    }
 
     template = build_import_template(
         snapshot,
@@ -952,16 +982,37 @@ def test_import_template_adds_noecho_internal_key_when_stack_parameter_is_missin
         ),
     )
 
-    assert template["Parameters"]["InternalApiKey"] == {
-        "Type": "String",
-        "NoEcho": True,
-        "MinLength": 1,
-    }
+    assert template.get("Parameters") == original_parameters
+    assert template["Outputs"] == original_outputs
+    assert {
+        key: value for key, value in template.items() if key != "Resources"
+    } == original_non_resources
+    assert "Environment" not in template["Resources"]["QueryFunction"]["Properties"]
+    assert "InternalApiKey" not in str(template)
+
+
+@pytest.mark.parametrize("keep_empty_section", [False, True])
+def test_missing_internal_key_preserves_parameters_section_shape(keep_empty_section):
+    snapshot = valid_snapshot()
+    snapshot["stack"]["parameters"] = []
+    if keep_empty_section:
+        snapshot["stack"]["template"]["Parameters"] = {}
+    else:
+        snapshot["stack"]["template"].pop("Parameters")
+
+    template = build_import_template(
+        snapshot,
+        CodeArtifact("private-artifacts", "backups/code.zip", "version-1"),
+    )
+
+    assert ("Parameters" in template) is keep_empty_section
+    assert template.get("Parameters", {}) == {}
 
 
 def test_missing_internal_key_keeps_role_template_and_parameter_file_secret_free():
     snapshot = valid_snapshot()
     snapshot["stack"]["parameters"] = []
+    snapshot["stack"]["template"].pop("Parameters")
     original_role = deepcopy(
         snapshot["stack"]["template"]["Resources"]["QueryLambdaRole"]
     )
@@ -990,11 +1041,11 @@ def test_post_import_baseline_allows_expected_managed_resource_ownership_only():
     assert_runtime_unchanged(before, after)
 
 
-def test_post_import_baseline_allows_only_the_new_noecho_parameter_registration():
+def test_post_import_baseline_requires_parameter_names_to_remain_unchanged():
     before = valid_snapshot()
     before["stack"]["parameters"] = []
+    before["stack"]["template"].pop("Parameters")
     after = deepcopy(before)
-    after["stack"]["parameters"] = ["InternalApiKey"]
     after["stack"]["managed"].update({
         "QueryFunction": "PacificBioArchive-QueryLambda",
         "QueryIntegration": "fbjojun",
@@ -1007,6 +1058,64 @@ def test_post_import_baseline_allows_only_the_new_noecho_parameter_registration(
         after["stack"]["managed"][logical_id] = route["RouteId"]
 
     assert_runtime_unchanged(before, after)
+
+
+def test_post_import_baseline_rejects_parameter_registration_during_import():
+    before = valid_snapshot()
+    before["stack"]["parameters"] = []
+    before["stack"]["template"].pop("Parameters")
+    after = deepcopy(before)
+    after["stack"]["parameters"] = ["InternalApiKey"]
+    after["stack"]["template"]["Parameters"] = {
+        "InternalApiKey": {
+            "Type": "String",
+            "NoEcho": True,
+            "MinLength": 1,
+        }
+    }
+
+    with pytest.raises(AdoptionError, match="parameter|runtime|import"):
+        assert_runtime_unchanged(before, after)
+
+
+@pytest.mark.parametrize(
+    ("parameter_names", "parameter_definition"),
+    [
+        (["InternalApiKey"], None),
+        ([], {"Type": "String", "NoEcho": True, "MinLength": 1}),
+        (["InternalApiKey"], {"Type": "String", "NoEcho": False}),
+    ],
+    ids=("name-only", "template-only", "non-noecho-definition"),
+)
+def test_snapshot_rejects_internal_key_registration_mismatch(
+    parameter_names,
+    parameter_definition,
+):
+    snapshot = valid_snapshot()
+    snapshot["stack"]["parameters"] = parameter_names
+    if parameter_definition is None:
+        snapshot["stack"]["template"].pop("Parameters")
+    else:
+        snapshot["stack"]["template"]["Parameters"] = {
+            "InternalApiKey": parameter_definition
+        }
+
+    with pytest.raises(AdoptionError, match="InternalApiKey|NoEcho|parameter"):
+        validate_snapshot(snapshot)
+
+
+def test_post_import_baseline_rejects_output_change_during_import():
+    before = valid_snapshot()
+    before["stack"]["template"]["Outputs"] = {
+        "TableName": {"Value": {"Ref": "FilesTable"}}
+    }
+    after = deepcopy(before)
+    after["stack"]["template"]["Outputs"]["Injected"] = {
+        "Value": "must-not-change-during-import"
+    }
+
+    with pytest.raises(AdoptionError, match="runtime changed|template|import"):
+        assert_runtime_unchanged(before, after)
 
 
 def test_post_import_snapshot_rejects_wrong_adopted_physical_identity():
@@ -1029,6 +1138,15 @@ def test_post_import_runtime_comparison_rejects_reservations_table_change():
     after["reservations_table"]["BillingMode"] = "PROVISIONED"
 
     with pytest.raises(AdoptionError, match="runtime changed|ReservationsTable"):
+        assert_runtime_unchanged(before, after)
+
+
+def test_post_import_runtime_comparison_rejects_hidden_environment_rotation():
+    before = valid_snapshot()
+    after = deepcopy(before)
+    after["function"]["RevisionId"] = "rotated-function-revision"
+
+    with pytest.raises(AdoptionError, match="runtime changed|function"):
         assert_runtime_unchanged(before, after)
 
 

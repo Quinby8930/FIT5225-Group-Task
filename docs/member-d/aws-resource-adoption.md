@@ -150,66 +150,73 @@ python infrastructure/member-d/import/prepare_import.py prepare \
 - `resources-to-import.json`
 - `import-parameters.json`
 
-## 阶段 6/10：确定 InternalApiKey 的安全参数路径
+## 阶段 6/10：验证纯 IMPORT 工件与密钥状态
 
-IMPORT template 始终把 `InternalApiKey` 定义为 `NoEcho: true`。如果该参数已经属于 stack，
-导入参数文件必须继续使用 `UsePreviousValue: true`；如果该参数尚不存在，导入参数文件必须
-完全不包含它，值只能在下一阶段的 CloudFormation 控制台中交互输入。工具不得为缺失参数
-创建 bootstrap UPDATE，也不得把 live `QueryLambdaRole` policies 复制到临时模板。
+IMPORT 只能改变 CloudFormation 对既有资源的所有权，不能顺便增加 Parameter、Output，或
+修改任何既有资源。若当前 stack 没有 `InternalApiKey`，IMPORT template 也必须没有该参数，
+`import-parameters.json` 必须没有它，而且待导入的 `QueryFunction` 暂时省略整个
+`Environment` 属性。IMPORT 不会据此修改在线 Lambda；阶段 8 会证明其实际环境变量保持
+不变，阶段 9 的正常 UPDATE 才将完整环境和密钥引用纳入模板管理。
 
-用本地 Python 检查参数文件和 template；命令只输出 `existing` 或 `console`，不会读取密钥：
+禁止为缺失参数创建 bootstrap UPDATE。CloudFormation 不会执行只有参数/描述变化而没有
+资源变化的 UPDATE；加入 Metadata 等占位变化又会产生被禁止的资源 `Modify`。也禁止删除
+Outputs、把 live `QueryLambdaRole` drift 复制进临时模板，或重用旧版工具生成的 IMPORT
+工件。若此前曾用 `aeaeb10` 生成或上传工件，拉取本次修复后必须从阶段 4 重新 audit、阶段
+5 重新 prepare；这不是重试已经失败的 change set。
+
+下面的本地检查只读取参数**名称**和已净化模板，输出 `existing` 或 `missing`，不会读取密钥：
 
 ```bash
 INTERNAL_KEY_MODE=$(python - \
+  "$WORK_DIR/sanitized-snapshot.json" \
   "$WORK_DIR/import-parameters.json" \
   "$WORK_DIR/import-template.json" <<'PY'
 import json
 import pathlib
 import sys
 
-parameters = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
-template = json.loads(pathlib.Path(sys.argv[2]).read_text(encoding="utf-8"))
-assert template["Parameters"]["InternalApiKey"] == {
-    "Type": "String",
-    "NoEcho": True,
-    "MinLength": 1,
-}, "InternalApiKey is not an exact NoEcho parameter"
+snapshot = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
+parameters = json.loads(pathlib.Path(sys.argv[2]).read_text(encoding="utf-8"))
+template = json.loads(pathlib.Path(sys.argv[3]).read_text(encoding="utf-8"))
+live = snapshot["stack"]["template"]
+assert {
+    key: value for key, value in template.items() if key != "Resources"
+} == {
+    key: value for key, value in live.items() if key != "Resources"
+}, "IMPORT changed Parameters, Conditions, Outputs, or another stack attribute"
+names = set(snapshot["stack"]["parameters"])
+assert {item["ParameterKey"] for item in parameters} == names
+assert len(parameters) == len(names), "IMPORT parameter is duplicated"
 assert all(
-    item.get("UsePreviousValue") is True and "ParameterValue" not in item
-    for item in parameters
-), "a literal parameter value is present"
-internal = [
-    item for item in parameters
-    if item.get("ParameterKey") == "InternalApiKey"
-]
-assert len(internal) <= 1, "InternalApiKey parameter is duplicated"
-if internal:
-    assert internal[0] == {
-        "ParameterKey": "InternalApiKey",
+    item == {
+        "ParameterKey": item["ParameterKey"],
         "UsePreviousValue": True,
+    }
+    for item in parameters
+), "IMPORT parameter is new, duplicated, or contains a value override"
+if "InternalApiKey" in names:
+    assert live["Parameters"]["InternalApiKey"] == {
+        "Type": "String",
+        "NoEcho": True,
+        "MinLength": 1,
     }
     print("existing")
 else:
-    print("console")
+    assert "InternalApiKey" not in template.get("Parameters", {})
+    function = template["Resources"]["QueryFunction"]["Properties"]
+    assert "Environment" not in function
+    print("missing")
 PY
 )
-test "$INTERNAL_KEY_MODE" = "existing" || test "$INTERNAL_KEY_MODE" = "console"
+test "$INTERNAL_KEY_MODE" = "existing" || test "$INTERNAL_KEY_MODE" = "missing"
 ```
-
-如果输出 `console`，从团队认可的安全存储取得**当前正在使用**的 internal key；此步骤只是
-把现有值登记成新的 stack `NoEcho` 参数，不是轮换密钥。不要把值放进 argv、shell history、
-环境变量、stdin、`.work/`、`samconfig.toml`、参数文件、snapshot、输出、日志、截图、Git
-或群聊。当前值无法通过安全渠道取得时停止，不能用临时值继续。
 
 ## 阶段 7/10：创建并审查 IMPORT change set
 
-### 路径 A：`INTERNAL_KEY_MODE=existing`
-
-已有参数时继续使用 CLI；下面第一条命令只创建 change set，不执行资源变更：
+无论输出 `existing` 还是 `missing`，都只使用同一条 CLI 路径。下面第一条命令只创建
+change set，不执行资源变更，也不会接触 internal key：
 
 ```bash
-test "$INTERNAL_KEY_MODE" = "existing"
-
 # WRITE — 只创建 IMPORT change set；不要执行。
 aws cloudformation create-change-set \
   --region "$AWS_REGION" --stack-name "$STACK_NAME" \
@@ -220,45 +227,7 @@ aws cloudformation create-change-set \
   --capabilities CAPABILITY_NAMED_IAM
 ```
 
-### 路径 B：`INTERNAL_KEY_MODE=console`
-
-缺少参数时禁止运行上面的 CLI 命令，因为任何 `--parameters`、环境变量或临时文件方案都会
-为密钥增加不允许的暴露面。改用 AWS CloudFormation 控制台的现有 stack resource import
-流程；[AWS 官方 resource import 流程](https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/resource-import-new-stack.html)
-会在参数页之后创建 change set，并在最后选择 `Import resources` 时才执行它。此处必须
-停在 Review 页面，不能提前执行。
-
-1. 保持 CloudShell 的 `set +x`，不要在 CloudShell 输入或粘贴密钥。
-2. 在 CloudFormation 控制台选择 `ap-southeast-2` → Stacks →
-   `PacificBioArchive-Database` → Stack actions → **Import resources into stack**。
-3. 选择 **Upload a template file**，上传未编辑的 `import-template.json`。该文件可通过
-   CloudShell 的 Actions → Download file 下载到本机；不要上传其他 template。
-4. 在 **Identify resources** 中严格按照 `resources-to-import.json` 识别全部 19 个资源；
-   不要选择 `QueryLambdaRole`、Member B 路由或 OPTIONS 路由。
-5. 在 **Specify stack details** 中保持所有既有参数不变；只在新的 `InternalApiKey`
-   `NoEcho` 字段中粘贴当前 internal key。不要截图、录屏或把值复制到其他位置。
-6. 进入 Review 页面，让控制台创建 IMPORT change set，但**不要选择 Import resources**。
-   从页面记录本次 change set 的精确名称；名称不是密钥，可以写入 shell 变量。
-7. 回到 CloudShell，先列出候选项核对创建时间和状态，再输入页面显示的精确名称：
-
-```bash
-test "$INTERNAL_KEY_MODE" = "console"
-aws cloudformation list-change-sets \
-  --region "$AWS_REGION" --stack-name "$STACK_NAME" \
-  --query 'reverse(sort_by(Summaries,&CreationTime))[].{Name:ChangeSetName,Status:Status,Execution:ExecutionStatus,Created:CreationTime}' \
-  --output table --no-cli-pager
-read -r -p "Exact IMPORT change set name shown by the console: " IMPORT_CHANGE_SET
-test -n "$IMPORT_CHANGE_SET"
-```
-
-控制台输入的值只能存在于 CloudFormation 的 `NoEcho` parameter 中。AWS 的
-[`NoEcho` 参数文档](https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/parameters-section-structure.html)
-说明 describe stack 和 stack events 返回该值时会使用星号遮蔽；项目工具只验证 change
-set 中该参数已提供，不会读取、比较、输出或保存它。
-
-### 两条路径共同的验证步骤
-
-无论采用路径 A 还是 B，都必须执行以下只读验证：
+随后执行以下只读验证：
 
 ```bash
 
@@ -282,14 +251,14 @@ python infrastructure/member-d/import/prepare_import.py validate-change-set \
 
 验证器会重新只读采集在线状态，并与旧 snapshot 的运行时指纹比较；随后只信任这次实时
 结果，从 Lambda `CodeSha256` 重建内容寻址 S3 key 和完整 IMPORT template，再要求本地
-template、CloudFormation processed template
-三者完全一致，并用 `head-object` 证明精确 S3 version 的 `ChecksumSHA256` 等于审计值。
-change set 参数还必须与从 snapshot 重建的参数键集合一致，
-已有 stack 参数必须全部只有 `UsePreviousValue=true`、没有明文值；若审计时缺少
-`InternalApiKey`，验证器只允许 change set 中额外出现这一项控制台提供的 NoEcho 值，且
-本地 `import-parameters.json` 仍不得包含它。随后确认恰好 19 个 `Import`：1 张
+重建结果、本地 template、CloudFormation processed template 三者完全一致，并用
+`head-object` 证明精确 S3 version 的 `ChecksumSHA256` 等于审计值。
+change set 参数还必须与从 snapshot 重建的当前 stack 参数键集合完全一致，每一项都只能
+是 `UsePreviousValue=true`，不得新增参数或出现任何 `ParameterValue`。处理后模板的
+Parameters、Conditions、Outputs 和全部既有 Resources 必须与审计模板完全相同；不能用
+删除 Outputs 规避 CloudFormation 的 import 限制。随后确认恰好 19 个 `Import`：1 张
 `ReservationsTable`、1 个 Lambda、1 个 integration、16 条 Member D 非 OPTIONS 路由；
-不得出现 Add/Modify/Remove、`QueryLambdaRole`、Member B 路由或 OPTIONS 路由。
+不得出现 Add/Modify/Remove/Replace、`QueryLambdaRole`、Member B 路由或 OPTIONS 路由。
 
 > **STOP 1 — 第一次明确批准：** 把净化后的审查结论交给用户。只有用户明确回复批准
 > “执行 IMPORT change set”后才可进入阶段 8。沉默、模糊回复或“继续看看”都不算批准。
@@ -346,6 +315,12 @@ aws apigatewayv2 get-routes \
 共 23 个。`QueryLambdaRole` 只允许保持审计前记录的完全相同 reservation-only 漂移；漂移
 扩大、缩小、改变，或出现任何其他运行时差异时停止，不进入 UPDATE。
 
+若阶段 6 输出 `missing`，IMPORT 后 Lambda 的在线 internal key 和其他环境变量仍与审计时
+相同，但 `QueryFunction` 的 IMPORT 模板刻意没有声明整个 `Environment`，因此 drift 检测
+可能把该属性报告为新增/不同。这只是阶段 9 正常 UPDATE 前的短暂纳管状态，不是让人工
+补改 Lambda 的许可。此时禁止手工修改或轮换环境变量；工具还会比较 Lambda `RevisionId`，
+在不读取密钥值的前提下发现并发配置变化。
+
 ## 阶段 9/10：打包当前 SAM，创建并审查 UPDATE change set
 
 先只读取得 Member B stack 输出。函数参数必须使用函数**名称**，不能传 ARN：
@@ -383,6 +358,25 @@ python infrastructure/member-d/import/prepare_import.py package-update \
   --expected-commit "$DEPLOYMENT_COMMIT" \
   --output-template "$WORK_DIR/packaged-template.yaml"
 
+# 只查询参数名数量，不读取任何参数值。
+INTERNAL_KEY_COUNT=$(aws cloudformation describe-stacks \
+  --region "$AWS_REGION" --stack-name "$STACK_NAME" \
+  --query 'length(Stacks[0].Parameters[?ParameterKey==`InternalApiKey`] || `[]`)' \
+  --output text --no-cli-pager)
+case "$INTERNAL_KEY_COUNT" in
+  0) INTERNAL_KEY_MODE=missing ;;
+  1) INTERNAL_KEY_MODE=existing ;;
+  *) echo "Unexpected InternalApiKey parameter count" >&2; exit 1 ;;
+esac
+```
+
+### 路径 A：`INTERNAL_KEY_MODE=existing`
+
+参数已经由 stack 管理时，CLI 只能复用其 NoEcho 值：
+
+```bash
+test "$INTERNAL_KEY_MODE" = "existing"
+
 # WRITE — 只创建 UPDATE change set；不要执行。
 aws cloudformation create-change-set \
   --region "$AWS_REGION" --stack-name "$STACK_NAME" \
@@ -397,6 +391,53 @@ aws cloudformation create-change-set \
     ParameterKey=InferenceApiBaseUrl,ParameterValue="$INFERENCE_API_BASE_URL" \
     ParameterKey=AllowLegacyProcessingCallbacks,ParameterValue="$ALLOW_LEGACY_PROCESSING_CALLBACKS" \
     ParameterKey=InternalApiKey,UsePreviousValue=true
+```
+
+### 路径 B：`INTERNAL_KEY_MODE=missing`
+
+只有这个路径需要从团队认可的安全存储取得**当前正在使用**的 internal key。此步骤是把
+现有值登记为 stack 的 `NoEcho` 参数，不是轮换密钥。当前值无法安全取得时停止，不能使用
+临时值。值不得进入 CloudShell、argv、shell history、环境变量、stdin、`.work/`、
+`samconfig.toml`、参数文件、snapshot、输出、日志、截图、Git 或群聊。
+
+1. 保持 CloudShell 的 `set +x`。通过 CloudShell 的 Actions → Download file，把未编辑的
+   `$WORK_DIR/packaged-template.yaml` 下载到本机；不要下载或打开任何密钥文件。
+2. 在 AWS Console 选择 `ap-southeast-2` → CloudFormation → Stacks →
+   `PacificBioArchive-Database` → Stack actions → **Create change set for current stack**。
+   这是普通 `UPDATE` change set；不要再次选择 **Import resources into stack**。
+3. 选择 **Replace current template** → **Upload a template file**，上传刚下载的
+   `packaged-template.yaml`。
+4. 在 Parameters 页面逐项输入这些 CloudShell 变量所代表的**实际非秘密值**，不要把
+   `$API_ID` 等变量名原样输入：`ExistingHttpApiId` 取 `$API_ID` 的值、
+   `ExistingJwtAuthorizerId` 取 `$AUTHORIZER_ID` 的值、`QueryInputBucketName` 取
+   `$MEDIA_BUCKET` 的值、`StorageDeleteFunctionName` 取
+   `$STORAGE_DELETE_FUNCTION_NAME` 的值、`InferenceApiBaseUrl` 取
+   `$INFERENCE_API_BASE_URL` 的值，并设置 `AllowLegacyProcessingCallbacks=true`。
+   `AllowedOrigin`、`PublicAllowedOrigin` 和空的 `NotificationEmailEndpoint` 保持模板默认值。
+5. 只在新的 `InternalApiKey` 密码框中粘贴当前 internal key。不要点击显示、不要截图，
+   也不要把值复制到任何其他字段。
+6. 确认 capabilities 包含 named IAM 和 transform/auto-expand 所需确认，创建 change set，
+   但**绝对不要执行**。记录控制台显示的精确 change set 名称。
+7. 回到 CloudShell，列出候选项并输入刚记录的非秘密名称：
+
+```bash
+test "$INTERNAL_KEY_MODE" = "missing"
+aws cloudformation list-change-sets \
+  --region "$AWS_REGION" --stack-name "$STACK_NAME" \
+  --query 'reverse(sort_by(Summaries,&CreationTime))[].{Name:ChangeSetName,Status:Status,Execution:ExecutionStatus,Created:CreationTime}' \
+  --output table --no-cli-pager
+read -r -p "Exact UPDATE change set name shown by the console: " UPDATE_CHANGE_SET
+test -n "$UPDATE_CHANGE_SET"
+```
+
+[`NoEcho` 参数文档](https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/parameters-section-structure.html)
+说明 CloudFormation 在 describe 输出中遮蔽该值。验证器只接受控制台返回的标准遮蔽形态；
+它不会读取、记录、比较或输出密钥。人工必须自行保证输入的是当前值，这一点无法在不读取
+秘密的前提下自动证明。
+
+### 两条 UPDATE 路径共同的验证步骤
+
+```bash
 
 aws cloudformation wait change-set-create-complete \
   --region "$AWS_REGION" --stack-name "$STACK_NAME" \
@@ -437,10 +478,14 @@ VersionId 的 packaged template 和 CloudFormation processed template 逐层对�
 打包的依赖文件还必须与 commit 内受审 manifest 的路径、大小和 SHA-256 完全一致，不能
 用 build 内可同步伪造的 `.dist-info/RECORD` 自证。验证器随后重新生成确定性 zip，并通过
 `head-object` 核对精确版本的 SHA-256。Lambda 的
-processed `Code` 必须精确指向该固定版本，顶层 Parameters、
-Conditions、Outputs 没有被替换或增加，且 change set 参数与上面人工确认的值逐项相同；
-`InternalApiKey` 只能 `UsePreviousValue=true`，不能出现明文值。随后还必须证明 processed
-template 没有隐式 `QueryFunctionRole`，`QueryFunction` 仍绑定
+processed `Code` 必须精确指向该固定版本，顶层 Parameters、Conditions、Outputs 必须与
+受审仓库模板和 packaged template 完全一致，且 change set 参数与上面人工确认的值逐项
+相同。`InternalApiKey` 必须是精确的 `String / NoEcho: true / MinLength: 1`，整份处理后
+模板中只能在 `QueryFunction.Properties.Environment.Variables.INTERNAL_API_KEY` 出现一次
+`Ref: InternalApiKey`；Output、Metadata、其他资源和 `Fn::Sub` 均不得引用它。若参数原本
+存在，只能 `UsePreviousValue=true`；若原本缺失，只能接受 CloudFormation 控制台返回的
+NoEcho 遮蔽值，不能接受明文、额外字段或本地参数文件。随后还必须证明 processed template
+没有隐式 `QueryFunctionRole`，`QueryFunction` 仍绑定
 `QueryLambdaRole`，且 Lambda、integration、16 条已纳管路由、`ReservationsTable` 和
 `QueryLambdaRole` 都不会 replacement/remove。若 snapshot 记录了允许的 reservation-only
 漂移，UPDATE 对 `QueryLambdaRole` 只能是 `Modify / Replacement=False`，并且目标必须精确
@@ -470,6 +515,12 @@ aws cloudformation describe-stacks \
   --region "$AWS_REGION" --stack-name "$STACK_NAME" \
   --query 'Stacks[0].{Status:StackStatus,Outputs:Outputs}' \
   --output table --no-cli-pager
+
+# 只验证参数名已纳管，不读取其值；后续 UPDATE 必须 UsePreviousValue=true。
+test "$(aws cloudformation describe-stacks \
+  --region "$AWS_REGION" --stack-name "$STACK_NAME" \
+  --query 'length(Stacks[0].Parameters[?ParameterKey==`InternalApiKey`] || `[]`)' \
+  --output text --no-cli-pager)" = "1"
 
 aws apigatewayv2 get-routes \
   --region "$AWS_REGION" --api-id "$API_ID" \

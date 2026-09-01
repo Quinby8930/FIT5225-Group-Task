@@ -26,7 +26,7 @@
 | `QueryInputBucketName` | 成员 A 管理的 Member B 私有媒体桶 |
 | `StorageDeleteFunctionName` | 成员 A 管理的 Member B guarded-delete Lambda 名称（使用 B 栈的同名输出，不要填 ARN；ARN 只用于审计/IAM 参考） |
 | `InferenceApiBaseUrl` | Member C 阿里云 HTTPS 根地址（不要加 `/infer`） |
-| `InternalApiKey` | 仅 A/C 通过安全渠道配置的非空共享密钥 |
+| `InternalApiKey` | A/C 通过安全渠道约定或交付的非空共享密钥；当前账号的纯 IMPORT 不处理它，缺参时只由获授权的 A 在后续正常 UPDATE 的 NoEcho 控制台字段输入 |
 | `AllowLegacyProcessingCallbacks` | 滚动升级临时开关；默认 `false`，稳定态必须保持 `false` |
 | `NotificationEmailEndpoint` | 可选；留空则只创建 Topic，不创建 email subscription |
 
@@ -63,9 +63,12 @@ C 只负责阿里云部署，不操作 AWS；B/D 不持有部署职责。
 `sam deploy --guided` 或重试失败的 UPDATE；必须完整执行
 [`aws-resource-adoption.md`](aws-resource-adoption.md)：
 
-1. 先创建并审查恰好 19 项的 IMPORT change set；
+1. 先创建并审查恰好 19 项的纯 IMPORT change set；它必须完全复用 live stack 的
+   Parameters/Outputs/既有 Resources，不能新增 `InternalApiKey`，也不能读取密钥；
 2. 得到第一次明确批准后执行 IMPORT，并证明运行时未改变；
-3. 再创建并审查独立 UPDATE change set，以
+3. 再创建并审查独立的正常 UPDATE change set。若 stack 已有 `InternalApiKey`，只能
+   `UsePreviousValue=true`；若尚无该参数，只能由 A 在 CloudFormation 控制台的 NoEcho
+   字段输入当前值，不能放入 CLI、环境变量或文件。该 UPDATE 以
    `AllowLegacyProcessingCallbacks=true` 安全接住尚未证明已升级的旧 Member B，同时将角色
    收敛到模板中的规范权限；
 4. 得到第二次明确批准后执行 UPDATE；精确移除旧宽泛 Lambda permission、数据 backfill、
@@ -98,6 +101,9 @@ C 只负责阿里云部署，不操作 AWS；B/D 不持有部署职责。
 模板固定 `REPO_BACKEND=dynamodb`、`STORAGE_BACKEND=lambda`、
 `TAG_DETECTOR_BACKEND=remote`、`NOTIFICATION_PUBLISHER=sns`，并把四张表、SNS Topic、
 私有桶、删除函数、C 地址和内部密钥参数接入 Lambda。生产环境绝不会自动选择 stub。
+当前账号缺少该 stack 参数时，纯 IMPORT 会保持在线 Lambda 现有环境不变，但暂不在
+IMPORT template 中声明整个 `Environment`；只有紧随其后的正常 UPDATE 才把完整环境和
+`InternalApiKey` 的 NoEcho 引用纳入 CloudFormation 管理。
 
 ### 3.1 B/D 安全滚动升级顺序
 
