@@ -1,800 +1,380 @@
-# Member D 现有 AWS 资源纳管手册
+# Member D 双 Stack 现有资源纳管手册
 
-本手册只适用于当前 AWS 账号：`PacificBioArchive-QueryLambda`、单一 API Gateway
-integration、16 条 Member D 非 OPTIONS 路由和未被任何 stack 管理的
-`PacificBioArchiveUploadReservations` 表已经在线。`QueryLambdaRole` 还存在已审计的
-reservation-only 权限漂移。目标是先通过 IMPORT 在不替换、不删除、不修改在线资源的
-前提下原样纳管这 19 个资源，再通过独立 UPDATE 将角色收敛到当前模板的规范权限。
+> **当前状态：DO NOT EXECUTE — awaiting separate AWS-write approval。**
+>
+> 本文记录未来获批后的操作顺序。它不是 AWS 写操作授权，也不授权创建、执行或删除
+> Change Set。当前实现阶段没有执行任何 AWS 命令。
 
-如果是一个没有上述 Member D 资源的全新普通 AWS 账号，不要使用本手册；按
-[`database-setup.md`](database-setup.md) 的“全新账号”路径正常部署 SAM。
+本手册只适用于已审计的现有账号。线上已有 19 项 Member D query 资源，但它们尚未被
+任何 CloudFormation Stack 管理。此前向 `PacificBioArchive-Database` 导入资源的方案已
+在真实 CloudFormation 服务端预检中失败，因此不得再向该 Stack 重试 IMPORT。
 
-## 不可突破的安全边界
+## 1. 资源所有权边界
 
-- 所有 AWS 写命令都标为 `WRITE`。其中 artifact 上传和 change set 创建不改变在线运行时，
-  仍须由当前人工操作者明确选择运行；IMPORT 执行、首次 UPDATE 执行、精确移除旧宽泛
-  Lambda permission、reservations backfill、Member B 部署，以及最终关闭兼容开关的 UPDATE
-  执行则各有独立 `STOP`。任何一次批准都不能自动覆盖后续写操作。
-- Root 只允许在阶段 1 为**既有** `fit5225-cli-deployer` 开启控制台登录。Root 不运行
-  CloudShell、不部署、不创建或执行 change set；完成后立即退出。
-- 禁止创建或使用 Root access key。禁止把普通用户 access key 分享给 Codex、微信、
-  Git 或文档。实际部署必须在该 IAM 用户登录后的 CloudShell 中完成。
-- 本项目没有 AWS Academy/Learner Lab 流程；不要寻找、创建或粘贴 Academy 临时凭据。
-- `INTERNAL_API_KEY`、控制台密码、JWT、session token、presigned URL 不得进入命令行
-  argv、shell history、环境转储、`.work/`、`samconfig.toml`、参数文件、截图、输出、Git
-  或群聊。不要打开 shell tracing；第一条 shell 设置必须包含 `set +x`。
-- 禁止运行 `delete-route`、`delete-integration`、`delete-function`、`delete-stack`。也不要
-  为绕过冲突而删除或重建在线资源。
-- 本手册中的 AWS 命令仅供已获授权的人工操作者复制。凡会改变 AWS 状态的命令都以
-  `WRITE` 标记；未得到相应审批时不得运行。
+双 Stack 是有意设计的资源所有权边界，不是重复部署。
 
-## 阶段 1/10：Root 仅开启既有 IAM 用户的控制台登录
+| Stack | 稳定拥有的资源 |
+|---|---|
+| `PacificBioArchive-Database` | `FilesTable`、`SubscriptionsTable`、`NotificationsTable`、`QueryLambdaRole` |
+| `PacificBioArchive-QueryAdoption` | `ReservationsTable`、`QueryFunction`、`QueryIntegration`、16 条 Member D 非 OPTIONS Route |
 
-**WRITE（人工控制台操作）— 仅用于启用 IAM 用户登录，不用于部署。**
+初始 IMPORT 的 16 条 Route 为：
 
-1. 用 Root 登录 AWS Console，进入 IAM → Users → `fit5225-cli-deployer`。
-2. 确认这是既有用户，不新建同名用户；在 Security credentials 中启用 Console access。
-3. 选择 AWS 自动生成的一次性密码，并要求用户首次登录时重置密码。
-4. 通过团队认可的私密渠道把一次性密码交给当前操作者。不要截图、复制到 Codex/微信、
-   写入本地文件或 Git。
-5. 立即退出 Root。后续所有 CloudShell 与部署操作都禁止使用 Root。
+1. `AuthTestRoute`
+2. `QueryByTagsRoute`
+3. `QueryBySpeciesRoute`
+4. `QueryByThumbnailRoute`
+5. `QueryByFileRoute`
+6. `EditTagsRoute`
+7. `DeleteFilesRoute`
+8. `SubscribeRoute`
+9. `UnsubscribeRoute`
+10. `SubscriptionsRoute`
+11. `NotificationsRoute`
+12. `ReserveUploadRoute`
+13. `AcquireProcessingRoute`
+14. `CompleteFileRoute`
+15. `FailFileRoute`
+16. `AuthorizeAssetsRoute`
 
-如果无法确认用户身份、权限或安全交付方式，停止并联系账号所有者。
+初始 IMPORT template 恰好包含上述 19 项，每项都声明
+`DeletionPolicy: Retain` 和 `UpdateReplacePolicy: Retain`。它绝不包含数据库 Stack 的
+4 项资源、`Outputs`、`InternalApiKey`、SNS 资源、OPTIONS Route 或 Lambda permission。
 
-## 阶段 2/10：以 IAM 用户重新登录并精确验证身份
+Query Stack 通过普通、非敏感参数接收经过只读审计的
+`ExistingQueryLambdaRoleArn`、`ExistingHttpApiId` 和
+`ExistingJwtAuthorizerId`。后续正常 UPDATE 还会接收三张 core table 的名称。它不使用
+跨 Stack `Fn::GetAtt`，不新增 Export，也不改变数据库 Stack 的 Outputs。
 
-使用账号的 IAM sign-in URL 登录 `fit5225-cli-deployer`，完成强制密码重置，然后从该
-会话打开 CloudShell。先运行以下只读检查；任何 `test` 失败都必须停止。
+## 2. 不可突破的安全不变量
+
+- 不删除、不替换真实资源，不修改业务数据。
+- 不把线上 drift 复制进维护模板；Query Stack 不修改或“收敛”数据库 Stack 拥有的
+  `QueryLambdaRole`。
+- 初始 IMPORT 不包含、读取或保存 `InternalApiKey`。该值只允许在日后单独获批的正常
+  UPDATE 中，通过 CloudFormation Console 的 `NoEcho` 密码框输入。
+- 密钥不得进入 CLI argv、环境变量、文件、snapshot、日志、截图、Git、聊天或群消息。
+- 19 项 `resources-to-import` 必须由工具根据新鲜审计自动生成；操作者不得手工输入资源
+  标识符。
+- 每次 AWS 写操作前都必须有新鲜 validator 结果和独立人工批准。一次批准不能覆盖下一步。
+- 失败尝试生成的 `.work` 文件、备份对象引用和 Change Set 结果不得复用。
+- 原始对象继续使用稳定的 `user/file` 范围 S3 key。按物种浏览是 DynamoDB tags 构成的
+  逻辑目录；不得按物种复制或移动 S3 对象。
+
+## 3. 恢复状态机
+
+任何异常先运行只读 `recovery-report`，再按下表处理。禁止用删除在线资源来清除冲突。
+
+| Target Stack 状态 | 所有权要求 | 安全响应 |
+|---|---|---|
+| 不存在 | 19 项全部 unmanaged | 可从新鲜 audit 重新 prepare；创建预览仍需单独授权 |
+| `REVIEW_IN_PROGRESS` | 通常为 0 项 | 只读检查 Stack、Change Set 和资源；不得重试。只有证明为空壳后，才可另行申请删除批准 |
+| IMPORT Change Set 创建失败 | 0 项或未知 | 加 `--import-change-set-creation-failed` 生成 recovery report，丢弃本次工件并停止；不得自动重试 |
+| `IMPORT_ROLLBACK_COMPLETE` | 必须重新审计 | 仅生成 recovery report；若有任一资源被管理则停止；若确认为空壳，仅可申请独立清理批准 |
+| `IMPORT_ROLLBACK_FAILED` | 未知且不安全 | 冻结自动化，不删除、不重试；保留净化证据并交由 AWS Support/人工恢复评审 |
+| `IMPORT_COMPLETE` | Query Stack 精确拥有 19 项 | 立即执行 post-import evidence gate；通过后才是稳定回滚边界 |
+| `UPDATE_ROLLBACK_COMPLETE` | 导入的 19 项仍精确归 Query Stack | 完整验证所有权、Lambda runtime/policy/concurrency 和 API Gateway；只有与 `IMPORT_COMPLETE` 边界等价才可接受 |
+| 已证明为空的 Target Stack | 0 项且无应用资源 | 只生成清理清单；删除空壳 Stack 必须取得新的明确批准 |
+
+只读恢复命令的真实接口为：
+
+```bash
+python infrastructure/member-d/import/prepare_import.py recovery-report \
+  --region "$AWS_REGION" \
+  --source-stack "$SOURCE_STACK" \
+  --target-stack "$TARGET_STACK" \
+  --workdir "$WORK_DIR"
+```
+
+若 IMPORT Change Set 创建失败，再额外添加
+`--import-change-set-creation-failed`。报告只分类；它不删除 Stack 或资源。
+
+## 4. 未来第一次 IMPORT preview
+
+> **DO NOT EXECUTE — awaiting separate AWS-write approval。**
+>
+> 本节只覆盖：新鲜审计、备份/生成工件、创建 IMPORT preview、验证并汇报。
+> 它在执行 IMPORT 之前强制停止，且故意不提供 execute 命令。
+
+### 4.1 新会话或 CloudShell 重连后的初始化
+
+使用 A 的普通 AWS 身份打开 CloudShell；CloudShell 已自动认证，不得创建、索取或粘贴
+Root/IAM access key。每次重连后从仓库目录重新运行整个变量块，不得假设旧变量仍存在。
+`SOURCE_STACK` 和 `TARGET_STACK` 使用固定字面值，绝不会因占位符未填写而变成空名称。
+
+先把两个尖括号占位符替换为**非敏感**的已批准值；未替换时下面的 `test` 会停止流程。
 
 ```bash
 set +x
 set -euo pipefail
-export AWS_REGION=ap-southeast-2
 export AWS_PAGER=""
-STACK_NAME=PacificBioArchive-Database
+export AWS_REGION=ap-southeast-2
+
+SOURCE_STACK=PacificBioArchive-Database
+TARGET_STACK=PacificBioArchive-QueryAdoption
 API_ID=2dd2aqb32j
 AUTHORIZER_ID=7ir7fs
 INTEGRATION_ID=fbjojun
 FUNCTION_NAME=PacificBioArchive-QueryLambda
-ROLE_NAME=PacificBioArchive-QueryLambdaRole
-WORK_DIR=infrastructure/member-d/import/.work
-IMPORT_CHANGE_SET=member-d-adopt-existing
-UPDATE_CHANGE_SET=member-d-deploy-current
-HARDEN_CHANGE_SET=member-d-disable-legacy-callbacks
-INFERENCE_API_BASE_URL=https://pacificchive-ml-chidpnuwue.ap-southeast-1.fcapp.run
-ALLOW_LEGACY_PROCESSING_CALLBACKS=true
+WORK_DIR=infrastructure/member-d/import/.work/query-adoption-first-preview
+IMPORT_CHANGE_SET=member-d-query-adoption-import-preview
+APPROVED_COMMIT='<eventual-approved-full-commit-sha>'
+ARTIFACT_BUCKET='<approved-private-versioned-artifact-bucket>'
 
-ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
-CALLER_ARN=$(aws sts get-caller-identity --query Arn --output text)
-test "$CALLER_ARN" = "arn:aws:iam::$ACCOUNT_ID:user/fit5225-cli-deployer"
+test "$SOURCE_STACK" = "PacificBioArchive-Database"
+test "$TARGET_STACK" = "PacificBioArchive-QueryAdoption"
+test "$SOURCE_STACK" != "$TARGET_STACK"
+test "$APPROVED_COMMIT" != '<eventual-approved-full-commit-sha>'
+test "$ARTIFACT_BUCKET" != '<approved-private-versioned-artifact-bucket>'
+test -n "$APPROVED_COMMIT" && test -n "$ARTIFACT_BUCKET"
 ```
 
-仅仅“不是 Root”不够；ARN 必须与上面的动态账号 ID 和用户名完全一致。不要打印、记录
-或截图 `ACCOUNT_ID`/`CALLER_ARN` 的实际输出。
+### 4.2 从全新 checkout 绑定获批 commit
 
-## 阶段 3/10：取得最新代码并运行本地工具测试
-
-在 CloudShell 中克隆仓库，或在既有 clone 中只做 fast-forward pull。下面是本地文件操作，
-不会改变 AWS：
+不要复用此前失败方案的 checkout 或 `.work`。在新的目录 clone，然后 detach 到最终获批
+的完整 commit SHA：
 
 ```bash
-git clone https://github.com/Quinby8930/FIT5225-Group-Task.git
-cd FIT5225-Group-Task
-git pull --ff-only
-DEPLOYMENT_COMMIT=$(git rev-parse HEAD)
-test "$DEPLOYMENT_COMMIT" = "$(git rev-parse origin/main)"
+cd ~
+git clone https://github.com/Quinby8930/FIT5225-Group-Task.git \
+  FIT5225-Group-Task-query-adoption-preview
+cd FIT5225-Group-Task-query-adoption-preview
+git fetch --prune origin
+git checkout --detach "$APPROVED_COMMIT"
+test "$(git rev-parse HEAD)" = "$APPROVED_COMMIT"
 git diff --quiet
 git diff --cached --quiet
-
-python -m pytest infrastructure/member-d/import/test_adoption.py \
-  infrastructure/member-d/import/test_prepare_import.py \
-  infrastructure/member-d/test_template.py -q
 ```
 
-测试不全绿则停止。不要为了继续部署而跳过或修改测试。
+### 4.3 只读核对调用者、区域和当前所有权
 
-## 阶段 4/10：只读审计现有资源
+下面命令只读。调用者必须是审计工具允许的非 Root IAM 身份；区域固定为
+`ap-southeast-2`。数据库 Stack 必须仍精确拥有 4 项，Target Stack 必须不存在：
 
-`audit` 只调用只读 AWS API，并在本地写入已净化 snapshot。参数名以当前工具的真实 CLI
-接口为准：
+```bash
+ACCOUNT_ID=$(aws sts get-caller-identity \
+  --region "$AWS_REGION" --query Account --output text --no-cli-pager)
+CALLER_ARN=$(aws sts get-caller-identity \
+  --region "$AWS_REGION" --query Arn --output text --no-cli-pager)
+test "$CALLER_ARN" = "arn:aws:iam::$ACCOUNT_ID:user/fit5225-cli-deployer"
 
-开始前必须由账号操作者冻结对
-`PacificBioArchiveUploadReservations` 的 `PutResourcePolicy` / `DeleteResourcePolicy` 操作，
-直到阶段 9 的首次 UPDATE validator、首次 UPDATE 执行以及阶段 10 紧随其后的更新后复核
-全部结束。阶段 9 会再次采集在线状态，因此不能在 IMPORT 验收后提前解除冻结。AWS 明确
-说明 `GetResourcePolicy` 最终一致且没有承诺
-最大传播时间；工具会在 30 秒稳定窗口内做三次 absence 确认，但这不能替代变更冻结。
-无法保证没有其他人/自动化修改该 policy 时，本流程必须停止。
+aws cloudformation describe-stacks \
+  --region "$AWS_REGION" --stack-name "$SOURCE_STACK" \
+  --query 'Stacks[0].{Name:StackName,Status:StackStatus}' \
+  --output table --no-cli-pager
+
+aws cloudformation list-stack-resources \
+  --region "$AWS_REGION" --stack-name "$SOURCE_STACK" \
+  --query 'StackResourceSummaries[].{LogicalId:LogicalResourceId,Type:ResourceType,PhysicalId:PhysicalResourceId,Status:ResourceStatus}' \
+  --output table --no-cli-pager
+
+TARGET_STATUS=$(aws cloudformation list-stacks \
+  --region "$AWS_REGION" \
+  --query "StackSummaries[?StackName=='PacificBioArchive-QueryAdoption' && StackStatus!='DELETE_COMPLETE'].StackStatus | [0]" \
+  --output text --no-cli-pager)
+test -z "$TARGET_STATUS" || test "$TARGET_STATUS" = "None"
+unset TARGET_STATUS
+```
+
+### 4.4 运行本地 Member D 测试
+
+```bash
+python -m pytest \
+  backend/lambdas/query/tests \
+  infrastructure/member-d/import/test_adoption.py \
+  infrastructure/member-d/import/test_prepare_import.py \
+  infrastructure/member-d/test_template.py \
+  -q -p no:cacheprovider
+```
+
+测试不全绿则停止。测试通过只是本地 validator 证据，不等于 AWS 服务可行性证明。
+
+### 4.5 新鲜 audit 和所有权恢复报告
+
+成功的 `audit` 会遍历全部活动 Stack 和分页资源列表，证明全部 19 个物理资源仍然
+unmanaged，并严格核对真实 Role ARN、API ID、authorizer ID、integration ID、function 和
+16 条 Route。它只调用只读 AWS API，并只写净化后的本地 snapshot：
 
 ```bash
 python infrastructure/member-d/import/prepare_import.py audit \
-  --region "$AWS_REGION" --stack "$STACK_NAME" --api "$API_ID" \
-  --authorizer "$AUTHORIZER_ID" --integration "$INTEGRATION_ID" \
-  --function "$FUNCTION_NAME" --workdir "$WORK_DIR"
-```
+  --region "$AWS_REGION" \
+  --stack "$SOURCE_STACK" \
+  --api "$API_ID" \
+  --authorizer "$AUTHORIZER_ID" \
+  --integration "$INTEGRATION_ID" \
+  --function "$FUNCTION_NAME" \
+  --workdir "$WORK_DIR"
 
-它必须验证：调用者、stack 状态、Lambda/role/resource policy、integration、16 条 Member D
-非 OPTIONS 路由、authorizer、其他 stack 所有权和 CloudFormation import identifiers。
-`ReservationsTable` 必须属于同一账号和区域、状态为 `ACTIVE`、按需计费，且只有字符串
-HASH 主键 `reservation_key`；普通/向量索引、stream、replica/global witness、TTL、PITR、
-标签、加密模式、删除保护、resource policy、有效 Kinesis streaming destination 或
-Contributor Insights 出现无法由当前模板原样
-表达的差异时必须停止。`QueryLambdaRole` 只允许 `IN_SYNC`，或精确
-匹配已知 reservation-only 漂移：`DynamoDBFilesAccess` 仅增加
-`dynamodb:TransactWriteItems` 和 reservation 表 ARN，并额外存在内容完全匹配的
-`UploadReservationsAccess`。任何其他 path、action、resource 或 policy 差异都必须失败关闭。
-工具不会选择 Member B 的 `/upload-url`、`/asset-urls`，也不会选择 OPTIONS 路由。
-
-## 阶段 5/10：人工批准 artifact bucket，再备份 Lambda
-
-artifact bucket 必须由操作者明确指定。不要自动创建 bucket，不要在本流程中修改 bucket
-设置，也不要改动共享的 `aws-sam-cli-managed-default` bucket。`prepare` 会先证明目标 bucket
-属于同一账号和区域、不可公开、已加密、已启用版本、可读写，然后才上传内容寻址的精确
-Lambda zip 备份并生成四个确定性文件。
-
-```bash
-read -r -p "Approved private, encrypted, versioned artifact bucket: " ARTIFACT_BUCKET
-
-# WRITE — 在已批准 bucket 中上传精确 Lambda 备份；不会创建 CloudFormation change set。
-python infrastructure/member-d/import/prepare_import.py prepare \
-  --region "$AWS_REGION" --stack "$STACK_NAME" --api "$API_ID" \
-  --authorizer "$AUTHORIZER_ID" --integration "$INTEGRATION_ID" \
-  --function "$FUNCTION_NAME" --artifact-bucket "$ARTIFACT_BUCKET" \
+python infrastructure/member-d/import/prepare_import.py recovery-report \
+  --region "$AWS_REGION" \
+  --source-stack "$SOURCE_STACK" \
+  --target-stack "$TARGET_STACK" \
   --workdir "$WORK_DIR"
 ```
 
-必须得到以下四个本地文件，且不得手工编辑：
+报告必须把 target 分类为 `prepare`，且 source 仍是精确四资源边界；否则停止。
+
+### 4.6 新鲜 prepare（未来单独获批的 AWS 写操作）
+
+`prepare` 会再次采集完整只读证据，然后把当前 Query Lambda zip 以内容寻址方式上传到
+已批准、私有、加密且启用版本的 artifact bucket。这个 versioned Lambda backup 会执行
+`s3:PutObject`，因此 **prepare 本身也必须先取得 AWS 写批准**；当前批准不包含它。
+
+```bash
+# FUTURE WRITE — 仅在 prepare 获得独立批准后运行。
+python infrastructure/member-d/import/prepare_import.py prepare \
+  --region "$AWS_REGION" \
+  --stack "$SOURCE_STACK" \
+  --api "$API_ID" \
+  --authorizer "$AUTHORIZER_ID" \
+  --integration "$INTEGRATION_ID" \
+  --function "$FUNCTION_NAME" \
+  --artifact-bucket "$ARTIFACT_BUCKET" \
+  --workdir "$WORK_DIR"
+```
+
+必须得到下面四个新生成文件，且不得编辑：
 
 - `sanitized-snapshot.json`
 - `import-template.json`
 - `resources-to-import.json`
 - `import-parameters.json`
 
-## 阶段 6/10：验证纯 IMPORT 工件与密钥状态
+`resources-to-import.json` 已含全部 19 项真实标识符。操作者只传入这个文件，绝不手工逐项
+填写。`import-template.json` 没有 Outputs 或 secret parameter；`import-parameters.json`
+只有三个经过审计的普通参数值。
 
-IMPORT 只能改变 CloudFormation 对既有资源的所有权，不能顺便增加 Parameter、Output，或
-修改任何既有资源。若当前 stack 没有 `InternalApiKey`，IMPORT template 也必须没有该参数，
-`import-parameters.json` 必须没有它，而且待导入的 `QueryFunction` 暂时省略整个
-`Environment` 属性。IMPORT 不会据此修改在线 Lambda；阶段 8 会证明其实际环境变量保持
-不变，阶段 9 的正常 UPDATE 才将完整环境和密钥引用纳入模板管理。
+### 4.7 创建并验证第一次 IMPORT preview
 
-禁止为缺失参数创建 bootstrap UPDATE。CloudFormation 不会执行只有参数/描述变化而没有
-资源变化的 UPDATE；加入 Metadata 等占位变化又会产生被禁止的资源 `Modify`。也禁止删除
-Outputs、把 live `QueryLambdaRole` drift 复制进临时模板，或重用旧版工具生成的 IMPORT
-工件。若此前曾用 `aeaeb10` 生成或上传工件，拉取本次修复后必须从阶段 4 重新 audit、阶段
-5 重新 prepare；这不是重试已经失败的 change set。
-
-下面的本地检查只读取参数**名称**和已净化模板，输出 `existing` 或 `missing`，不会读取密钥：
+该写操作也需要与 prepare 分开的明确批准。它只能以新 Query Stack 为目标：
 
 ```bash
-INTERNAL_KEY_MODE=$(python - \
-  "$WORK_DIR/sanitized-snapshot.json" \
-  "$WORK_DIR/import-parameters.json" \
-  "$WORK_DIR/import-template.json" <<'PY'
-import json
-import pathlib
-import sys
-
-snapshot = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
-parameters = json.loads(pathlib.Path(sys.argv[2]).read_text(encoding="utf-8"))
-template = json.loads(pathlib.Path(sys.argv[3]).read_text(encoding="utf-8"))
-live = snapshot["stack"]["template"]
-assert {
-    key: value for key, value in template.items() if key != "Resources"
-} == {
-    key: value for key, value in live.items() if key != "Resources"
-}, "IMPORT changed Parameters, Conditions, Outputs, or another stack attribute"
-names = set(snapshot["stack"]["parameters"])
-assert {item["ParameterKey"] for item in parameters} == names
-assert len(parameters) == len(names), "IMPORT parameter is duplicated"
-assert all(
-    item == {
-        "ParameterKey": item["ParameterKey"],
-        "UsePreviousValue": True,
-    }
-    for item in parameters
-), "IMPORT parameter is new, duplicated, or contains a value override"
-if "InternalApiKey" in names:
-    assert live["Parameters"]["InternalApiKey"] == {
-        "Type": "String",
-        "NoEcho": True,
-        "MinLength": 1,
-    }
-    print("existing")
-else:
-    assert "InternalApiKey" not in template.get("Parameters", {})
-    function = template["Resources"]["QueryFunction"]["Properties"]
-    assert "Environment" not in function
-    print("missing")
-PY
-)
-test "$INTERNAL_KEY_MODE" = "existing" || test "$INTERNAL_KEY_MODE" = "missing"
-```
-
-## 阶段 7/10：创建并审查 IMPORT change set
-
-无论输出 `existing` 还是 `missing`，都只使用同一条 CLI 路径。下面第一条命令只创建
-change set，不执行资源变更，也不会接触 internal key：
-
-```bash
-# WRITE — 只创建 IMPORT change set；不要执行。
+# FUTURE WRITE — 只创建 preview；不执行 IMPORT。
+set +e
 aws cloudformation create-change-set \
-  --region "$AWS_REGION" --stack-name "$STACK_NAME" \
-  --change-set-name "$IMPORT_CHANGE_SET" --change-set-type IMPORT \
+  --region "$AWS_REGION" \
+  --stack-name "$TARGET_STACK" \
+  --change-set-name "$IMPORT_CHANGE_SET" \
+  --change-set-type IMPORT \
   --template-body "file://$WORK_DIR/import-template.json" \
   --resources-to-import "file://$WORK_DIR/resources-to-import.json" \
-  --parameters "file://$WORK_DIR/import-parameters.json" \
-  --capabilities CAPABILITY_NAMED_IAM
-```
+  --parameters "file://$WORK_DIR/import-parameters.json"
+CREATE_RC=$?
+set -e
 
-随后执行以下只读验证：
+if [ "$CREATE_RC" -ne 0 ]; then
+  python infrastructure/member-d/import/prepare_import.py recovery-report \
+    --region "$AWS_REGION" \
+    --source-stack "$SOURCE_STACK" \
+    --target-stack "$TARGET_STACK" \
+    --workdir "$WORK_DIR" \
+    --import-change-set-creation-failed
+  echo 'STOP: preview creation failed; discard this preparation bundle.' >&2
+  exit 1
+fi
+unset CREATE_RC
 
-```bash
-
+set +e
 aws cloudformation wait change-set-create-complete \
-  --region "$AWS_REGION" --stack-name "$STACK_NAME" \
+  --region "$AWS_REGION" \
+  --stack-name "$TARGET_STACK" \
   --change-set-name "$IMPORT_CHANGE_SET"
+WAIT_RC=$?
+set -e
+
+if [ "$WAIT_RC" -ne 0 ]; then
+  python infrastructure/member-d/import/prepare_import.py recovery-report \
+    --region "$AWS_REGION" \
+    --source-stack "$SOURCE_STACK" \
+    --target-stack "$TARGET_STACK" \
+    --workdir "$WORK_DIR" \
+    --import-change-set-creation-failed
+  echo 'STOP: preview is not CREATE_COMPLETE; do not retry.' >&2
+  exit 1
+fi
+unset WAIT_RC
 
 aws cloudformation describe-change-set \
-  --region "$AWS_REGION" --stack-name "$STACK_NAME" \
+  --region "$AWS_REGION" \
+  --stack-name "$TARGET_STACK" \
   --change-set-name "$IMPORT_CHANGE_SET" \
   --query 'Changes[].ResourceChange.{Action:Action,LogicalId:LogicalResourceId,Type:ResourceType,Replacement:Replacement}' \
   --output table --no-cli-pager
 
 python infrastructure/member-d/import/prepare_import.py validate-change-set \
-  --region "$AWS_REGION" --stack "$STACK_NAME" \
-  --change-set "$IMPORT_CHANGE_SET" --expected-type IMPORT \
-  --api "$API_ID" --authorizer "$AUTHORIZER_ID" \
-  --integration "$INTEGRATION_ID" --function "$FUNCTION_NAME" \
-  --workdir "$WORK_DIR" --artifact-bucket "$ARTIFACT_BUCKET"
-```
-
-验证器会重新只读采集在线状态，并与旧 snapshot 的运行时指纹比较；随后只信任这次实时
-结果，从 Lambda `CodeSha256` 重建内容寻址 S3 key 和完整 IMPORT template，再要求本地
-重建结果、本地 template、CloudFormation processed template 三者完全一致，并用
-`head-object` 证明精确 S3 version 的 `ChecksumSHA256` 等于审计值。
-change set 参数还必须与从 snapshot 重建的当前 stack 参数键集合完全一致，每一项都只能
-是 `UsePreviousValue=true`，不得新增参数或出现任何 `ParameterValue`。处理后模板的
-Parameters、Conditions、Outputs 和全部既有 Resources 必须与审计模板完全相同；不能用
-删除 Outputs 规避 CloudFormation 的 import 限制。随后确认恰好 19 个 `Import`：1 张
-`ReservationsTable`、1 个 Lambda、1 个 integration、16 条 Member D 非 OPTIONS 路由；
-不得出现 Add/Modify/Remove/Replace、`QueryLambdaRole`、Member B 路由或 OPTIONS 路由。
-
-> **STOP 1 — 第一次明确批准：** 把净化后的审查结论交给用户。只有用户明确回复批准
-> “执行 IMPORT change set”后才可进入阶段 8。沉默、模糊回复或“继续看看”都不算批准。
-
-## 阶段 8/10：批准后执行 IMPORT，并证明运行时未改变
-
-```bash
-# WRITE — 仅在 STOP 1 获得明确批准后执行。
-aws cloudformation execute-change-set \
-  --region "$AWS_REGION" --stack-name "$STACK_NAME" \
-  --change-set-name "$IMPORT_CHANGE_SET"
-
-aws cloudformation wait stack-import-complete \
-  --region "$AWS_REGION" --stack-name "$STACK_NAME"
-
-# WRITE — 启动只读性质的 drift 检测任务；不会修改 stack 资源。
-DRIFT_ID=$(aws cloudformation detect-stack-drift \
-  --region "$AWS_REGION" --stack-name "$STACK_NAME" \
-  --query StackDriftDetectionId --output text)
-
-aws cloudformation wait stack-drift-detection-complete \
-  --region "$AWS_REGION" --stack-drift-detection-id "$DRIFT_ID"
-
-aws cloudformation describe-stack-drift-detection-status \
-  --region "$AWS_REGION" --stack-drift-detection-id "$DRIFT_ID" \
-  --output table --no-cli-pager
-
-python infrastructure/member-d/import/prepare_import.py audit \
-  --region "$AWS_REGION" --stack "$STACK_NAME" --api "$API_ID" \
-  --authorizer "$AUTHORIZER_ID" --integration "$INTEGRATION_ID" \
-  --function "$FUNCTION_NAME" --workdir "$WORK_DIR" \
-  --baseline "$WORK_DIR/sanitized-snapshot.json"
-
-aws lambda get-policy \
-  --region "$AWS_REGION" --function-name "$FUNCTION_NAME" \
-  --query Policy --output text --no-cli-pager
-
-aws iam get-role --role-name "$ROLE_NAME" \
-  --query 'Role.{RoleName:RoleName,Path:Path,PermissionsBoundary:PermissionsBoundary}' \
-  --output table --no-cli-pager
-
-aws apigatewayv2 get-integration \
-  --region "$AWS_REGION" --api-id "$API_ID" \
-  --integration-id "$INTEGRATION_ID" --output json --no-cli-pager
-
-aws apigatewayv2 get-routes \
-  --region "$AWS_REGION" --api-id "$API_ID" \
-  --query 'sort_by(Items,&RouteKey)[].{Route:RouteKey,Target:Target,Auth:AuthorizationType,Authorizer:AuthorizerId}' \
-  --output table --no-cli-pager
-```
-
-`audit --baseline` 必须证明 Lambda 完整配置与 resource policy、integration、16 条路由和
-`ReservationsTable` 保持不变，并确认 stack 已从原 4 个资源扩展为原 4 个加 19 个纳管资源，
-共 23 个。`QueryLambdaRole` 只允许保持审计前记录的完全相同 reservation-only 漂移；漂移
-扩大、缩小、改变，或出现任何其他运行时差异时停止，不进入 UPDATE。
-
-若阶段 6 输出 `missing`，IMPORT 后 Lambda 的在线 internal key 和其他环境变量仍与审计时
-相同，但 `QueryFunction` 的 IMPORT 模板刻意没有声明整个 `Environment`，因此 drift 检测
-可能把该属性报告为新增/不同。这只是阶段 9 正常 UPDATE 前的短暂纳管状态，不是让人工
-补改 Lambda 的许可。此时禁止手工修改或轮换环境变量；工具还会比较 Lambda `RevisionId`，
-在不读取密钥值的前提下发现并发配置变化。
-
-## 阶段 9/10：打包当前 SAM，创建并审查 UPDATE change set
-
-先只读取得 Member B stack 输出。函数参数必须使用函数**名称**，不能传 ARN：
-
-```bash
-MEDIA_BUCKET=$(aws cloudformation describe-stacks \
-  --region "$AWS_REGION" --stack-name PacificBioArchive-Media \
-  --query "Stacks[0].Outputs[?OutputKey=='MediaBucketName'].OutputValue | [0]" \
-  --output text)
-STORAGE_DELETE_ARN=$(aws cloudformation describe-stacks \
-  --region "$AWS_REGION" --stack-name PacificBioArchive-Media \
-  --query "Stacks[0].Outputs[?OutputKey=='StorageDeleteFunctionArn'].OutputValue | [0]" \
-  --output text)
-STORAGE_DELETE_FUNCTION_NAME=$(aws lambda get-function-configuration \
-  --region "$AWS_REGION" --function-name "$STORAGE_DELETE_ARN" \
-  --query FunctionName --output text)
-
-test -n "$MEDIA_BUCKET" && test "$MEDIA_BUCKET" != "None"
-test -n "$STORAGE_DELETE_FUNCTION_NAME" && \
-  test "$STORAGE_DELETE_FUNCTION_NAME" != "None"
-
-# 本地构建 — SAM 在受控目录中安装 requirements.txt 依赖；不会改变 AWS。
-sam build --template-file infrastructure/member-d/dynamodb.yaml \
-  --build-dir "$WORK_DIR/sam-build"
-test -f "$WORK_DIR/sam-build/template.yaml"
-
-# WRITE — 把精确 build tree 打成确定性 zip，上传内容寻址对象并固定 S3 VersionId；
-# 不会创建或执行 CloudFormation change set。
-python infrastructure/member-d/import/prepare_import.py package-update \
-  --region "$AWS_REGION" --artifact-bucket "$ARTIFACT_BUCKET" \
-  --built-template "$WORK_DIR/sam-build/template.yaml" \
-  --built-code-dir "$WORK_DIR/sam-build/QueryFunction" \
-  --source-code-dir backend/lambdas/query \
-  --dependency-manifest infrastructure/member-d/import/member-d-query-build.lock.json \
-  --expected-commit "$DEPLOYMENT_COMMIT" \
-  --output-template "$WORK_DIR/packaged-template.yaml"
-
-# 只查询参数名数量，不读取任何参数值。
-INTERNAL_KEY_COUNT=$(aws cloudformation describe-stacks \
-  --region "$AWS_REGION" --stack-name "$STACK_NAME" \
-  --query 'length(Stacks[0].Parameters[?ParameterKey==`InternalApiKey`] || `[]`)' \
-  --output text --no-cli-pager)
-case "$INTERNAL_KEY_COUNT" in
-  0) INTERNAL_KEY_MODE=missing ;;
-  1) INTERNAL_KEY_MODE=existing ;;
-  *) echo "Unexpected InternalApiKey parameter count" >&2; exit 1 ;;
-esac
-```
-
-### 路径 A：`INTERNAL_KEY_MODE=existing`
-
-参数已经由 stack 管理时，CLI 只能复用其 NoEcho 值：
-
-```bash
-test "$INTERNAL_KEY_MODE" = "existing"
-
-# WRITE — 只创建 UPDATE change set；不要执行。
-aws cloudformation create-change-set \
-  --region "$AWS_REGION" --stack-name "$STACK_NAME" \
-  --change-set-name "$UPDATE_CHANGE_SET" --change-set-type UPDATE \
-  --template-body "file://$WORK_DIR/packaged-template.yaml" \
-  --capabilities CAPABILITY_NAMED_IAM CAPABILITY_AUTO_EXPAND \
-  --parameters \
-    ParameterKey=ExistingHttpApiId,ParameterValue="$API_ID" \
-    ParameterKey=ExistingJwtAuthorizerId,ParameterValue="$AUTHORIZER_ID" \
-    ParameterKey=QueryInputBucketName,ParameterValue="$MEDIA_BUCKET" \
-    ParameterKey=StorageDeleteFunctionName,ParameterValue="$STORAGE_DELETE_FUNCTION_NAME" \
-    ParameterKey=InferenceApiBaseUrl,ParameterValue="$INFERENCE_API_BASE_URL" \
-    ParameterKey=AllowLegacyProcessingCallbacks,ParameterValue="$ALLOW_LEGACY_PROCESSING_CALLBACKS" \
-    ParameterKey=InternalApiKey,UsePreviousValue=true
-```
-
-### 路径 B：`INTERNAL_KEY_MODE=missing`
-
-只有这个路径需要从团队认可的安全存储取得**当前正在使用**的 internal key。此步骤是把
-现有值登记为 stack 的 `NoEcho` 参数，不是轮换密钥。当前值无法安全取得时停止，不能使用
-临时值。值不得进入 CloudShell、argv、shell history、环境变量、stdin、`.work/`、
-`samconfig.toml`、参数文件、snapshot、输出、日志、截图、Git 或群聊。
-
-1. 保持 CloudShell 的 `set +x`。通过 CloudShell 的 Actions → Download file，把未编辑的
-   `$WORK_DIR/packaged-template.yaml` 下载到本机；不要下载或打开任何密钥文件。
-2. 在 AWS Console 选择 `ap-southeast-2` → CloudFormation → Stacks →
-   `PacificBioArchive-Database` → Stack actions → **Create change set for current stack**。
-   这是普通 `UPDATE` change set；不要再次选择 **Import resources into stack**。
-3. 选择 **Replace current template** → **Upload a template file**，上传刚下载的
-   `packaged-template.yaml`。
-4. 在 Parameters 页面逐项输入这些 CloudShell 变量所代表的**实际非秘密值**，不要把
-   `$API_ID` 等变量名原样输入：`ExistingHttpApiId` 取 `$API_ID` 的值、
-   `ExistingJwtAuthorizerId` 取 `$AUTHORIZER_ID` 的值、`QueryInputBucketName` 取
-   `$MEDIA_BUCKET` 的值、`StorageDeleteFunctionName` 取
-   `$STORAGE_DELETE_FUNCTION_NAME` 的值、`InferenceApiBaseUrl` 取
-   `$INFERENCE_API_BASE_URL` 的值，并设置 `AllowLegacyProcessingCallbacks=true`。
-   `AllowedOrigin`、`PublicAllowedOrigin` 和空的 `NotificationEmailEndpoint` 保持模板默认值。
-5. 只在新的 `InternalApiKey` 密码框中粘贴当前 internal key。不要点击显示、不要截图，
-   也不要把值复制到任何其他字段。
-6. 确认 capabilities 包含 named IAM 和 transform/auto-expand 所需确认，创建 change set，
-   但**绝对不要执行**。记录控制台显示的精确 change set 名称。
-7. 回到 CloudShell，列出候选项并输入刚记录的非秘密名称：
-
-```bash
-test "$INTERNAL_KEY_MODE" = "missing"
-aws cloudformation list-change-sets \
-  --region "$AWS_REGION" --stack-name "$STACK_NAME" \
-  --query 'reverse(sort_by(Summaries,&CreationTime))[].{Name:ChangeSetName,Status:Status,Execution:ExecutionStatus,Created:CreationTime}' \
-  --output table --no-cli-pager
-read -r -p "Exact UPDATE change set name shown by the console: " UPDATE_CHANGE_SET
-test -n "$UPDATE_CHANGE_SET"
-```
-
-[`NoEcho` 参数文档](https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/parameters-section-structure.html)
-说明 CloudFormation 在 describe 输出中遮蔽该值。验证器只接受控制台返回的标准遮蔽形态；
-它不会读取、记录、比较或输出密钥。人工必须自行保证输入的是当前值，这一点无法在不读取
-秘密的前提下自动证明。
-
-### 两条 UPDATE 路径共同的验证步骤
-
-```bash
-
-aws cloudformation wait change-set-create-complete \
-  --region "$AWS_REGION" --stack-name "$STACK_NAME" \
-  --change-set-name "$UPDATE_CHANGE_SET"
-
-aws cloudformation describe-change-set \
-  --region "$AWS_REGION" --stack-name "$STACK_NAME" \
-  --change-set-name "$UPDATE_CHANGE_SET" \
-  --query 'Changes[].ResourceChange.{Action:Action,LogicalId:LogicalResourceId,Type:ResourceType,Replacement:Replacement}' \
-  --output table --no-cli-pager
-
-python infrastructure/member-d/import/prepare_import.py validate-change-set \
-  --region "$AWS_REGION" --stack "$STACK_NAME" \
-  --change-set "$UPDATE_CHANGE_SET" --expected-type UPDATE \
-  --api "$API_ID" --authorizer "$AUTHORIZER_ID" \
-  --integration "$INTEGRATION_ID" --function "$FUNCTION_NAME" \
+  --region "$AWS_REGION" \
+  --source-stack "$SOURCE_STACK" \
+  --stack "$TARGET_STACK" \
+  --change-set "$IMPORT_CHANGE_SET" \
+  --expected-type IMPORT \
+  --api "$API_ID" \
+  --authorizer "$AUTHORIZER_ID" \
+  --integration "$INTEGRATION_ID" \
+  --function "$FUNCTION_NAME" \
   --workdir "$WORK_DIR" \
-  --artifact-bucket "$ARTIFACT_BUCKET" \
-  --built-template "$WORK_DIR/sam-build/template.yaml" \
-  --built-code-dir "$WORK_DIR/sam-build/QueryFunction" \
-  --source-code-dir backend/lambdas/query \
-  --dependency-manifest infrastructure/member-d/import/member-d-query-build.lock.json \
-  --expected-commit "$DEPLOYMENT_COMMIT" \
-  --packaged-template "$WORK_DIR/packaged-template.yaml" \
-  --expected-http-api-id "$API_ID" \
-  --expected-jwt-authorizer-id "$AUTHORIZER_ID" \
-  --expected-query-input-bucket "$MEDIA_BUCKET" \
-  --expected-storage-delete-function "$STORAGE_DELETE_FUNCTION_NAME" \
-  --expected-inference-api-base-url "$INFERENCE_API_BASE_URL" \
-  --expected-allow-legacy-processing-callbacks "$ALLOW_LEGACY_PROCESSING_CALLBACKS" \
-  --expect-role-reconciliation true
+  --artifact-bucket "$ARTIFACT_BUCKET"
+
+echo 'STOP: report the validated 19-Import preview for a new approval.'
 ```
 
-验证器必须先重新采集在线状态，再证明仓库源模板、SAM built template、内容寻址且固定
-VersionId 的 packaged template 和 CloudFormation processed template 逐层对应；它要求
-所有一方源码、维护模板及 dependency manifest 精确来自干净的 `$DEPLOYMENT_COMMIT`。
-`requirements.txt` 固定完整 CPython 3.12/x86_64 依赖及 wheel SHA-256；build 中每个会被
-打包的依赖文件还必须与 commit 内受审 manifest 的路径、大小和 SHA-256 完全一致，不能
-用 build 内可同步伪造的 `.dist-info/RECORD` 自证。验证器随后重新生成确定性 zip，并通过
-`head-object` 核对精确版本的 SHA-256。Lambda 的
-processed `Code` 必须精确指向该固定版本，顶层 Parameters、Conditions、Outputs 必须与
-受审仓库模板和 packaged template 完全一致，且 change set 参数与上面人工确认的值逐项
-相同。`InternalApiKey` 必须是精确的 `String / NoEcho: true / MinLength: 1`，整份处理后
-模板中只能在 `QueryFunction.Properties.Environment.Variables.INTERNAL_API_KEY` 出现一次
-`Ref: InternalApiKey`；Output、Metadata、其他资源和 `Fn::Sub` 均不得引用它。若参数原本
-存在，只能 `UsePreviousValue=true`；若原本缺失，只能接受 CloudFormation 控制台返回的
-NoEcho 遮蔽值，不能接受明文、额外字段或本地参数文件。随后还必须证明 processed template
-没有隐式 `QueryFunctionRole`，`QueryFunction` 仍绑定
-`QueryLambdaRole`，且 Lambda、integration、16 条已纳管路由、`ReservationsTable` 和
-`QueryLambdaRole` 都不会 replacement/remove。若 snapshot 记录了允许的 reservation-only
-漂移，UPDATE 对 `QueryLambdaRole` 只能是 `Modify / Replacement=False`，并且目标必须精确
-收敛为模板中的单一规范 `DynamoDBFilesAccess`；不得接受其他 IAM action、resource、policy、
-boundary、tag 或 role 属性变化。此次 UPDATE 不只是修角色：它还更新 Lambda code/config，
-新增 SNS Topic、OPTIONS routes、逐路由 invoke permissions 等模板资源，因此必须逐项审查。
+Validator 必须从 CloudFormation 实际描述中确认：`ChangeSetType=IMPORT`、目标 Stack 精确
+为 `PacificBioArchive-QueryAdoption`、恰好 19 个 `Import`、没有 Add/Modify/Remove/Replace、
+没有数据库 Stack 资源、没有 Outputs/secret，并在预览后再次证明 19 项仍 unmanaged。
 
-这里明确使用 `AllowLegacyProcessingCallbacks=true`，因为当前 Member B 是否已经全部转发
-lease token 尚未由运行证据证明。该值只用于安全滚动升级，稳定态必须在最后单独 UPDATE
-为 `false`。
+**到这里必须停止并汇报。第一次 preview 流程中不存在执行 IMPORT 的命令。**
 
-> **STOP 2 — 第二次明确批准：** 把 UPDATE change set 的净化结果交给用户。只有用户
-> 明确回复批准“执行 UPDATE change set”后才可进入阶段 10。
+## 5. 日后获批执行 IMPORT 后的强制证据门
 
-## 阶段 10/10：执行首次 UPDATE、收窄 permission、迁移并关闭兼容开关
+若未来另行批准并执行该 IMPORT，Stack 到达 `IMPORT_COMPLETE` 后必须立即运行：
 
 ```bash
-# WRITE — 仅在 STOP 2 获得明确批准后执行。
-aws cloudformation execute-change-set \
-  --region "$AWS_REGION" --stack-name "$STACK_NAME" \
-  --change-set-name "$UPDATE_CHANGE_SET"
-
-aws cloudformation wait stack-update-complete \
-  --region "$AWS_REGION" --stack-name "$STACK_NAME"
-
-aws cloudformation describe-stacks \
-  --region "$AWS_REGION" --stack-name "$STACK_NAME" \
-  --query 'Stacks[0].{Status:StackStatus,Outputs:Outputs}' \
-  --output table --no-cli-pager
-
-# 只验证参数名已纳管，不读取其值；后续 UPDATE 必须 UsePreviousValue=true。
-test "$(aws cloudformation describe-stacks \
-  --region "$AWS_REGION" --stack-name "$STACK_NAME" \
-  --query 'length(Stacks[0].Parameters[?ParameterKey==`InternalApiKey`] || `[]`)' \
-  --output text --no-cli-pager)" = "1"
-
-aws apigatewayv2 get-routes \
-  --region "$AWS_REGION" --api-id "$API_ID" \
-  --query 'sort_by(Items,&RouteKey)[].{Route:RouteKey,Auth:AuthorizationType,Authorizer:AuthorizerId}' \
-  --output table --no-cli-pager
-
-aws cloudformation detect-stack-resource-drift \
-  --region "$AWS_REGION" --stack-name "$STACK_NAME" \
-  --logical-resource-id QueryLambdaRole \
-  --query 'StackResourceDrift.{Status:StackResourceDriftStatus,Differences:PropertyDifferences}' \
-  --output json --no-cli-pager
-
-aws cloudformation describe-stack-resource \
-  --region "$AWS_REGION" --stack-name "$STACK_NAME" \
-  --logical-resource-id ReservationsTable \
-  --query 'StackResourceDetail.{CloudFormationStatus:ResourceStatus,PhysicalId:PhysicalResourceId}' \
-  --output table --no-cli-pager
-
-aws dynamodb describe-table \
+python infrastructure/member-d/import/prepare_import.py verify-post-import \
   --region "$AWS_REGION" \
-  --table-name PacificBioArchiveUploadReservations \
-  --query 'Table.{Name:TableName,Status:TableStatus,Arn:TableArn}' \
-  --output table --no-cli-pager
+  --source-stack "$SOURCE_STACK" \
+  --target-stack "$TARGET_STACK" \
+  --baseline "$WORK_DIR/sanitized-snapshot.json" \
+  --api "$API_ID" \
+  --authorizer "$AUTHORIZER_ID" \
+  --integration "$INTEGRATION_ID" \
+  --function "$FUNCTION_NAME" \
+  --workdir "$WORK_DIR"
 ```
 
-UPDATE 完成后，`QueryLambdaRole` 必须为 `IN_SYNC` 且没有 `PropertyDifferences`；
-CloudFormation 的 `PhysicalId` 必须仍为 `PacificBioArchiveUploadReservations`，随后 DynamoDB
-查询中的 `Status` 必须为 `ACTIVE`。CloudFormation 的 `ResourceStatus` 不能替代 DynamoDB 的
-`TableStatus`。任一条件不满足时，不得恢复流量或开始迁移。
+该 gate 会要求 Target Stack 精确拥有 19 项，并比较 Lambda 完整配置、环境变量名称和所有
+安全值、`CodeSha256`、`RevisionId`、Role、reserved/provisioned concurrency、resource
+policy 与 policy revision。因为 `AWS::ApiGatewayV2::Integration` 在此工作流中没有可用
+的 CloudFormation drift detection，工具会直接调用 API Gateway 只读 API，逐属性比较
+integration 和全部 16 条 Route。任何差异都停止，不得进入 UPDATE。
 
-首次 UPDATE 会新增 26 条由 CloudFormation 管理的逐路由 invoke permissions，但不会自动
-删除 IMPORT 前审计到的以下 3 条 stack 外历史 permissions：
+IMPORT template 暂时省略 `QueryFunction.Environment` 只是避免读取 secret；不能仅凭模板
+推断线上 Lambda 未改变。只有上述真实 post-import comparison 能证明这一点。
 
-1. `apigateway-query-lambda`：`/*/*/*`
-2. `AllowAuthTestInvoke`：`/*/GET/auth-test`
-3. `AllowApiGatewayInvokeAllRoutes-20260829030023`：`/*/*`
+## 6. 最终正常 UPDATE（仅记录边界，不是操作授权）
 
-先用仓库验证器证明在线 policy 恰好是“26 条 scoped + 尚未删除的历史 permissions”。每次
-删除前都必须重新调用验证器。验证器从同一次最新在线 policy 响应原子输出固定顺序中的
-下一条 Sid 与该响应的 RevisionId；禁止从 snapshot、旧 shell 变量或第二次查询重取或复用
-Sid/RevisionId。
+最终正常 UPDATE 是另一阶段，必须使用 `infrastructure/member-d/query-adoption.yaml` 新鲜
+build/package，单独创建 preview、运行 validator，并再次取得人工批准。若当前 key 未被
+Stack 注册，A 只能在 CloudFormation Console 的 `InternalApiKey` `NoEcho` 密码框输入
+当前值；不存在 secret-bearing CLI 路径。
 
-### STOP 3A — 删除第一条已审计历史 permission
+第一次正常 UPDATE 的允许变更固定为 37 项：
 
-只有用户明确批准精确删除 `apigateway-query-lambda` 后，才能执行本段：
+- `QueryFunction`：唯一 `Modify`，且 `Replacement=False`；
+- 10 条 OPTIONS Route：`Add`；
+- 26 条 method/path-scoped `AWS::Lambda::Permission`：`Add`。
 
-```bash
-POLICY_GUARD=$(python infrastructure/member-d/import/prepare_import.py validate-lambda-policy \
-  --region "$AWS_REGION" --function "$FUNCTION_NAME" \
-  --workdir "$WORK_DIR" --removed-legacy-count 0 --emit-revision)
-readarray -t POLICY_GUARD_FIELDS < <(
-  printf '%s' "$POLICY_GUARD" | python -c \
-    'import json,sys; value=json.load(sys.stdin); print(value["next_legacy_sid"]); print(value["revision_id"])'
-)
-unset POLICY_GUARD
-test "${#POLICY_GUARD_FIELDS[@]}" -eq 2
-LEGACY_STATEMENT_ID="${POLICY_GUARD_FIELDS[0]}"
-POLICY_REVISION_ID="${POLICY_GUARD_FIELDS[1]}"
-test "$LEGACY_STATEMENT_ID" = "apigateway-query-lambda"
-test -n "$POLICY_REVISION_ID"
-aws lambda remove-permission \
-  --region "$AWS_REGION" --function-name "$FUNCTION_NAME" \
-  --statement-id "$LEGACY_STATEMENT_ID" \
-  --revision-id "$POLICY_REVISION_ID"
-unset LEGACY_STATEMENT_ID POLICY_REVISION_ID POLICY_GUARD_FIELDS
-```
+禁止任何 Remove、Replace、额外 Modify、wildcard permission、数据库 Stack 资源或
+`QueryLambdaRole` 变更。该 UPDATE 不新增 SNS Topic/Subscription。DynamoDB
+`NotificationsTable` 仍提供 durable in-app inbox；每用户 email 订阅需要另行设计、审查并
+批准跨 Stack IAM/SNS 方案。
 
-### STOP 3B — 删除第二条已审计历史 permission
+如果 UPDATE 失败并进入 `UPDATE_ROLLBACK_COMPLETE`，必须运行 recovery report 和完整
+runtime/API/ownership 验证。只有确认 19 项导入资源仍精确归 Query Stack、且全部运行时
+证据等同 `IMPORT_COMPLETE` 稳定边界，才能把回滚视为成功恢复；否则冻结后续操作。
 
-只有用户明确批准精确删除 `AllowAuthTestInvoke` 后，才能执行本段。此处再次读取 policy，
-并只使用这次响应的新 RevisionId：
+## 7. 相关文件
 
-```bash
-POLICY_GUARD=$(python infrastructure/member-d/import/prepare_import.py validate-lambda-policy \
-  --region "$AWS_REGION" --function "$FUNCTION_NAME" \
-  --workdir "$WORK_DIR" --removed-legacy-count 1 --emit-revision)
-readarray -t POLICY_GUARD_FIELDS < <(
-  printf '%s' "$POLICY_GUARD" | python -c \
-    'import json,sys; value=json.load(sys.stdin); print(value["next_legacy_sid"]); print(value["revision_id"])'
-)
-unset POLICY_GUARD
-test "${#POLICY_GUARD_FIELDS[@]}" -eq 2
-LEGACY_STATEMENT_ID="${POLICY_GUARD_FIELDS[0]}"
-POLICY_REVISION_ID="${POLICY_GUARD_FIELDS[1]}"
-test "$LEGACY_STATEMENT_ID" = "AllowAuthTestInvoke"
-test -n "$POLICY_REVISION_ID"
-aws lambda remove-permission \
-  --region "$AWS_REGION" --function-name "$FUNCTION_NAME" \
-  --statement-id "$LEGACY_STATEMENT_ID" \
-  --revision-id "$POLICY_REVISION_ID"
-unset LEGACY_STATEMENT_ID POLICY_REVISION_ID POLICY_GUARD_FIELDS
-```
-
-### STOP 3C — 删除第三条已审计历史 permission
-
-只有用户明确批准精确删除 `AllowApiGatewayInvokeAllRoutes-20260829030023` 后，才能执行本段。
-它仍会重新读取并严格验证此刻的完整 policy：
-
-```bash
-POLICY_GUARD=$(python infrastructure/member-d/import/prepare_import.py validate-lambda-policy \
-  --region "$AWS_REGION" --function "$FUNCTION_NAME" \
-  --workdir "$WORK_DIR" --removed-legacy-count 2 --emit-revision)
-readarray -t POLICY_GUARD_FIELDS < <(
-  printf '%s' "$POLICY_GUARD" | python -c \
-    'import json,sys; value=json.load(sys.stdin); print(value["next_legacy_sid"]); print(value["revision_id"])'
-)
-unset POLICY_GUARD
-test "${#POLICY_GUARD_FIELDS[@]}" -eq 2
-LEGACY_STATEMENT_ID="${POLICY_GUARD_FIELDS[0]}"
-POLICY_REVISION_ID="${POLICY_GUARD_FIELDS[1]}"
-test "$LEGACY_STATEMENT_ID" = "AllowApiGatewayInvokeAllRoutes-20260829030023"
-test -n "$POLICY_REVISION_ID"
-aws lambda remove-permission \
-  --region "$AWS_REGION" --function-name "$FUNCTION_NAME" \
-  --statement-id "$LEGACY_STATEMENT_ID" \
-  --revision-id "$POLICY_REVISION_ID"
-unset LEGACY_STATEMENT_ID POLICY_REVISION_ID POLICY_GUARD_FIELDS
-
-python infrastructure/member-d/import/prepare_import.py validate-lambda-policy \
-  --region "$AWS_REGION" --function "$FUNCTION_NAME" \
-  --workdir "$WORK_DIR" --removed-legacy-count 3
-```
-
-最终验证必须证明 3 条历史 permissions 已全部删除，在线 policy 只剩模板管理的 26 条 scoped
-permissions，并与 16 条业务路由和 10 条 OPTIONS 路由逐一完全对应；不得存在额外 permission
-或任何 wildcard 历史权限，否则停止。
-
-在浏览器中用 Cognito 已登录会话验证公开路由、上传、查询、编辑、删除和通知；不要把
-JWT 或内部 key 复制到 shell。公开路由必须有 JWT，internal 路由在无/错 key 时必须 401，
-OPTIONS 不挂 JWT。确认在线图片/视频处理与 C 的 inference endpoint 正常后再迁移旧数据。
-
-reservations 迁移期间，必须暂停所有 Files/Reservations mutation，包括 reserve、上传、
-processing/complete/failed 回调和删除，并确认没有请求在途。无法确认则停止。保持暂停状态
-先执行只读 verify：
-
-```bash
-python backend/lambdas/query/migrate_reservations.py verify \
-  --region "$AWS_REGION" \
-  --files-table PacificBioArchiveFiles \
-  --reservations-table PacificBioArchiveUploadReservations
-```
-
-若 verify 已是 `claims_missing=0`、`claims_extra=0`，不要运行 backfill。若存在缺失 claim：
-
-> **STOP 4 — 单独批准数据回填：** 保持所有 mutation 暂停，提交 verify 的净化统计；只有
-> 用户明确批准“执行 reservations backfill”后，才可运行下面的写命令。
-
-```bash
-# WRITE — 仅在所有 Files/Reservations mutation 仍暂停时创建缺失 claims。
-python backend/lambdas/query/migrate_reservations.py backfill \
-  --region "$AWS_REGION" \
-  --files-table PacificBioArchiveFiles \
-  --reservations-table PacificBioArchiveUploadReservations \
-  --confirm-uploads-paused
-
-python backend/lambdas/query/migrate_reservations.py verify \
-  --region "$AWS_REGION" \
-  --files-table PacificBioArchiveFiles \
-  --reservations-table PacificBioArchiveUploadReservations
-```
-
-只有最后一次 verify 退出 0，且 `claims_missing=0`、`claims_extra=0`，才可恢复流量。
-
-此时 Member D 仍临时允许旧 callback。下一步由成员 A 按
-[`docs/member-b/manual-aws-steps.md`](../member-b/manual-aws-steps.md) 部署前面固定的
-`$DEPLOYMENT_COMMIT`；不要在中途再次 `git pull` 或换 commit。无论该手册的 guided prompt
-如何显示，对 `Save arguments to configuration file` 都回答 `N`，不得把共享 key 写入
-`samconfig.toml`。部署后用新上传证明 processing 返回的 `lease_token` 被 complete/failed
-原样转发；不能只凭代码版本号推断线上已升级。
-
-> **STOP 5 — Member B 部署属于独立 AWS 写操作：** 必须按 Member B 手册单独审查和批准；
-> 本手册不替它执行或扩大授权。验证新 callback 确实带 token 后才能继续。
-
-Member B 部署完成后重新读取并验证输出，不能复用部署前的 shell 值：
-
-```bash
-test "$(git rev-parse HEAD)" = "$DEPLOYMENT_COMMIT"
-git diff --quiet
-git diff --cached --quiet
-
-MEDIA_BUCKET=$(aws cloudformation describe-stacks \
-  --region "$AWS_REGION" --stack-name PacificBioArchive-Media \
-  --query "Stacks[0].Outputs[?OutputKey=='MediaBucketName'].OutputValue | [0]" \
-  --output text)
-STORAGE_DELETE_FUNCTION_NAME=$(aws cloudformation describe-stacks \
-  --region "$AWS_REGION" --stack-name PacificBioArchive-Media \
-  --query "Stacks[0].Outputs[?OutputKey=='StorageDeleteFunctionName'].OutputValue | [0]" \
-  --output text)
-test -n "$MEDIA_BUCKET" && test "$MEDIA_BUCKET" != "None"
-test -n "$STORAGE_DELETE_FUNCTION_NAME" && \
-  test "$STORAGE_DELETE_FUNCTION_NAME" != "None"
-```
-
-最后创建一个只把兼容开关改为 `false` 的独立 hardening UPDATE。复用已经校验的 built 和
-packaged template；不要重新打包或改其他参数：
-
-```bash
-ALLOW_LEGACY_PROCESSING_CALLBACKS=false
-
-# WRITE — 只创建 hardening change set；不要执行。
-aws cloudformation create-change-set \
-  --region "$AWS_REGION" --stack-name "$STACK_NAME" \
-  --change-set-name "$HARDEN_CHANGE_SET" --change-set-type UPDATE \
-  --template-body "file://$WORK_DIR/packaged-template.yaml" \
-  --capabilities CAPABILITY_NAMED_IAM CAPABILITY_AUTO_EXPAND \
-  --parameters \
-    ParameterKey=ExistingHttpApiId,ParameterValue="$API_ID" \
-    ParameterKey=ExistingJwtAuthorizerId,ParameterValue="$AUTHORIZER_ID" \
-    ParameterKey=QueryInputBucketName,ParameterValue="$MEDIA_BUCKET" \
-    ParameterKey=StorageDeleteFunctionName,ParameterValue="$STORAGE_DELETE_FUNCTION_NAME" \
-    ParameterKey=InferenceApiBaseUrl,ParameterValue="$INFERENCE_API_BASE_URL" \
-    ParameterKey=AllowLegacyProcessingCallbacks,ParameterValue=false \
-    ParameterKey=InternalApiKey,UsePreviousValue=true
-
-aws cloudformation wait change-set-create-complete \
-  --region "$AWS_REGION" --stack-name "$STACK_NAME" \
-  --change-set-name "$HARDEN_CHANGE_SET"
-
-aws cloudformation describe-change-set \
-  --region "$AWS_REGION" --stack-name "$STACK_NAME" \
-  --change-set-name "$HARDEN_CHANGE_SET" \
-  --query 'Changes[].ResourceChange.{Action:Action,LogicalId:LogicalResourceId,Type:ResourceType,Replacement:Replacement}' \
-  --output table --no-cli-pager
-
-python infrastructure/member-d/import/prepare_import.py validate-change-set \
-  --region "$AWS_REGION" --stack "$STACK_NAME" \
-  --change-set "$HARDEN_CHANGE_SET" --expected-type UPDATE \
-  --workdir "$WORK_DIR" \
-  --artifact-bucket "$ARTIFACT_BUCKET" \
-  --built-template "$WORK_DIR/sam-build/template.yaml" \
-  --built-code-dir "$WORK_DIR/sam-build/QueryFunction" \
-  --source-code-dir backend/lambdas/query \
-  --dependency-manifest infrastructure/member-d/import/member-d-query-build.lock.json \
-  --expected-commit "$DEPLOYMENT_COMMIT" \
-  --packaged-template "$WORK_DIR/packaged-template.yaml" \
-  --expected-http-api-id "$API_ID" \
-  --expected-jwt-authorizer-id "$AUTHORIZER_ID" \
-  --expected-query-input-bucket "$MEDIA_BUCKET" \
-  --expected-storage-delete-function "$STORAGE_DELETE_FUNCTION_NAME" \
-  --expected-inference-api-base-url "$INFERENCE_API_BASE_URL" \
-  --expected-allow-legacy-processing-callbacks false \
-  --expect-role-reconciliation false
-```
-
-验证器会重新读取当前 stack 的 processed template、参数、Lambda `CodeSha256`，并对
-`QueryFunction` 单独执行 drift detection。只有当前函数为 `IN_SYNC`、当前与候选 template
-完全相同、代码仍是同一固定 S3 版本、所有有效参数都不变且唯一差异为
-`AllowLegacyProcessingCallbacks: true → false`，同时 change set 恰好只有一条
-`QueryFunction / Modify / Replacement=False` 时才通过；任何其他代码、配置、role、资源或
-参数变化都必须失败。
-
-> **STOP 6 — 单独批准关闭兼容开关：** 只有用户明确批准执行该 hardening UPDATE 后继续。
-
-```bash
-# WRITE — 仅在 STOP 6 明确批准后执行。
-aws cloudformation execute-change-set \
-  --region "$AWS_REGION" --stack-name "$STACK_NAME" \
-  --change-set-name "$HARDEN_CHANGE_SET"
-
-aws cloudformation wait stack-update-complete \
-  --region "$AWS_REGION" --stack-name "$STACK_NAME"
-
-python infrastructure/member-d/import/prepare_import.py validate-lambda-policy \
-  --region "$AWS_REGION" --function "$FUNCTION_NAME" \
-  --workdir "$WORK_DIR" --removed-legacy-count 3
-```
-
-最后再测试：无 token 的 complete/failed 必须被拒绝，带当前 lease token 的回调成功；公开
-路由仍要求 JWT，internal 路由仍要求正确内部 key。全部通过后兼容升级才算结束。
-
-## 当前账号遇到 AlreadyExists 时
-
-如果 stack 为 `UPDATE_ROLLBACK_COMPLETE`，事件中出现 `RouteKey ... already exists`：
-
-1. 不要重试同一 SAM deploy；它仍会尝试创建在线 route。
-2. 不要删除 route、integration、Lambda 或 stack。
-3. 回到本手册阶段 4，从只读 audit 开始；只有完成 IMPORT 纳管后才能进行正常 UPDATE。
+- 架构设计：[`../superpowers/specs/2026-09-01-member-d-query-adoption-stack-design.md`](../superpowers/specs/2026-09-01-member-d-query-adoption-stack-design.md)
+- 数据库/Query Stack 说明：[`database-setup.md`](database-setup.md)
+- core database template：[`../../infrastructure/member-d/dynamodb.yaml`](../../infrastructure/member-d/dynamodb.yaml)
+- Query normal-UPDATE template：[`../../infrastructure/member-d/query-adoption.yaml`](../../infrastructure/member-d/query-adoption.yaml)
+- adoption 工具：[`../../infrastructure/member-d/import/prepare_import.py`](../../infrastructure/member-d/import/prepare_import.py)

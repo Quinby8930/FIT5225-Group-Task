@@ -65,19 +65,25 @@ Member D has added the database and query API:
   rule as a cleanup backstop rather than a precise expiry guarantee.
 - An internal metadata state machine (`reserve` / `processing` lease /
   `complete` / `failed`) that Member B's upload and processing Lambdas call.
-- A subscription & notification model (subscribe/unsubscribe/list endpoints plus
-  a trigger that notifies subscribers when a completed file matches their
-  subscribed species), behind a `NotificationPublisher` integration slot for
-  Member E's delivery. A manual tag edit notifies current subscribers only for
-  their deterministic first notification per file/user/species when it activates
-  a normalized species on a completed file (missing or non-positive count to
-  positive); repeat adds and removals do not notify existing recipients.
-- A CloudFormation template declaring three DynamoDB tables (file metadata,
-  subscriptions, notifications) and the query Lambda's IAM role.
+- A subscription & durable in-app notification model
+  (subscribe/unsubscribe/list endpoints plus a trigger that writes a per-user
+  notification when a completed file matches a subscribed species). A manual
+  tag edit notifies current subscribers only for their deterministic first
+  notification per file/user/species when it activates a normalized species on
+  a completed file; repeat adds and removals do not notify existing recipients.
+- An intentional two-stack CloudFormation ownership boundary. The existing
+  `PacificBioArchive-Database` stack retains the three core tables and query
+  Lambda role. A new `PacificBioArchive-QueryAdoption` stack will own the
+  reservation table, query Lambda, integration, routes and scoped permissions
+  after a separately approved import. This is ownership separation, not a
+  duplicate deployment.
+- Stable user/file-scoped S3 object keys. Species browsing is a DynamoDB-tag
+  logical directory; files are never copied or moved into per-species S3 paths.
 
-The Member D database has not been deployed from this repository. Live DynamoDB,
-Lambda, and API Gateway wiring remains in the manual handoff (see
-`docs/member-d/database-setup.md`).
+The dedicated Member D adoption stack has not been created from this repository.
+Local validators and tests do not authorize AWS writes. The first import preview
+remains a future, separately approved manual step (see
+`docs/member-d/aws-resource-adoption.md`).
 
 Member E has added the frontend and integration console:
 
@@ -92,8 +98,9 @@ Member E has added the frontend and integration console:
   authenticated temporary-URL endpoint.
 - Local Node mocked contract/integration-flow tests for the Member E request workflow and form parsing (not browser E2E),
   plus CORS wiring for local frontend-to-query-API integration.
-- Optional SNS notification publisher for email delivery, enabled by
-  `NOTIFICATION_PUBLISHER=sns`.
+- A notification publisher integration slot. The first dual-stack normal
+  UPDATE does not enable SNS email; per-user email delivery needs a separate
+  Cognito-claims, IAM and SNS design and approval.
 - User guide, architecture notes, and demo evidence checklist under
   `docs/member-e/`.
 
@@ -129,6 +136,10 @@ Handoff references:
 ### Member D architecture
 
 ```text
+PacificBioArchive-Database (core ownership)
+  -> FilesTable + SubscriptionsTable + NotificationsTable + QueryLambdaRole
+PacificBioArchive-QueryAdoption (query ownership after approved import)
+  -> ReservationsTable + QueryFunction + Integration + explicit routes/permissions
 Query API (FastAPI, one Lambda via mangum)
   -> FileRepository abstraction -> SQLite (local) | DynamoDB (cloud)
   -> /query/* , /tags/edit , /files/delete        (Member E, Cognito-protected)
@@ -150,6 +161,8 @@ Handoff references:
 - [Integration guide (tag names, schema, API contract)](backend/lambdas/query/INTEGRATION.md)
 - [DynamoDB infrastructure](infrastructure/member-d/README.md)
 - [Database setup for the AWS operator](docs/member-d/database-setup.md)
+- [Existing-resource adoption runbook](docs/member-d/aws-resource-adoption.md)
+- [Report-ready dual-stack contribution](docs/member-d/team-report-contribution.md)
 
 ### Member E verification
 

@@ -57,17 +57,18 @@ reserve 必须先于 complete 调用（状态机是 `reserve → processing → 
 
 **原因**（按概率）：
 
-1. 没有通过最新 SAM 模板部署 QueryFunction 或模板生成的执行角色。
+1. QueryFunction 尚未按双 Stack adoption 流程完成纳管和后续正常 UPDATE。
 2. 表名/区域不匹配 —— `DYNAMODB_TABLE` / `RESERVATIONS_TABLE` / `AWS_REGION` 没设对。
 3. 新表没部署 —— 订阅/通知依赖 `PacificBioArchiveSubscriptions` /
    `PacificBioArchiveNotifications` 两张表，旧模板没有。
 
 **解决**：
 
-1. 先判断账号状态：全新账号且没有 Member D 在线资源时，才可用最新
-   `infrastructure/member-d/dynamodb.yaml` 正常 `sam build` + `sam deploy --guided`。
-   当前已有 Query Lambda/integration/routes 的账号必须先完整执行
-   [`aws-resource-adoption.md`](aws-resource-adoption.md)，不能直接重跑 SAM。
+1. 当前已有 Query Lambda/integration/routes 的账号必须使用新
+   `PacificBioArchive-QueryAdoption` Stack 的
+   [`aws-resource-adoption.md`](aws-resource-adoption.md)，不能把 query 资源部署进
+   `PacificBioArchive-Database`，也不能直接重跑旧 SAM。全新空账号的两 Stack 创建顺序
+   需要另行设计；现有 adoption 手册不覆盖 clean-room deploy。
 2. Lambda 环境变量补齐：
 
    | 变量 | 值 |
@@ -79,8 +80,9 @@ reserve 必须先于 complete 调用（状态机是 `reserve → processing → 
    | `NOTIFICATIONS_TABLE` | `PacificBioArchiveNotifications` |
    | `AWS_REGION` | `ap-southeast-2` |
 
-3. IAM 角色确认授予 `dynamodb:Query`、`dynamodb:TransactWriteItems`，并对模板 Topic
-   精确授予 `sns:Publish`；新模板已包含这些权限。
+3. IAM 角色必须通过只读审计确认已有查询和 transaction 权限。Query Stack 的第一次
+   正常 UPDATE 不修改数据库 Stack 拥有的 Role，也不部署 SNS Topic 或 `sns:Publish`；
+   不得为了排错手工扩大 Role 权限。
 
 所有上述 AWS 检查和环境变量修改均由成员 A 执行，B/D 不自行改 AWS。C 只处理阿里云
 推理部署；共享 `INTERNAL_API_KEY` 仅 A/C 安全配置，不得进入 Git、文档或群聊。
@@ -99,14 +101,9 @@ reserve 必须先于 complete 调用（状态机是 `reserve → processing → 
 3. 该物种在 `tags` 里数量为 0 —— 触发器只对 `count >= 1` 的物种发通知。
 
 **解决**：核对 `complete.json` 的 `tags` key 与订阅的 `species` 完全一致（简化名、
-小写）。如果 SNS 临时失败，inbox 仍存在且 delivery 保持 pending；重放同一 completed
-请求会重试 pending。正常成功标记 delivered 后，后续重放不会再次选择该记录。
-
-这里没有周期 worker 或 DLQ。若自动重试已结束，由成员 A 用原始相同 metadata 人工
-重放 `PUT /internal/files/{file_id}/complete`；completed 分支只 publish 已存在的
-pending inbox，不会读取当前订阅或给晚订阅者补发。SNS 是
-at-least-once；若消息已接受但 delivered
-更新失败，重放可能重复投递，消费者应按确定性 `notification_id` 去重。
+小写），然后用同一已登录用户调用 `GET /notifications` 检查 DynamoDB-backed durable
+in-app inbox。当前第一次正常 UPDATE 不部署 SNS email，因此“没有收到邮件”不能作为
+inbox 失败证据。每用户 email 需要另行批准 Cognito claims、IAM、SNS 和防串发设计。
 
 ---
 
@@ -115,11 +112,10 @@ at-least-once；若消息已接受但 delivered
 **原因**：旧 FilesTable 行没有对应 claim，或旧数据已违反 `(user_id, checksum)`
 唯一性。运行时 fallback 不是正式迁移完成证明。
 
-**解决**：成员 A 暂停所有 Files/Reservations mutation（reserve、processing/complete/
-failed 回调和 delete），按
-`database-setup.md §3.1` 执行 verify、带
-`--confirm-uploads-paused` 的 backfill、再次 verify。多 file/错误 claim 必须人工核对并
-fail closed；禁止删 claim 后直接恢复流量。
+**解决**：这是 IMPORT 以外的业务数据变更。成员 A 必须先暂停所有
+Files/Reservations mutation（reserve、processing/complete/failed 回调和 delete），然后
+为 verify/backfill/verify 迁移另行提交方案和写操作批准。多 file/错误 claim 必须人工核对
+并 fail closed；禁止删 claim 后直接恢复流量，也不得把 backfill 混入 adoption。
 
 ---
 
@@ -174,10 +170,13 @@ rm -f data/pacific_bioarchive.db && python seed.py
 1. 不要再次运行相同的 `sam deploy` / `sam deploy --guided`；结果仍会冲突。
 2. 不要运行 `delete-route`、`delete-integration`、`delete-function` 或 `delete-stack`，也不要
    在 Console 中手工删除在线资源。
-3. 按 [`aws-resource-adoption.md`](aws-resource-adoption.md) 从只读 audit 开始，先用
-   IMPORT 纳管现有 Lambda、integration 和 16 条 Member D 非 OPTIONS 路由。
-4. IMPORT 验收完成后再审查正常 UPDATE；只有得到第二次明确审批，才执行 UPDATE。
-5. 首次 UPDATE 完成并不代表迁移结束；继续严格执行主手册的 STOP 3–6，分别审批旧宽泛
-   permission 移除、reservations backfill、Member B 部署和最终关闭兼容开关。
+3. 按 [`aws-resource-adoption.md`](aws-resource-adoption.md) 从只读 audit 开始，只为新的
+   `PacificBioArchive-QueryAdoption` Stack 创建恰好 19 项的 IMPORT preview：既有
+   reservations table、Lambda、integration 和 16 条 Member D 非 OPTIONS Route。
+4. Preview validator 通过后必须停止。执行 IMPORT 需要另一项批准；若未来执行，必须立即
+   通过 post-import runtime/API evidence gate。
+5. 第一次正常 UPDATE 又是独立 preview/批准，只允许 QueryFunction 非替换 Modify、10 条
+   OPTIONS Add 和 26 条 scoped permission Add。它不修改 Role，也不部署 SNS。
 
-全新账号没有这些在线资源，不需要 adoption，可按 `database-setup.md §2.1` 正常部署。
+全新账号没有这些在线资源，不需要 adoption，但两 Stack clean-room 创建顺序仍需要另行
+设计和验证，不能复用本手册。
