@@ -185,6 +185,9 @@ Resources:
   AuthTestRoute:
     Type: AWS::ApiGatewayV2::Route
     Properties: {ApiId: !Ref ExistingHttpApiId, RouteKey: 'GET /auth-test', AuthorizationType: JWT, AuthorizerId: !Ref ExistingJwtAuthorizerId, Target: !Sub 'integrations/${QueryIntegration}'}
+  UploadStatusRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties: {ApiId: !Ref ExistingHttpApiId, RouteKey: 'GET /uploads/{file_id}', AuthorizationType: JWT, AuthorizerId: !Ref ExistingJwtAuthorizerId, Target: !Sub 'integrations/${QueryIntegration}'}
   QueryByTagsRoute:
     Type: AWS::ApiGatewayV2::Route
     Properties: {ApiId: !Ref ExistingHttpApiId, RouteKey: 'POST /query/by-tags', AuthorizationType: JWT, AuthorizerId: !Ref ExistingJwtAuthorizerId, Target: !Sub 'integrations/${QueryIntegration}'}
@@ -235,6 +238,9 @@ Resources:
   AuthTestOptionsRoute:
     Type: AWS::ApiGatewayV2::Route
     Properties: {ApiId: !Ref ExistingHttpApiId, RouteKey: 'OPTIONS /auth-test', AuthorizationType: NONE, Target: !Sub 'integrations/${QueryIntegration}'}
+  UploadStatusOptionsRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties: {ApiId: !Ref ExistingHttpApiId, RouteKey: 'OPTIONS /uploads/{file_id}', AuthorizationType: NONE, Target: !Sub 'integrations/${QueryIntegration}'}
   QueryByTagsOptionsRoute:
     Type: AWS::ApiGatewayV2::Route
     Properties: {ApiId: !Ref ExistingHttpApiId, RouteKey: 'OPTIONS /query/by-tags', AuthorizationType: NONE, Target: !Sub 'integrations/${QueryIntegration}'}
@@ -266,6 +272,9 @@ Resources:
   AuthTestPermission:
     Type: AWS::Lambda::Permission
     Properties: {Action: lambda:InvokeFunction, FunctionName: !Ref QueryFunction, Principal: apigateway.amazonaws.com, SourceArn: !Sub 'arn:${AWS::Partition}:execute-api:${AWS::Region}:${AWS::AccountId}:${ExistingHttpApiId}/*/GET/auth-test'}
+  UploadStatusPermission:
+    Type: AWS::Lambda::Permission
+    Properties: {Action: lambda:InvokeFunction, FunctionName: !Ref QueryFunction, Principal: apigateway.amazonaws.com, SourceArn: !Sub 'arn:${AWS::Partition}:execute-api:${AWS::Region}:${AWS::AccountId}:${ExistingHttpApiId}/*/GET/uploads/*'}
   QueryByTagsPermission:
     Type: AWS::Lambda::Permission
     Properties: {Action: lambda:InvokeFunction, FunctionName: !Ref QueryFunction, Principal: apigateway.amazonaws.com, SourceArn: !Sub 'arn:${AWS::Partition}:execute-api:${AWS::Region}:${AWS::AccountId}:${ExistingHttpApiId}/*/POST/query/by-tags'}
@@ -314,6 +323,9 @@ Resources:
   AuthTestOptionsPermission:
     Type: AWS::Lambda::Permission
     Properties: {Action: lambda:InvokeFunction, FunctionName: !Ref QueryFunction, Principal: apigateway.amazonaws.com, SourceArn: !Sub 'arn:${AWS::Partition}:execute-api:${AWS::Region}:${AWS::AccountId}:${ExistingHttpApiId}/*/OPTIONS/auth-test'}
+  UploadStatusOptionsPermission:
+    Type: AWS::Lambda::Permission
+    Properties: {Action: lambda:InvokeFunction, FunctionName: !Ref QueryFunction, Principal: apigateway.amazonaws.com, SourceArn: !Sub 'arn:${AWS::Partition}:execute-api:${AWS::Region}:${AWS::AccountId}:${ExistingHttpApiId}/*/OPTIONS/uploads/*'}
   QueryByTagsOptionsPermission:
     Type: AWS::Lambda::Permission
     Properties: {Action: lambda:InvokeFunction, FunctionName: !Ref QueryFunction, Principal: apigateway.amazonaws.com, SourceArn: !Sub 'arn:${AWS::Partition}:execute-api:${AWS::Region}:${AWS::AccountId}:${ExistingHttpApiId}/*/OPTIONS/query/by-tags'}

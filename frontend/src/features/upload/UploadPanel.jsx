@@ -1,5 +1,5 @@
-import { useEffect, useRef, useState } from "react";
-import { uploadMedia } from "../../api/mediaApi";
+import { useCallback, useEffect, useRef, useState } from "react";
+import { getUploadStatus, uploadMedia } from "../../api/mediaApi";
 import Field from "../../components/Field";
 import FilePicker from "../../components/FilePicker";
 import {
@@ -16,6 +16,14 @@ import {
   selectUploadFile,
   startUpload,
 } from "../../lib/uploadWorkflow.mjs";
+import {
+  loadRecentUploads,
+  mergeUploadStatus,
+  pendingUploadIds,
+  rememberRecentUpload,
+  saveRecentUploads,
+  uploadStatusView,
+} from "../../lib/recentUploads.mjs";
 
 const STAGE_COPY = {
   hashing: "Calculating file checksum…",
@@ -39,6 +47,68 @@ function stepClass(stepKey, currentStage) {
   return "todo";
 }
 
+function sessionStorageOrNull() {
+  try {
+    return globalThis.sessionStorage || null;
+  } catch {
+    return null;
+  }
+}
+
+function processingMessage(stage, upload) {
+  if (stage !== "queued" || !upload) return STAGE_COPY[stage];
+  if (upload.status === "processing") return "Upload complete; AI processing is running.";
+  if (upload.status === "completed") return "Processing complete; the archive record is ready.";
+  if (upload.status === "failed") return "Upload succeeded, but processing failed.";
+  return STAGE_COPY.queued;
+}
+
+function RecentUploadCard({ upload, onExploreSpecies }) {
+  const view = uploadStatusView(upload);
+  const species = Object.keys(upload.tags || {});
+  return (
+    <article className="recent-upload-card">
+      <div className="recent-upload-heading">
+        <div>
+          <strong>{upload.filename}</strong>
+          <code>{upload.file_id}</code>
+        </div>
+        <span className={`upload-status status-${upload.status}`}>{view.label}</span>
+      </div>
+      {view.tagRows.length > 0 && (
+        <div className="recent-upload-details">
+          <h3>Archive tags</h3>
+          <ul>{view.tagRows.map((row) => <li key={row}>{row}</li>)}</ul>
+        </div>
+      )}
+      {view.detectionRows.length > 0 && (
+        <div className="recent-upload-details">
+          <h3>Original AI detections</h3>
+          <ul>{view.detectionRows.map((row) => <li key={row}>{row}</li>)}</ul>
+        </div>
+      )}
+      {view.modelVersion && (
+        <p className="recent-upload-model"><strong>Model version</strong> {view.modelVersion}</p>
+      )}
+      {view.failure && <p className="recent-upload-failure" role="alert">{view.failure}</p>}
+      {species.length > 0 && (
+        <div className="btn-row">
+          {species.map((label) => (
+            <button
+              key={label}
+              type="button"
+              className="btn btn-secondary"
+              onClick={() => onExploreSpecies(label)}
+            >
+              Explore {label}
+            </button>
+          ))}
+        </div>
+      )}
+    </article>
+  );
+}
+
 export default function UploadPanel({
   active,
   getActiveSession,
@@ -46,6 +116,7 @@ export default function UploadPanel({
   onNavigate,
   onExploreSpecies,
   sessionKey,
+  userSubject,
 }) {
   const [uploadState, setUploadState] = useState({
     file: null,
@@ -54,12 +125,19 @@ export default function UploadPanel({
     duplicate: null,
     submitting: false,
   });
+  const [recentUploads, setRecentUploads] = useState(() => (
+    loadRecentUploads(sessionStorageOrNull(), userSubject)
+  ));
   const [previewUrl, setPreviewUrl] = useState("");
   const mountedRef = useRef(true);
   const previewMediaRef = useRef(null);
   const uploadRunRef = useRef(0);
+  const pollInFlightRef = useRef(false);
   const { file, stage, receipt, duplicate } = uploadState;
   const duplicateCard = duplicate ? duplicateCardModel(duplicate, file?.type) : null;
+  const receiptUpload = recentUploads.find((item) => item.file_id === receipt?.file_id);
+  const activeUploadIds = pendingUploadIds(recentUploads);
+  const activeUploadIdsKey = activeUploadIds.join("|");
 
   useEffect(() => {
     mountedRef.current = true;
@@ -75,6 +153,10 @@ export default function UploadPanel({
   }, [active]);
 
   useEffect(() => {
+    saveRecentUploads(sessionStorageOrNull(), userSubject, recentUploads);
+  }, [recentUploads, userSubject]);
+
+  useEffect(() => {
     if (!file) {
       setPreviewUrl("");
       return undefined;
@@ -83,6 +165,43 @@ export default function UploadPanel({
     setPreviewUrl(objectUrl);
     return () => URL.revokeObjectURL(objectUrl);
   }, [file]);
+
+  const refreshUploadStatuses = useCallback(async (fileIds, announce = false) => {
+    if (!fileIds.length || pollInFlightRef.current) return;
+    const sourceSession = sessionKey;
+    pollInFlightRef.current = true;
+    try {
+      const results = await Promise.allSettled(fileIds.map((fileId) => getUploadStatus(fileId)));
+      if (!mountedRef.current || getActiveSession?.() !== sourceSession) return;
+      const fulfilled = results
+        .filter((result) => result.status === "fulfilled")
+        .map((result) => result.value);
+      if (fulfilled.length) {
+        setRecentUploads((current) => fulfilled.reduce(
+          (uploads, status) => mergeUploadStatus(uploads, status),
+          current,
+        ));
+      }
+      if (announce) {
+        const failures = results.length - fulfilled.length;
+        onStatus(failures
+          ? { type: "error", message: `${failures} upload status update(s) could not be loaded.` }
+          : { type: "success", message: "Recent upload status refreshed." });
+      }
+    } finally {
+      pollInFlightRef.current = false;
+    }
+  }, [getActiveSession, onStatus, sessionKey]);
+
+  useEffect(() => {
+    if (!active || !activeUploadIdsKey) return undefined;
+    const ids = activeUploadIdsKey.split("|");
+    void refreshUploadStatuses(ids);
+    const intervalId = globalThis.setInterval(() => {
+      void refreshUploadStatuses(ids);
+    }, 5000);
+    return () => globalThis.clearInterval(intervalId);
+  }, [active, activeUploadIdsKey, refreshUploadStatuses]);
 
   async function submit(event) {
     event.preventDefault();
@@ -104,7 +223,16 @@ export default function UploadPanel({
         },
       });
       if (!canCommit()) return;
-      setUploadState((current) => completeUpload(current, { file_id: result.file_id, checksum: result.checksum, filename: file.name }));
+      const uploadReceipt = {
+        file_id: result.file_id,
+        checksum: result.checksum,
+        filename: file.name,
+        file_type: file.type.startsWith("video/") ? "video" : "image",
+        status: "pending_upload",
+        upload_time: new Date().toISOString(),
+      };
+      setUploadState((current) => completeUpload(current, uploadReceipt));
+      setRecentUploads((current) => rememberRecentUpload(current, uploadReceipt));
       onStatus({ type: "success", message: "Upload accepted. Processing has been queued." });
     } catch (error) {
       if (!canCommit()) return;
@@ -185,7 +313,7 @@ export default function UploadPanel({
               </li>
             ))}
           </ol>
-          <p className="upload-stage" role="status">{STAGE_COPY[stage]}</p>
+          <p className="upload-stage" role="status">{processingMessage(stage, receiptUpload)}</p>
         </>
       )}
       {duplicateCard && (
@@ -247,21 +375,45 @@ export default function UploadPanel({
       )}
       {receipt && (
         <>
-          <dl className="upload-receipt">
-            <div><dt>Filename</dt><dd>{receipt.filename}</dd></div>
-            <div><dt>File ID</dt><dd>{receipt.file_id}</dd></div>
-            <div><dt>Checksum</dt><dd>{receipt.checksum?.slice(0, 12)}…</dd></div>
-            <div><dt>Status</dt><dd>Processing queued</dd></div>
-          </dl>
           <p className="receipt-guidance">
-            Processing runs automatically. Find the record in Explore once it completes, or
-            subscribe to a species in Notifications.
+            Processing status updates automatically. This upload remains in Recent uploads if
+            you refresh this page.
           </p>
           <div className="btn-row">
             <button type="button" className="btn btn-secondary" onClick={() => onNavigate("explore")}>Go to Explore</button>
             <button type="button" className="btn btn-quiet" onClick={() => onNavigate("notifications")}>Open Notifications</button>
           </div>
         </>
+      )}
+      {recentUploads.length > 0 && (
+        <section className="recent-uploads" aria-labelledby="recent-uploads-heading">
+          <div className="recent-uploads-title">
+            <div>
+              <p className="eyebrow">This browser session</p>
+              <h2 id="recent-uploads-heading">Recent uploads</h2>
+            </div>
+            <button
+              type="button"
+              className="btn btn-quiet"
+              disabled={!activeUploadIds.length || pollInFlightRef.current}
+              onClick={() => refreshUploadStatuses(activeUploadIds, true)}
+            >
+              Refresh status
+            </button>
+          </div>
+          <p className="recent-uploads-guidance">
+            Pending records are checked every five seconds while this page is open.
+          </p>
+          <div className="recent-upload-list">
+            {recentUploads.map((upload) => (
+              <RecentUploadCard
+                key={upload.file_id}
+                upload={upload}
+                onExploreSpecies={onExploreSpecies}
+              />
+            ))}
+          </div>
+        </section>
       )}
     </section>
   );

@@ -21,7 +21,7 @@ import {
   settleQueryFailure,
   settleQuerySuccess,
 } from "./lib/queryDescriptor.mjs";
-import { authRouteForPath } from "./lib/appRoutes.mjs";
+import { authRouteForPath, viewForHash, viewUrl } from "./lib/appRoutes.mjs";
 import { advanceSessionIdentity, navigateToView, projectSessionViewState, queryStatusAfterDeletion, resetSessionViewState, setStatusForView, statusForView } from "./lib/viewState.mjs";
 import useAuthSession from "./hooks/useAuthSession";
 
@@ -35,7 +35,7 @@ const VIEW_TITLES = {
 };
 
 export default function App() {
-  const [activeView, setActiveView] = useState("home");
+  const [activeView, setActiveView] = useState(() => viewForHash(window.location.hash));
   const [statuses, setStatuses] = useState({});
   const [query, setQuery] = useState(EMPTY_QUERY);
   const [queryState, setQueryState] = useState("idle");
@@ -95,6 +95,13 @@ export default function App() {
   const navigate = useCallback((view) => {
     navigateToView(view, {
       setActiveView,
+      writeRoute: (nextView) => {
+        const nextUrl = viewUrl(window.location, nextView);
+        const currentUrl = `${window.location.pathname}${window.location.search}${window.location.hash}`;
+        if (nextUrl !== currentUrl) {
+          window.history.pushState({}, document.title, nextUrl);
+        }
+      },
       scrollTo: window.scrollTo.bind(window),
     });
     window.requestAnimationFrame(() => mainRef.current?.focus({ preventScroll: true }));
@@ -116,6 +123,18 @@ export default function App() {
   }, [visibleActiveView]);
 
   useEffect(() => {
+    const syncViewFromLocation = () => {
+      setActiveView(viewForHash(window.location.hash));
+    };
+    window.addEventListener("popstate", syncViewFromLocation);
+    window.addEventListener("hashchange", syncViewFromLocation);
+    return () => {
+      window.removeEventListener("popstate", syncViewFromLocation);
+      window.removeEventListener("hashchange", syncViewFromLocation);
+    };
+  }, []);
+
+  useEffect(() => {
     if (authRoute === "logout") {
       window.history.replaceState({}, document.title, appConfig.homePath);
     }
@@ -127,6 +146,11 @@ export default function App() {
       const sessionView = resetSessionViewState();
       queryLifecycle.current = beginQuery(queryLifecycle.current);
       setActiveView(sessionView.activeView);
+      window.history.replaceState(
+        {},
+        document.title,
+        viewUrl(window.location, sessionView.activeView),
+      );
       setStatuses(sessionView.statuses);
       setQuery(EMPTY_QUERY);
       setSelectedFileIds([]);
@@ -265,6 +289,7 @@ export default function App() {
             <UploadPanel
               key={sessionKey}
               active={visibleActiveView === "upload"}
+              userSubject={subject}
               sessionKey={sessionKey}
               getActiveSession={() => activeSession.current}
               onStatus={(status) => setUploadStatus(sessionKey, status)}

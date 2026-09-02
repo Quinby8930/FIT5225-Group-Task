@@ -495,6 +495,7 @@ input[type="checkbox"] { min-height: 0; width: 17px; height: 17px; accent-color:
 
 /* ---------- Species spotlights ---------- */
 
+.explore-view { margin-inline: auto; max-width: 1600px; min-width: 0; width: 100%; }
 .explore-idle { display: grid; gap: 28px; }
 .species-spotlights { background: var(--panel); border: 1px solid var(--hair); padding: 22px; }
 .spotlight-heading { align-items: end; display: flex; gap: 24px; justify-content: space-between; margin-bottom: 18px; }
@@ -760,6 +761,31 @@ input[type="checkbox"] { min-height: 0; width: 17px; height: 17px; accent-color:
 .duplicate-tags { border-top: 1px solid var(--hair); margin-top: 18px; padding-top: 14px; }
 .duplicate-tags ul { display: flex; flex-wrap: wrap; gap: 8px; list-style: none; margin: 8px 0 14px; padding: 0; }
 .duplicate-tags li { background: var(--paper); border: 1px solid var(--hair); padding: 6px 10px; }
+
+.recent-uploads {
+  border-top: 1px solid var(--hair);
+  margin-top: 28px;
+  padding-top: 22px;
+}
+.recent-uploads-title { align-items: end; display: flex; gap: 20px; justify-content: space-between; }
+.recent-uploads-title h2 { font-family: var(--serif); font-size: 1.45rem; font-weight: 400; }
+.recent-uploads-guidance { color: var(--ink2); font-size: 0.82rem; margin: 8px 0 14px; }
+.recent-upload-list { display: grid; gap: 12px; grid-template-columns: repeat(2, minmax(0, 1fr)); }
+.recent-upload-card { border: 1px solid var(--hair); min-width: 0; padding: 15px; }
+.recent-upload-heading { align-items: start; display: flex; gap: 12px; justify-content: space-between; }
+.recent-upload-heading > div { display: grid; gap: 5px; min-width: 0; }
+.recent-upload-heading code { color: var(--ink2); overflow-wrap: anywhere; }
+.upload-status { border: 1px solid var(--hair); flex: none; font-size: 0.72rem; font-weight: 700; padding: 5px 8px; }
+.upload-status.status-completed { border-color: var(--pine); color: var(--pine); }
+.upload-status.status-failed { border-color: var(--danger); color: var(--danger); }
+.upload-status.status-processing { border-color: var(--amber); color: var(--amber); }
+.recent-upload-details { border-top: 1px solid var(--hair); margin-top: 13px; padding-top: 10px; }
+.recent-upload-details h3, .recent-upload-model { font-size: 0.75rem; }
+.recent-upload-details ul { list-style: none; margin: 6px 0 0; padding: 0; }
+.recent-upload-details li { color: var(--ink2); font-size: 0.82rem; }
+.recent-upload-model { margin: 10px 0 0; }
+.recent-upload-failure { color: var(--danger); margin: 12px 0 0; }
+.recent-upload-card .btn-row { border-top: 1px solid var(--hair); margin-top: 12px; padding-top: 12px; }
 
 /* ---------- Manage ---------- */
 
@@ -1078,6 +1104,7 @@ dialog p { color: var(--ink2); margin-bottom: 22px; }
   .section { grid-template-columns: 1fr; gap: 10px; }
   .explore-controls { grid-template-columns: 1fr; }
   .metadata-grid, .upload-receipt { grid-template-columns: 1fr; }
+  .recent-upload-list { grid-template-columns: 1fr; }
   .spotlight-heading { align-items: start; flex-direction: column; gap: 8px; }
   .spotlight-heading > p { max-width: none; text-align: left; }
   .spotlight-grid { grid-template-columns: 1fr; }

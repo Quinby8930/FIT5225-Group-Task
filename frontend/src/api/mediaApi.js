@@ -83,6 +83,10 @@ export function requestAssetUrls(keys) {
   });
 }
 
+export function getUploadStatus(fileId) {
+  return apiRequest(`/uploads/${encodeURIComponent(fileId)}`);
+}
+
 export function queryByTags(tags) {
   return apiRequest("/query/by-tags", {
     method: "POST",

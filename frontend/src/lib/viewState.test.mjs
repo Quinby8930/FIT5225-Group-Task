@@ -34,6 +34,23 @@ test("navigates internal views from the top of the document", async () => {
   ]);
 });
 
+test("navigation writes the selected view route before restoring the viewport", async () => {
+  const { navigateToView } = await import("./viewState.mjs");
+  const effects = [];
+
+  navigateToView("notifications", {
+    setActiveView: (view) => effects.push(["view", view]),
+    writeRoute: (view) => effects.push(["route", view]),
+    scrollTo: () => effects.push(["scroll"]),
+  });
+
+  assert.deepEqual(effects, [
+    ["route", "notifications"],
+    ["view", "notifications"],
+    ["scroll"],
+  ]);
+});
+
 test("reconciles the Explore status after deleting items from its result set", async () => {
   const { queryStatusAfterDeletion } = await import("./viewState.mjs");
   assert.deepEqual(queryStatusAfterDeletion(2), {

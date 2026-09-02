@@ -408,6 +408,126 @@ def client(tmp_path):
 
 
 class TestEndpoints:
+    def test_upload_status_returns_safe_owner_processing_and_completed_metadata(
+        self, client
+    ):
+        uploaded_at = datetime(2026, 9, 2, 6, 8, 38, tzinfo=timezone.utc)
+        client.repo.add(
+            FileRecord(
+                file_id="upload-processing",
+                user_id="u1",
+                file_type="image",
+                object_key="originals/u1/upload-processing/cassowary.jpg",
+                filename="cassowary.jpg",
+                content_type="image/jpeg",
+                size_bytes=425_000,
+                checksum="sha256:upload-processing",
+                status="processing",
+                upload_time=uploaded_at,
+            )
+        )
+        client.repo.add(
+            FileRecord(
+                file_id="upload-completed",
+                user_id="u1",
+                file_type="image",
+                object_key="originals/u1/upload-completed/boar.jpg",
+                thumbnail_key="thumbnails/u1/upload-completed/thumbnail.jpg",
+                filename="boar.jpg",
+                content_type="image/jpeg",
+                size_bytes=396_000,
+                checksum="sha256:upload-completed",
+                status="completed",
+                tags={"boar": 1},
+                detections=[
+                    {
+                        "species": "boar",
+                        "confidence": 0.991,
+                        "bbox": [0.1, 0.2, 0.3, 0.4],
+                    }
+                ],
+                model_version="v1",
+                upload_time=uploaded_at,
+            )
+        )
+
+        processing = client.get("/uploads/upload-processing")
+        completed = client.get("/uploads/upload-completed")
+
+        assert processing.status_code == 200
+        assert processing.json() == {
+            "file_id": "upload-processing",
+            "filename": "cassowary.jpg",
+            "file_type": "image",
+            "status": "processing",
+            "tags": {},
+            "detections": [],
+            "model_version": "",
+            "error_code": None,
+            "message": None,
+            "upload_time": "2026-09-02T06:08:38Z",
+        }
+        assert completed.status_code == 200
+        assert completed.json() == {
+            "file_id": "upload-completed",
+            "filename": "boar.jpg",
+            "file_type": "image",
+            "status": "completed",
+            "tags": {"boar": 1},
+            "detections": [{"species": "boar", "confidence": 0.991}],
+            "model_version": "v1",
+            "error_code": None,
+            "message": None,
+            "upload_time": "2026-09-02T06:08:38Z",
+        }
+        assert not {
+            "user_id",
+            "object_key",
+            "thumbnail_key",
+            "checksum",
+            "processing_lease_token",
+        }.intersection(completed.json())
+
+    def test_upload_status_hides_other_users_and_missing_ids_identically(self, client):
+        other_user = client.get("/uploads/f4")
+        missing = client.get("/uploads/not-present")
+
+        assert other_user.status_code == 404
+        assert missing.status_code == 404
+        assert other_user.json() == missing.json() == {
+            "detail": {
+                "code": "UPLOAD_NOT_FOUND",
+                "message": "upload not found",
+            }
+        }
+
+    def test_upload_status_exposes_only_bounded_owner_failure_summary(self, client):
+        client.repo.add(
+            FileRecord(
+                file_id="upload-failed",
+                user_id="u1",
+                file_type="video",
+                object_key="originals/u1/upload-failed/video.mp4",
+                filename="video.mp4",
+                content_type="video/mp4",
+                size_bytes=10,
+                checksum="sha256:upload-failed",
+                status="failed",
+                error_code="INFERENCE_UNAVAILABLE",
+                message="Processing could not reach the inference service.",
+            )
+        )
+
+        response = client.get("/uploads/upload-failed")
+
+        assert response.status_code == 200
+        payload = response.json()
+        assert payload["status"] == "failed"
+        assert payload["error_code"] == "INFERENCE_UNAVAILABLE"
+        assert payload["message"] == "Processing could not reach the inference service."
+        assert payload["tags"] == {}
+        assert payload["detections"] == []
+
     def test_query_returns_current_tags_original_ai_result_and_version(self, client):
         client.repo._conn.execute(
             "UPDATE files SET tags_json=?, detections_json=?, model_version=? "

@@ -10,13 +10,16 @@ from __future__ import annotations
 from decimal import Decimal
 import math
 
-from app.schemas import FileRecord, QueryResultItem
+from app.schemas import FileRecord, QueryResultItem, UploadStatusResponse
 
 
 MAX_PUBLIC_TAGS = 64
 MAX_PUBLIC_DETECTIONS = 1000
 MAX_PUBLIC_LABEL_BYTES = 128
 MAX_PUBLIC_MODEL_VERSION_BYTES = 128
+MAX_PUBLIC_FILENAME_BYTES = 255
+MAX_PUBLIC_ERROR_CODE_BYTES = 128
+MAX_PUBLIC_FAILURE_MESSAGE_BYTES = 240
 
 
 def _fits_utf8(value: str, maximum_bytes: int) -> bool:
@@ -95,6 +98,19 @@ def _safe_model_version(value: object) -> str:
     return version
 
 
+def _safe_text(value: object, maximum_bytes: int) -> str:
+    if not isinstance(value, str):
+        return ""
+    text = value.strip()
+    if (
+        not text
+        or not _fits_utf8(text, maximum_bytes)
+        or any(ord(character) < 0x20 or ord(character) == 0x7F for character in text)
+    ):
+        return ""
+    return text
+
+
 def filter_by_min_counts(
     records: list[FileRecord], min_counts: dict[str, int]
 ) -> list[FileRecord]:
@@ -162,3 +178,29 @@ def to_query_items(
         )
         for record in records
     ]
+
+
+def to_upload_status(record: FileRecord) -> UploadStatusResponse:
+    """Project one owner-authorized record into the upload progress contract."""
+    completed = record.status == "completed"
+    failed = record.status == "failed"
+    return UploadStatusResponse(
+        file_id=record.file_id,
+        filename=_safe_text(record.filename, MAX_PUBLIC_FILENAME_BYTES),
+        file_type=record.file_type,
+        status=record.status,
+        tags=_safe_tags(record.tags) if completed else {},
+        detections=_safe_detections(record.detections) if completed else [],
+        model_version=_safe_model_version(record.model_version) if completed else "",
+        error_code=(
+            _safe_text(record.error_code, MAX_PUBLIC_ERROR_CODE_BYTES) or None
+            if failed
+            else None
+        ),
+        message=(
+            _safe_text(record.message, MAX_PUBLIC_FAILURE_MESSAGE_BYTES) or None
+            if failed
+            else None
+        ),
+        upload_time=record.upload_time,
+    )

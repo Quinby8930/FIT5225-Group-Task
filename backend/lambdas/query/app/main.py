@@ -3,6 +3,7 @@
 Endpoints
 ---------
 Public (Member E frontend, Cognito-protected):
+  GET  /uploads/{file_id}    read owner-only upload processing status
   POST /query/by-tags        find files by tags with minimum counts (AND)
   POST /query/by-species     find files containing a species
   GET  /query/by-thumbnail   map a thumbnail key -> full-size object key
@@ -71,6 +72,7 @@ from app.schemas import (
     SubscriptionListResponse,
     TagEditRequest,
     TagQueryRequest,
+    UploadStatusResponse,
     utcnow,
 )
 from app.notification_client import (
@@ -90,6 +92,7 @@ from app.services.query_service import (
     filter_by_species,
     to_display_keys,
     to_query_items,
+    to_upload_status,
 )
 from app.services.media_reference_service import (
     MediaReferenceError,
@@ -466,6 +469,24 @@ def _ensure_notification_inbox(
 @app.get("/auth-test")
 def auth_test(user_id: str = Depends(get_current_user)) -> dict:
     return {"authenticated": True, "user_id": user_id}
+
+
+@app.get("/uploads/{file_id}", response_model=UploadStatusResponse)
+def upload_status(
+    file_id: str,
+    repo_: FileRepository = Depends(get_repo),
+    _user: str = Depends(get_current_user),
+) -> UploadStatusResponse:
+    record = repo_.get(file_id)
+    if record is None or record.user_id != _user:
+        raise HTTPException(
+            status_code=404,
+            detail={
+                "code": "UPLOAD_NOT_FOUND",
+                "message": "upload not found",
+            },
+        )
+    return to_upload_status(record)
 
 
 # ---------------------------------------------------------------------------

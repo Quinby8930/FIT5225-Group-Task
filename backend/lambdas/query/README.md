@@ -44,6 +44,7 @@ Public (Cognito-protected, called by the frontend):
 
 | Method | Path | Purpose |
 |--------|------|---------|
+| GET | `/uploads/{file_id}` | Return owner-only upload processing status and safe ML result fields |
 | POST | `/query/by-tags` | Find completed files by tags with minimum counts (AND) |
 | POST | `/query/by-species` | Find completed files containing a species |
 | GET  | `/query/by-thumbnail?key=...` | Map thumbnail key or trusted S3 HTTPS URL -> full-size object key plus structured `item` metadata |

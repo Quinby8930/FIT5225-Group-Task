@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import { ApiError, apiRequest, isDuplicateFileError } from "./apiClient.js";
+import { getUploadStatus } from "./mediaApi.js";
 import * as cognitoConfig from "../auth/cognitoConfig.js";
 
 function storage() {
@@ -144,4 +145,23 @@ test("default API requests use the complete dev-stage cloud URL", async () => {
     requestedUrl,
     "https://2dd2aqb32j.execute-api.ap-southeast-2.amazonaws.com/dev/stage-contract"
   );
+});
+
+test("recent upload status requests encode the owner-scoped file id", async () => {
+  installStorage();
+  let requestedUrl = null;
+  let requestedMethod = null;
+  globalThis.fetch = async (url, options) => {
+    requestedUrl = String(url);
+    requestedMethod = options.method || "GET";
+    return new Response(JSON.stringify({ file_id: "file/one" }), { status: 200 });
+  };
+
+  await getUploadStatus("file/one");
+
+  assert.equal(
+    requestedUrl,
+    "https://2dd2aqb32j.execute-api.ap-southeast-2.amazonaws.com/dev/uploads/file%2Fone"
+  );
+  assert.equal(requestedMethod, "GET");
 });

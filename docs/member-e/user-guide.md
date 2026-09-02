@@ -25,7 +25,9 @@ npm run dev
 
 1. Create an account or sign in through Cognito Hosted UI.
 2. Upload an image or video. The UI computes a SHA-256 checksum, requests
-   `POST /upload-url`, and uploads to the returned pre-signed URL.
+   `POST /upload-url`, and uploads to the returned pre-signed URL. Recent
+   uploads remain visible for the signed-in user after a same-session refresh;
+   pending processing status refreshes automatically until completion/failure.
 3. Query by tag counts, for example `dingo:1, wombat:1`.
    The UI exchanges server-approved completed-media keys through authenticated
    `POST /asset-urls` calls so private thumbnails can be previewed without
@@ -39,6 +41,9 @@ npm run dev
 8. Delete selected result keys.
 9. Subscribe to a species tag and refresh the inbox after a matching file
    completes processing.
+
+Workspace navigation uses GitHub Pages-safe hash URLs such as `#/explore`,
+`#/upload`, and `#/manage`, so refreshing a workspace view preserves it.
 
 ## Evidence Checklist
 

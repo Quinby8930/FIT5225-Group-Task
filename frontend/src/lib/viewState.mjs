@@ -22,8 +22,16 @@ export function projectSessionViewState(ownerSession, activeSession, state) {
   };
 }
 
-export function navigateToView(view, { setActiveView, scrollTo = globalThis.scrollTo } = {}) {
+export function navigateToView(
+  view,
+  {
+    setActiveView,
+    writeRoute,
+    scrollTo = globalThis.scrollTo,
+  } = {},
+) {
   if (typeof setActiveView !== "function") return;
+  if (typeof writeRoute === "function") writeRoute(view);
   setActiveView(view);
   if (typeof scrollTo === "function") {
     scrollTo({ top: 0, left: 0, behavior: "auto" });

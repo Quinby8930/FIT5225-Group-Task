@@ -47,6 +47,7 @@ def _properties(template, resource):
 
 PUBLIC_ROUTES = {
     "GET /auth-test",
+    "GET /uploads/{file_id}",
     "POST /query/by-tags",
     "POST /query/by-species",
     "GET /query/by-thumbnail",
@@ -67,6 +68,7 @@ INTERNAL_ROUTES = {
 }
 OPTIONS_ROUTES = {
     "OPTIONS /auth-test",
+    "OPTIONS /uploads/{file_id}",
     "OPTIONS /query/by-tags",
     "OPTIONS /query/by-species",
     "OPTIONS /query/by-thumbnail",

@@ -209,6 +209,12 @@ Base URL：本地 `http://localhost:8000`；云端是成员 A 提供的 API Gate
 `{"detail":{"code":"FORBIDDEN_OWNER","message":"media is not owned by the authenticated user"}}`；
 内部保留元数据冲突返回 `409` 且 `detail.code` 为 `METADATA_CONFLICT`。
 
+### 5.0 最近上传状态（owner only）
+
+`GET /uploads/{file_id}` 只向记录 owner 返回处理状态。缺失记录与其他用户记录返回完全
+相同的 `404 UPLOAD_NOT_FOUND`。响应仅包含安全的文件标识、文件名/类型、状态、上传时间，
+以及终态的标签、AI 结果、模型版本或失败摘要；不返回 owner、checksum、S3 key 或处理租约。
+
 **路由对齐**（成员 A 文档里的简称 → 我们的完整路径）：
 
 | 成员 A 文档写法 | 我们的实际路径 | 说明 |

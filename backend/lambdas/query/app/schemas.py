@@ -114,6 +114,23 @@ class QueryResponse(BaseModel):
     items: list[QueryResultItem] = Field(default_factory=list)
 
 
+class UploadStatusResponse(BaseModel):
+    """Owner-only processing state for a recently uploaded archive item."""
+
+    model_config = {"protected_namespaces": ()}
+
+    file_id: str
+    filename: str
+    file_type: Literal["image", "video"]
+    status: FileStatus
+    tags: dict[str, int] = Field(default_factory=dict)
+    detections: list[dict] = Field(default_factory=list)
+    model_version: str = ""
+    error_code: Optional[str] = None
+    message: Optional[str] = None
+    upload_time: datetime
+
+
 # ---------------------------------------------------------------------------
 # Subscription & notification (Member D owns data, trigger, and SNS publisher;
 # Member E owns the frontend/in-app UX on top of these endpoints)
