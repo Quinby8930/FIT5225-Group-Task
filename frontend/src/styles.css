@@ -616,6 +616,7 @@ input[type="checkbox"] { min-height: 0; width: 17px; height: 17px; accent-color:
 .overlay-note { color: var(--ink2); font-size: 0.85rem; margin: 0; }
 
 .media-wall {
+  align-items: start;
   display: grid;
   gap: 16px;
   grid-template-columns: repeat(auto-fill, minmax(232px, 1fr));
