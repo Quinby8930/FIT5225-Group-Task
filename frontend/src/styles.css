@@ -535,7 +535,7 @@ input[type="checkbox"] { min-height: 0; width: 17px; height: 17px; accent-color:
 .advanced-lookup form { margin-top: 4px; }
 .advanced-lookup .field-help { color: var(--ink2); font-size: 0.82rem; margin: -8px 0 0; }
 
-.results-panel { min-height: 320px; }
+.results-panel { min-height: 320px; min-width: 0; }
 
 .results-head {
   align-items: center;
@@ -596,7 +596,7 @@ input[type="checkbox"] { min-height: 0; width: 17px; height: 17px; accent-color:
 .explore-intro b { color: var(--ink); }
 .privacy-note { border-top: 1px solid var(--hair); font-size: 0.78rem; margin: 0; padding-top: 12px; }
 
-.wall-wrap { position: relative; }
+.wall-wrap { min-width: 0; position: relative; }
 
 .wall-overlay {
   align-items: center;
@@ -620,6 +620,7 @@ input[type="checkbox"] { min-height: 0; width: 17px; height: 17px; accent-color:
   display: grid;
   gap: 16px;
   grid-template-columns: repeat(auto-fill, minmax(232px, 1fr));
+  min-width: 0;
 }
 
 .media-card {
@@ -656,7 +657,7 @@ input[type="checkbox"] { min-height: 0; width: 17px; height: 17px; accent-color:
   width: 100%;
 }
 
-.media-card-body { display: grid; gap: 10px; padding: 14px 16px 16px; }
+.media-card-body { display: grid; gap: 10px; min-width: 0; padding: 14px 16px 16px; }
 
 .media-card-heading { align-items: center; display: flex; justify-content: space-between; }
 .media-card-heading strong {
@@ -678,8 +679,9 @@ input[type="checkbox"] { min-height: 0; width: 17px; height: 17px; accent-color:
 
 .media-card details { font-size: 0.82rem; }
 .media-card details summary { color: var(--pine); cursor: pointer; font-weight: 600; min-height: 32px; padding: 6px 0; }
-.media-card details code { margin-top: 6px; }
-.media-technical-details section { border-top: 1px solid var(--hair); margin-top: 8px; padding-top: 10px; }
+.media-card details code { margin-top: 6px; max-width: 100%; overflow-wrap: anywhere; word-break: break-all; }
+.media-technical-details { max-width: 100%; min-width: 0; }
+.media-technical-details section { border-top: 1px solid var(--hair); margin-top: 8px; min-width: 0; padding-top: 10px; }
 .media-technical-details h3 { color: var(--ink2); font-size: 0.72rem; margin: 0 0 6px; }
 .media-technical-details ul { display: grid; gap: 4px; list-style: none; margin: 0; padding: 0; }
 .media-technical-details p { margin: 10px 0 0; }
