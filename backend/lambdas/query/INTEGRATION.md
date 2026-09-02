@@ -228,10 +228,12 @@ POST /query/by-tags
 ```
 
 响应保留 `results/count`（图片给缩略图 key，视频给原图 key），并新增不含
-owner ID 的 `items`。只有 `status=completed` 的归档记录会出现在查询结果中：
+owner ID、checksum 或 filename 的 `items`。`tags` 是当前可人工修正的归档标签；
+`detections` 只保留原始 AI `species/confidence`，`model_version` 标识推理版本。
+异常或旧版 ML 字段会安全退化为空值。只有 `status=completed` 的记录会出现：
 
 ```json
-{"results":["thumbnails/u1/a1.jpg","originals/u1/v1.mp4"],"count":2,"items":[{"file_id":"f1","file_type":"image","display_key":"thumbnails/u1/a1.jpg","original_key":"originals/u1/a1.jpg","thumbnail_key":"thumbnails/u1/a1.jpg","can_preview":true,"can_manage":true}]}
+{"results":["thumbnails/u1/a1.jpg","originals/u1/v1.mp4"],"count":2,"items":[{"file_id":"f1","file_type":"image","display_key":"thumbnails/u1/a1.jpg","original_key":"originals/u1/a1.jpg","thumbnail_key":"thumbnails/u1/a1.jpg","can_preview":true,"can_manage":true,"tags":{"rat":1},"detections":[{"species":"cat","confidence":0.677265}],"model_version":"v1"}]}
 ```
 
 ### 5.2 按物种查询（≥1 只）
@@ -252,7 +254,7 @@ GET /query/by-thumbnail?key=thumbnails%2Fu1%2Fa1.jpg
 `key` 也可为 `QUERY_INPUT_BUCKET` 的 trusted HTTPS/presigned URL；服务会只解析并
 规范化为 key，不会抓取或记录 URL。非法引用返回 `422 INVALID_MEDIA_REFERENCE`，未找到
 缩略图返回 `404 THUMBNAIL_NOT_FOUND`。成功响应保留 `original_key` 与 `file_id`，并新增完整的安全 `item`（字段同查询 `items`，供前端预览/管理）：
-`{"original_key":"originals/u1/a1.jpg","file_id":"f1","item":{"file_id":"f1","file_type":"image","display_key":"thumbnails/u1/a1.jpg","original_key":"originals/u1/a1.jpg","thumbnail_key":"thumbnails/u1/a1.jpg","can_preview":true,"can_manage":true}}`
+`{"original_key":"originals/u1/a1.jpg","file_id":"f1","item":{"file_id":"f1","file_type":"image","display_key":"thumbnails/u1/a1.jpg","original_key":"originals/u1/a1.jpg","thumbnail_key":"thumbnails/u1/a1.jpg","can_preview":true,"can_manage":true,"tags":{"rat":1},"detections":[{"species":"cat","confidence":0.677265}],"model_version":"v1"}}`
 
 ### 5.4 按上传文件查询（不落库）
 

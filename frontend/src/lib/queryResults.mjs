@@ -1,7 +1,54 @@
 const MEDIA_TYPES = new Set(["image", "video"]);
+const MAX_PUBLIC_TAGS = 64;
+const MAX_PUBLIC_DETECTIONS = 1000;
+const MAX_PUBLIC_TEXT_LENGTH = 128;
+const AI_NOTICE = "AI-generated result; it may be incorrect. Archive tags can be corrected by the owner.";
 
 function nonEmptyString(value) {
   return typeof value === "string" && value.trim() ? value : null;
+}
+
+function safePublicText(value) {
+  const text = nonEmptyString(value)?.trim();
+  if (
+    !text
+    || text.length > MAX_PUBLIC_TEXT_LENGTH
+    || [...text].some((character) => {
+      const code = character.codePointAt(0);
+      return code < 0x20 || code === 0x7f;
+    })
+  ) return null;
+  return text;
+}
+
+function safeTags(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return {};
+  const entries = Object.entries(value);
+  if (entries.length > MAX_PUBLIC_TAGS) return {};
+  return Object.fromEntries(entries
+    .filter(([species, count]) => (
+      safePublicText(species) === species
+      && Number.isSafeInteger(count)
+      && count > 0
+    ))
+    .sort(([left], [right]) => left.localeCompare(right)));
+}
+
+function safeDetections(value) {
+  if (!Array.isArray(value) || value.length > MAX_PUBLIC_DETECTIONS) return [];
+  return value.flatMap((detection) => {
+    if (!detection || typeof detection !== "object" || Array.isArray(detection)) return [];
+    const species = safePublicText(detection.species);
+    const confidence = detection.confidence;
+    if (
+      !species
+      || typeof confidence !== "number"
+      || !Number.isFinite(confidence)
+      || confidence < 0
+      || confidence > 1
+    ) return [];
+    return [{ species, confidence }];
+  });
 }
 
 function structuredItem(value) {
@@ -21,12 +68,38 @@ function structuredItem(value) {
     thumbnail_key: nonEmptyString(value.thumbnail_key),
     can_preview: value.can_preview === true,
     can_manage: value.can_manage === true,
+    tags: safeTags(value.tags),
+    detections: safeDetections(value.detections),
+    model_version: safePublicText(value.model_version) || "",
     legacy: false,
   };
 }
 
 export function canRenderRawMediaKey(item) {
   return item?.can_manage === true;
+}
+
+export function mediaTechnicalDetails(item) {
+  const tagRows = Object.entries(safeTags(item?.tags)).map(([species, count]) => ({
+    species,
+    count,
+    label: `${species} × ${count}`,
+  }));
+  const detectionRows = safeDetections(item?.detections).map(({ species, confidence }) => ({
+    species,
+    confidence,
+    label: `${species} — model score ${(confidence * 100).toFixed(2)}%`,
+  }));
+  const modelVersion = safePublicText(item?.model_version);
+  const hasAiDetails = detectionRows.length > 0 || modelVersion !== null;
+  return {
+    tagRows,
+    detectionRows,
+    modelVersion,
+    notice: hasAiDetails ? AI_NOTICE : null,
+    hasDetails: tagRows.length > 0 || hasAiDetails,
+    hasAiDetails,
+  };
 }
 
 export function legacyReferenceLabel(index) {
@@ -56,6 +129,9 @@ export function normalizeQueryResponse(data) {
         thumbnail_key: null,
         can_preview: false,
         can_manage: false,
+        tags: {},
+        detections: [],
+        model_version: "",
         legacy: true,
       }];
     });

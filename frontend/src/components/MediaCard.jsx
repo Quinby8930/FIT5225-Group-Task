@@ -1,6 +1,6 @@
 import { canOpenFullImage, canOpenPreview, canRenderInlinePreview, previewStatusSemantics } from "../lib/mediaActions.mjs";
 import { usableAssetUrl } from "../lib/assetUrls.mjs";
-import { canRenderRawMediaKey } from "../lib/queryResults.mjs";
+import { canRenderRawMediaKey, mediaTechnicalDetails } from "../lib/queryResults.mjs";
 
 function previewMessage(state) {
   const messages = {
@@ -25,6 +25,8 @@ export default function MediaCard({ item, assetStates, selected, onToggle, onOpe
   const url = canRenderPreview ? usableAssetUrl(state) : null;
   const shortId = item.file_id.slice(0, 8);
   const canOpenOriginal = canOpenFullImage(item);
+  const canShowRawKey = canRenderRawMediaKey(item);
+  const technical = mediaTechnicalDetails(item);
 
   return (
     <article className="media-card">
@@ -96,10 +98,39 @@ export default function MediaCard({ item, assetStates, selected, onToggle, onOpe
             </button>
           )}
         </div>
-        {canRenderRawMediaKey(item) && (
-          <details>
+        {(technical.hasDetails || canShowRawKey) && (
+          <details className="media-technical-details">
             <summary>Technical details</summary>
-            <code>{item.display_key}</code>
+            {technical.tagRows.length > 0 && (
+              <section>
+                <h3>Current archive tags</h3>
+                <ul>
+                  {technical.tagRows.map(({ species, label }) => (
+                    <li key={species}>{label}</li>
+                  ))}
+                </ul>
+              </section>
+            )}
+            {technical.detectionRows.length > 0 && (
+              <section>
+                <h3>Original AI detections</h3>
+                <ul>
+                  {technical.detectionRows.map(({ species, label }, index) => (
+                    <li key={`${species}:${index}`}>{label}</li>
+                  ))}
+                </ul>
+              </section>
+            )}
+            {technical.modelVersion && (
+              <p><strong>Model version</strong> {technical.modelVersion}</p>
+            )}
+            {technical.notice && <p className="ai-result-notice">{technical.notice}</p>}
+            {canShowRawKey && (
+              <section>
+                <h3>Owner storage key</h3>
+                <code>{item.display_key}</code>
+              </section>
+            )}
           </details>
         )}
       </div>

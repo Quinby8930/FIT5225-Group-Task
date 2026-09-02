@@ -29,6 +29,7 @@ from app.services.query_service import (
     filter_by_min_counts,
     filter_by_species,
     to_display_keys,
+    to_query_items,
 )
 from app.storage_client import (
     LambdaStorageClient,
@@ -60,6 +61,68 @@ def _record(fid, ftype, thumb, tags, obj=None):
 # Pure query logic
 # ---------------------------------------------------------------------------
 class TestPureLogic:
+    def test_query_item_keeps_only_safe_explainability_fields(self):
+        record = FileRecord.model_construct(
+            file_id="explainable",
+            user_id="u2",
+            file_type="image",
+            object_key="originals/u2/explainable.jpg",
+            thumbnail_key="thumbnails/u2/explainable.jpg",
+            tags={"rat": 1, "": 2, "cat": True, "zero": 0},
+            detections=[
+                {
+                    "species": "cat",
+                    "confidence": 0.677265,
+                    "bbox": [0.1, 0.2, 0.3, 0.4],
+                    "internal_class_index": 7,
+                },
+                {"species": "", "confidence": 0.9},
+                {"species": "rat", "confidence": float("nan")},
+                {"species": "wombat", "confidence": 1.1},
+                "unexpected",
+            ],
+            model_version="v1",
+            checksum="private-checksum",
+            filename="private-filename.jpg",
+            status="completed",
+        )
+
+        item = to_query_items([record], "u1")[0].model_dump()
+
+        assert item == {
+            "file_id": "explainable",
+            "file_type": "image",
+            "display_key": "thumbnails/u2/explainable.jpg",
+            "original_key": "originals/u2/explainable.jpg",
+            "thumbnail_key": "thumbnails/u2/explainable.jpg",
+            "can_preview": True,
+            "can_manage": False,
+            "tags": {"rat": 1},
+            "detections": [{"species": "cat", "confidence": 0.677265}],
+            "model_version": "v1",
+        }
+        assert not {"user_id", "checksum", "filename"}.intersection(item)
+
+    def test_query_item_degrades_malformed_legacy_ml_fields_to_empty_values(self):
+        record = FileRecord.model_construct(
+            file_id="legacy",
+            user_id="u2",
+            file_type="image",
+            object_key="originals/u2/legacy.jpg",
+            thumbnail_key=None,
+            tags={"\ud800": 1},
+            detections=[{"species": "\ud800", "confidence": 0.8}],
+            model_version="\ud800",
+            checksum="private-checksum",
+            status="completed",
+        )
+
+        item = to_query_items([record], "u1")[0]
+
+        assert item.tags == {}
+        assert item.detections == []
+        assert item.model_version == ""
+
     def test_legacy_processing_callbacks_are_disabled_by_default(self):
         assert main.Settings().allow_legacy_processing_callbacks is False
 
@@ -345,6 +408,51 @@ def client(tmp_path):
 
 
 class TestEndpoints:
+    def test_query_returns_current_tags_original_ai_result_and_version(self, client):
+        client.repo._conn.execute(
+            "UPDATE files SET tags_json=?, detections_json=?, model_version=? "
+            "WHERE file_id=?",
+            (
+                json.dumps({"rat": 1}),
+                json.dumps(
+                    [
+                        {
+                            "species": "cat",
+                            "confidence": 0.677265,
+                            "bbox": [0.1, 0.2, 0.3, 0.4],
+                        }
+                    ]
+                ),
+                "v1",
+                "f4",
+            ),
+        )
+        client.repo._conn.commit()
+
+        response = client.post("/query/by-species", json={"species": "rat"})
+
+        assert response.status_code == 200
+        assert response.json()["items"] == [
+            {
+                "file_id": "f4",
+                "file_type": "image",
+                "display_key": "thumbnails/u2/f4.jpg",
+                "original_key": "originals/u2/f4.jpg",
+                "thumbnail_key": "thumbnails/u2/f4.jpg",
+                "can_preview": True,
+                "can_manage": False,
+                "tags": {"rat": 1},
+                "detections": [{"species": "cat", "confidence": 0.677265}],
+                "model_version": "v1",
+            }
+        ]
+        assert not {
+            "user_id",
+            "owner",
+            "checksum",
+            "filename",
+        }.intersection(response.json()["items"][0])
+
     def test_by_tags_preserves_archive_wide_results_across_owners(self, client):
         r = client.post("/query/by-tags", json={"tags": {"dingo": 1}})
 
@@ -389,6 +497,9 @@ class TestEndpoints:
                 "thumbnail_key": "thumbnails/f1.jpg",
                 "can_preview": True,
                 "can_manage": True,
+                "tags": {"dingo": 2, "wombat": 1},
+                "detections": [],
+                "model_version": "",
             },
             {
                 "file_id": "f3",
@@ -398,6 +509,9 @@ class TestEndpoints:
                 "thumbnail_key": None,
                 "can_preview": True,
                 "can_manage": True,
+                "tags": {"dingo": 1, "wombat": 3},
+                "detections": [],
+                "model_version": "",
             },
             {
                 "file_id": "f4",
@@ -407,6 +521,9 @@ class TestEndpoints:
                 "thumbnail_key": "thumbnails/u2/f4.jpg",
                 "can_preview": True,
                 "can_manage": False,
+                "tags": {"dingo": 1},
+                "detections": [],
+                "model_version": "",
             },
         ]
 
@@ -431,7 +548,8 @@ class TestEndpoints:
             "file_id": "f1", "file_type": "image",
             "display_key": "thumbnails/f1.jpg", "original_key": "originals/f1",
             "thumbnail_key": "thumbnails/f1.jpg", "can_preview": True,
-            "can_manage": True,
+            "can_manage": True, "tags": {"dingo": 2, "wombat": 1},
+            "detections": [], "model_version": "",
         }
 
     def test_by_thumbnail_url_normalizes_to_key(self, client):

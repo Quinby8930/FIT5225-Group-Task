@@ -97,6 +97,9 @@ class QueryResultItem(BaseModel):
     thumbnail_key: Optional[str]
     can_preview: bool
     can_manage: bool
+    tags: dict[str, int] = Field(default_factory=dict)
+    detections: list[dict] = Field(default_factory=list)
+    model_version: str = ""
 
 
 class QueryResponse(BaseModel):

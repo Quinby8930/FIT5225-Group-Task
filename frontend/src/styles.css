@@ -678,6 +678,11 @@ input[type="checkbox"] { min-height: 0; width: 17px; height: 17px; accent-color:
 .media-card details { font-size: 0.82rem; }
 .media-card details summary { color: var(--pine); cursor: pointer; font-weight: 600; min-height: 32px; padding: 6px 0; }
 .media-card details code { margin-top: 6px; }
+.media-technical-details section { border-top: 1px solid var(--hair); margin-top: 8px; padding-top: 10px; }
+.media-technical-details h3 { color: var(--ink2); font-size: 0.72rem; margin: 0 0 6px; }
+.media-technical-details ul { display: grid; gap: 4px; list-style: none; margin: 0; padding: 0; }
+.media-technical-details p { margin: 10px 0 0; }
+.media-technical-details .ai-result-notice { color: var(--ink2); font-style: italic; line-height: 1.45; }
 
 .legacy-results { border-top: 1px solid var(--hair); margin-top: 32px; padding-top: 20px; }
 .legacy-results h3 { margin-bottom: 6px; }

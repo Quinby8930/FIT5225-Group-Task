@@ -44,6 +44,9 @@ test("normalizes structured query items with file_id identity and no inferred au
     thumbnail_key: "thumbnails/other/file-image/thumbnail.jpg",
     can_preview: true,
     can_manage: false,
+    tags: {},
+    detections: [],
+    model_version: "",
     legacy: false,
   }, {
     identity: "file-video",
@@ -54,6 +57,9 @@ test("normalizes structured query items with file_id identity and no inferred au
     thumbnail_key: null,
     can_preview: false,
     can_manage: true,
+    tags: {},
+    detections: [],
+    model_version: "",
     legacy: false,
   }]);
   assert.deepEqual(result.legacyItems, []);
@@ -90,6 +96,9 @@ test("uses safe indexed legacy fallbacks only for result keys absent from struct
     thumbnail_key: null,
     can_preview: false,
     can_manage: false,
+    tags: {},
+    detections: [],
+    model_version: "",
     legacy: true,
   }, {
     identity: "legacy:2:legacy/unknown.bin",
@@ -100,6 +109,9 @@ test("uses safe indexed legacy fallbacks only for result keys absent from struct
     thumbnail_key: null,
     can_preview: false,
     can_manage: false,
+    tags: {},
+    detections: [],
+    model_version: "",
     legacy: true,
   }]);
   assert.equal(result.items.length, 3);
@@ -137,6 +149,88 @@ test("raw media keys are displayable only with explicit management permission", 
   assert.equal(canRenderRawMediaKey({ can_manage: false }), false);
   assert.equal(canRenderRawMediaKey({ can_manage: 1 }), false);
   assert.equal(canRenderRawMediaKey(null), false);
+});
+
+test("keeps current tags and original AI detections as separate safe details", async () => {
+  const {
+    canRenderRawMediaKey,
+    mediaTechnicalDetails,
+    normalizeQueryResponse,
+  } = await loadQueryResults();
+  assert.equal(typeof mediaTechnicalDetails, "function");
+  const result = normalizeQueryResponse({
+    items: [{
+      file_id: "read-only-rat",
+      file_type: "image",
+      display_key: "thumbnails/u2/read-only-rat.jpg",
+      original_key: "originals/u2/read-only-rat.jpg",
+      thumbnail_key: "thumbnails/u2/read-only-rat.jpg",
+      can_preview: true,
+      can_manage: false,
+      tags: { rat: 1 },
+      detections: [{
+        species: "cat",
+        confidence: 0.677265,
+        bbox: [0.1, 0.2, 0.3, 0.4],
+      }],
+      model_version: "v1",
+      owner: "must-not-survive",
+      checksum: "must-not-survive",
+      filename: "must-not-survive.jpg",
+    }],
+  });
+
+  const item = result.structuredItems[0];
+  const details = mediaTechnicalDetails(item);
+
+  assert.deepEqual(details, {
+    tagRows: [{ species: "rat", count: 1, label: "rat × 1" }],
+    detectionRows: [{
+      species: "cat",
+      confidence: 0.677265,
+      label: "cat — model score 67.73%",
+    }],
+    modelVersion: "v1",
+    notice: "AI-generated result; it may be incorrect. Archive tags can be corrected by the owner.",
+    hasDetails: true,
+    hasAiDetails: true,
+  });
+  assert.equal(canRenderRawMediaKey(item), false);
+  assert.deepEqual(
+    Object.keys(item).filter((key) => ["owner", "checksum", "filename"].includes(key)),
+    [],
+  );
+});
+
+test("missing or malformed ML details degrade without undefined placeholders", async () => {
+  const { mediaTechnicalDetails, normalizeQueryResponse } = await loadQueryResults();
+  assert.equal(typeof mediaTechnicalDetails, "function");
+  const result = normalizeQueryResponse({
+    items: [{
+      file_id: "legacy",
+      file_type: "image",
+      display_key: "thumbnails/u2/legacy.jpg",
+      original_key: "originals/u2/legacy.jpg",
+      thumbnail_key: "thumbnails/u2/legacy.jpg",
+      can_preview: true,
+      can_manage: false,
+      tags: { wombat: 2, zero: 0, boolean: true },
+      detections: [{ species: "cat", confidence: Number.NaN }],
+      model_version: { unexpected: "shape" },
+    }],
+  });
+
+  const details = mediaTechnicalDetails(result.structuredItems[0]);
+
+  assert.deepEqual(details, {
+    tagRows: [{ species: "wombat", count: 2, label: "wombat × 2" }],
+    detectionRows: [],
+    modelVersion: null,
+    notice: null,
+    hasDetails: true,
+    hasAiDetails: false,
+  });
+  assert.equal(JSON.stringify(details).includes("undefined"), false);
 });
 
 test("legacy result labels do not expose the normalized storage key", async () => {
