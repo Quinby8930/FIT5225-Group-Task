@@ -5,6 +5,9 @@ const ALLOWED_CONTENT_TYPES = new Set([
   'video/mp4',
   'video/quicktime',
 ]);
+const MAX_DUPLICATE_TAGS = 64;
+const MAX_DUPLICATE_TAG_NAME_BYTES = 128;
+const MAX_DUPLICATE_TAG_COUNT = 1_000_000;
 
 export class UploadError extends Error {
   constructor(code, properties = {}) {
@@ -24,6 +27,48 @@ function isCanonicalChecksum(value) {
   if (typeof value !== 'string' || !/^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/.test(value)) return false;
   const decoded = Buffer.from(value, 'base64');
   return decoded.length === 32 && decoded.toString('base64') === value;
+}
+
+function isPlainObject(value) {
+  return value !== null
+    && typeof value === 'object'
+    && !Array.isArray(value)
+    && Object.getPrototypeOf(value) === Object.prototype;
+}
+
+export function validateDuplicateDetails(input) {
+  if (!isPlainObject(input)) throw new UploadError('DEPENDENCY_UNAVAILABLE');
+  const fields = Object.keys(input).sort();
+  if (fields.length !== 2 || fields[0] !== 'existing_file_id' || fields[1] !== 'tags') {
+    throw new UploadError('DEPENDENCY_UNAVAILABLE');
+  }
+  const fileId = input.existing_file_id;
+  if (
+    typeof fileId !== 'string'
+    || !fileId
+    || fileId !== fileId.trim()
+    || fileId.length > 256
+    || [...fileId].some((character) => character.codePointAt(0) < 0x20)
+  ) throw new UploadError('DEPENDENCY_UNAVAILABLE');
+  if (!isPlainObject(input.tags)) throw new UploadError('DEPENDENCY_UNAVAILABLE');
+  const entries = Object.entries(input.tags);
+  if (entries.length > MAX_DUPLICATE_TAGS) {
+    throw new UploadError('DEPENDENCY_UNAVAILABLE');
+  }
+  const tags = {};
+  for (const [name, count] of entries) {
+    if (
+      !name
+      || name !== name.trim()
+      || Buffer.byteLength(name, 'utf8') > MAX_DUPLICATE_TAG_NAME_BYTES
+      || [...name].some((character) => character.codePointAt(0) < 0x20)
+      || !Number.isSafeInteger(count)
+      || count <= 0
+      || count > MAX_DUPLICATE_TAG_COUNT
+    ) throw new UploadError('DEPENDENCY_UNAVAILABLE');
+    tags[name] = count;
+  }
+  return { existing_file_id: fileId, tags };
 }
 
 export function validateUploadRequest(

@@ -27,7 +27,13 @@ from decimal import Decimal
 import hashlib
 from typing import Optional
 
-from app.repository.base import DuplicateError, FileRepository, RepositoryIntegrityError
+from app.repository.base import (
+    CompletedChecksumMatch,
+    DuplicateError,
+    FileRepository,
+    RepositoryIntegrityError,
+    completed_checksum_match,
+)
 from app.schemas import FileRecord
 
 
@@ -365,6 +371,41 @@ class DynamoDBRepository(FileRepository):
             ):
                 return None
             raise
+
+    def find_completed_by_checksum(
+        self, checksum: str, *, user_id: Optional[str] = None
+    ) -> Optional[CompletedChecksumMatch]:
+        filter_expression = "checksum = :checksum AND #status = :completed"
+        values = {":checksum": checksum, ":completed": "completed"}
+        if user_id is not None:
+            filter_expression += " AND user_id = :user_id"
+            values[":user_id"] = user_id
+        items = _scan_all(
+            self._table,
+            FilterExpression=filter_expression,
+            ExpressionAttributeNames={"#status": "status"},
+            ExpressionAttributeValues=values,
+            ConsistentRead=True,
+        )
+        matches: list[CompletedChecksumMatch] = []
+        for item in items:
+            try:
+                upload_time = _dt(item.get("upload_time"))
+            except (TypeError, ValueError) as exc:
+                raise RepositoryIntegrityError(
+                    "completed duplicate metadata is invalid"
+                ) from exc
+            raw_tags = item["tags"] if "tags" in item else {}
+            matches.append(
+                completed_checksum_match(
+                    item.get("file_id"), raw_tags, upload_time
+                )
+            )
+        return min(
+            matches,
+            key=lambda match: (match.upload_time, match.file_id),
+            default=None,
+        )
 
     def _record_for_claim(
         self, claim: dict, expected_user_id: str, expected_checksum: str

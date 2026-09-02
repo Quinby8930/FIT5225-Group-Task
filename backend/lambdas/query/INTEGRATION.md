@@ -311,9 +311,16 @@ POST /internal/uploads/reserve
 - 新预约 `201` → 返回 `file_id/object_key/status/reused=false`。
 - 旧状态为 `pending_upload` / `failed` 且不可变元数据一致 → `201` 返回旧
   `file_id/object_key`、`reused=true`，供成员 B 重新 presign；failed 重置为 pending。
-- 旧状态为 `processing` / `completed` → `409` + `existing_file_id`。
+- 同用户旧状态为 `processing` → `409` + `existing_file_id/tags={}`；同用户
+  `completed`，或任意用户已有完全相同 checksum 的 `completed` 记录 → `409` +
+  `existing_file_id/tags`。对外经 Upload Lambda 后只保留
+  `code/existing_file_id/tags`。
+- 其他用户的 pending/processing/failed 不参与全局 completed 检查；多条历史
+  completed 命中时按最早 `upload_time`、再按 `file_id` 稳定选择。
 - filename/type/content-type/size 不一致 → `409 METADATA_CONFLICT`。
 - DynamoDB 用 reservation table + transaction 保证并发唯一；删除文件同时释放 claim。
+- 跨用户 completed checksum 检查复用现有 Scan 权限，是演示规模的 best-effort
+  提前阻止；不改变 reservation key，也不声称提供跨用户并发原子唯一性。
 - 对已有 FilesTable，成员 A 必须暂停所有 Files/Reservations mutation（reserve、
   processing/complete/failed 回调和 delete）并用 `migrate_reservations.py` 执行
   verify → backfill → verify；运行时强一致 fallback transaction 只是 fail-closed 保护。

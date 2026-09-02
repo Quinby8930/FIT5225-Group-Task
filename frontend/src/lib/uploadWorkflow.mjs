@@ -1,5 +1,12 @@
 export function selectUploadFile(state = {}, file = null) {
-  return { ...state, file, stage: "", receipt: null, submitting: false };
+  return {
+    ...state,
+    file,
+    stage: "",
+    receipt: null,
+    duplicate: null,
+    submitting: false,
+  };
 }
 
 export function canSubmitUpload(state = {}) {
@@ -7,15 +14,17 @@ export function canSubmitUpload(state = {}) {
 }
 
 export function startUpload(state = {}) {
-  return canSubmitUpload(state) ? { ...state, submitting: true, receipt: null } : state;
+  return canSubmitUpload(state)
+    ? { ...state, submitting: true, receipt: null, duplicate: null }
+    : state;
 }
 
 export function completeUpload(state = {}, receipt) {
   return { ...state, submitting: false, stage: "queued", receipt };
 }
 
-export function failUpload(state = {}) {
-  return { ...state, submitting: false, stage: "" };
+export function failUpload(state = {}, duplicate = null) {
+  return { ...state, submitting: false, stage: "", duplicate };
 }
 
 export function canCommitUploadEffect({

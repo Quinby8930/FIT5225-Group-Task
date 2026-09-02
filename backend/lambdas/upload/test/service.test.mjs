@@ -48,10 +48,25 @@ test('does not pre-sign when duplicate reservation fails', async () => {
   let presigned = false;
   const service = createUploadService({
     createFileId: () => 'file-123',
-    reserveUpload: async () => { const error = new Error('duplicate'); error.code = 'DUPLICATE_FILE'; throw error; },
+    reserveUpload: async () => {
+      const error = new Error('duplicate');
+      Object.assign(error, {
+        code: 'DUPLICATE_FILE',
+        existing_file_id: 'existing-file',
+        tags: { cat: 1 },
+      });
+      throw error;
+    },
     presignUpload: async () => { presigned = true; },
   });
-  await assert.rejects(() => service.createUpload({ userId: 'user-456', request }), { code: 'DUPLICATE_FILE' });
+  await assert.rejects(
+    () => service.createUpload({ userId: 'user-456', request }),
+    {
+      code: 'DUPLICATE_FILE',
+      existing_file_id: 'existing-file',
+      tags: { cat: 1 },
+    },
+  );
   assert.equal(presigned, false);
 });
 

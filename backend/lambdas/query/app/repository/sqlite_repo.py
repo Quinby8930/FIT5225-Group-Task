@@ -15,7 +15,13 @@ from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
-from app.repository.base import DuplicateError, FileRepository
+from app.repository.base import (
+    CompletedChecksumMatch,
+    DuplicateError,
+    FileRepository,
+    RepositoryIntegrityError,
+    completed_checksum_match,
+)
 from app.schemas import FileRecord
 
 _SCHEMA = """
@@ -338,3 +344,33 @@ class SQLiteRepository(FileRepository):
             (user_id, checksum),
         ).fetchone()
         return _deserialise(row) if row else None
+
+    def find_completed_by_checksum(
+        self, checksum: str, *, user_id: Optional[str] = None
+    ) -> Optional[CompletedChecksumMatch]:
+        query = "SELECT file_id,tags_json,upload_time FROM files "
+        query += "WHERE checksum=? AND status='completed'"
+        params: tuple[str, ...] = (checksum,)
+        if user_id is not None:
+            query += " AND user_id=?"
+            params = (checksum, user_id)
+        rows = self._conn.execute(query, params).fetchall()
+        matches: list[CompletedChecksumMatch] = []
+        for row in rows:
+            try:
+                raw_tags = json.loads(row["tags_json"])
+                upload_time = _dt(row["upload_time"])
+            except (json.JSONDecodeError, TypeError, ValueError) as exc:
+                raise RepositoryIntegrityError(
+                    "completed duplicate metadata is invalid"
+                ) from exc
+            matches.append(
+                completed_checksum_match(
+                    row["file_id"], raw_tags, upload_time
+                )
+            )
+        return min(
+            matches,
+            key=lambda match: (match.upload_time, match.file_id),
+            default=None,
+        )

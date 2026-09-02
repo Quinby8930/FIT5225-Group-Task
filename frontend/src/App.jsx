@@ -14,6 +14,7 @@ import UploadPanel from "./features/upload/UploadPanel";
 import { beginQuerySelection, selectedMutationKeys, toggleFileSelection } from "./lib/manageSelection.mjs";
 import { canCommitManageEffect, removeManagedQueryItemsForSession, removeManagedSelectionForSession } from "./lib/manageWorkflow.mjs";
 import { beginQuery } from "./lib/queryLifecycle.mjs";
+import { createExploreSpeciesRequest } from "./lib/duplicateUpload.mjs";
 import {
   beginPendingQuery,
   clearQueryDescriptors,
@@ -40,6 +41,7 @@ export default function App() {
   const [queryState, setQueryState] = useState("idle");
   const [descriptors, setDescriptors] = useState(clearQueryDescriptors);
   const [selectedFileIds, setSelectedFileIds] = useState([]);
+  const [requestedSpecies, setRequestedSpecies] = useState(null);
   const { user, reason: sessionReason } = useAuthSession();
   const subject = typeof user?.sub === "string" && user.sub.trim() ? user.sub : null;
   const sessionIdentity = useRef(null);
@@ -53,6 +55,7 @@ export default function App() {
   const mainRef = useRef(null);
   const queryLifecycle = useRef({ generation: 0, phase: "idle", result: null });
   const pendingDeletionFeedback = useRef(null);
+  const exploreRequestId = useRef(0);
   const authRoute = authRouteForPath(window.location.pathname, appConfig);
   const demoMode = useMemo(
     () => Boolean(import.meta.env.DEV) || new URLSearchParams(window.location.search).has("demo"),
@@ -96,6 +99,17 @@ export default function App() {
     });
     window.requestAnimationFrame(() => mainRef.current?.focus({ preventScroll: true }));
   }, []);
+  const exploreDuplicateSpecies = useCallback((sourceSession, species) => {
+    if (sourceSession !== activeSession.current) return;
+    const request = createExploreSpeciesRequest(
+      exploreRequestId.current,
+      sourceSession,
+      species,
+    );
+    exploreRequestId.current = request.id;
+    setRequestedSpecies(request);
+    navigate("explore");
+  }, [navigate]);
 
   useEffect(() => {
     document.title = VIEW_TITLES[visibleActiveView] || "Pacific BioArchive";
@@ -118,6 +132,7 @@ export default function App() {
       setSelectedFileIds([]);
       setQueryState("idle");
       setDescriptors(clearQueryDescriptors());
+      setRequestedSpecies(null);
       setSessionStateOwner(sessionKey);
     }
   }, [sessionKey, sessionStateOwner]);
@@ -240,6 +255,10 @@ export default function App() {
               ))}
               onStatus={(status) => setExploreStatus(sessionKey, status)}
               sessionKey={sessionKey}
+              requestedSpecies={requestedSpecies}
+              onRequestedSpeciesConsumed={(requestId) => setRequestedSpecies(
+                (current) => current?.id === requestId ? null : current,
+              )}
             />
           )}
           <div hidden={visibleActiveView !== "upload"}>
@@ -250,6 +269,10 @@ export default function App() {
               getActiveSession={() => activeSession.current}
               onStatus={(status) => setUploadStatus(sessionKey, status)}
               onNavigate={navigate}
+              onExploreSpecies={(species) => exploreDuplicateSpecies(
+                sessionKey,
+                species,
+              )}
             />
           </div>
           {visibleActiveView === "manage" && (

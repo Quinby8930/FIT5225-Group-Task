@@ -43,11 +43,41 @@ test('maps an over-limit file to HTTP 413', async () => {
 });
 
 test('maps duplicate reservations and echoes an allowed request origin', async () => {
-  const duplicate = new Error('duplicate'); duplicate.code = 'DUPLICATE_FILE'; duplicate.existing_file_id = 'existing-file';
+  const duplicate = new Error('duplicate');
+  Object.assign(duplicate, {
+    code: 'DUPLICATE_FILE',
+    existing_file_id: 'existing-file',
+    tags: { cat: 1, wombat: 2 },
+    owner: 'must-not-leak',
+    email: 'must-not-leak@example.com',
+    filename: 'must-not-leak.jpg',
+    object_key: 'must/not/leak',
+    thumbnail_key: 'must/not/leak-thumb',
+  });
   const handler = createHandler({ allowedOrigin: 'https://app.example', createService: () => ({ createUpload: async () => { throw duplicate; } }) });
   const response = await handler(event({ headers: { origin: 'https://app.example' } }));
-  assert.equal(response.statusCode, 409); assert.deepEqual(body(response), { code: 'DUPLICATE_FILE', existing_file_id: 'existing-file' });
+  assert.equal(response.statusCode, 409);
+  assert.deepEqual(body(response), {
+    code: 'DUPLICATE_FILE',
+    existing_file_id: 'existing-file',
+    tags: { cat: 1, wombat: 2 },
+  });
   assert.equal(response.headers['Access-Control-Allow-Origin'], 'https://app.example');
+});
+
+test('fails closed instead of exposing a malformed duplicate error', async () => {
+  const duplicate = new Error('duplicate');
+  Object.assign(duplicate, {
+    code: 'DUPLICATE_FILE',
+    existing_file_id: 'existing-file',
+    tags: { cat: 0 },
+  });
+  const response = await createHandler({
+    createService: () => ({ createUpload: async () => { throw duplicate; } }),
+  })(event());
+
+  assert.equal(response.statusCode, 503);
+  assert.deepEqual(body(response), { code: 'DEPENDENCY_UNAVAILABLE' });
 });
 
 test('handles CORS preflight without invoking the service', async () => {

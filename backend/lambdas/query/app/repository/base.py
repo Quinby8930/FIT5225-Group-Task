@@ -11,7 +11,9 @@ URLs, matching Member B's contract in `docs/member-b/api-contracts.md`.
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+from dataclasses import dataclass
 from datetime import datetime
+from decimal import Decimal
 from typing import Optional
 
 from app.schemas import FileRecord
@@ -27,6 +29,71 @@ class DuplicateError(Exception):
 
 class RepositoryIntegrityError(RuntimeError):
     """Raised when persisted uniqueness metadata contradicts file records."""
+
+
+MAX_DUPLICATE_TAGS = 64
+MAX_DUPLICATE_TAG_NAME_BYTES = 128
+MAX_DUPLICATE_TAG_COUNT = 1_000_000
+
+
+@dataclass(frozen=True)
+class CompletedChecksumMatch:
+    """Public-safe details for one stable completed checksum match."""
+
+    file_id: str
+    tags: dict[str, int]
+    upload_time: datetime
+
+
+def completed_checksum_match(
+    file_id: object, tags: object, upload_time: object
+) -> CompletedChecksumMatch:
+    """Validate untrusted persisted duplicate details before returning them."""
+
+    if (
+        not isinstance(file_id, str)
+        or file_id != file_id.strip()
+        or not file_id
+        or len(file_id) > 256
+        or any(ord(character) < 0x20 for character in file_id)
+    ):
+        raise RepositoryIntegrityError("completed duplicate file id is invalid")
+    if not isinstance(upload_time, datetime) or upload_time.utcoffset() is None:
+        raise RepositoryIntegrityError("completed duplicate upload time is invalid")
+    if not isinstance(tags, dict) or len(tags) > MAX_DUPLICATE_TAGS:
+        raise RepositoryIntegrityError("completed duplicate tags are invalid")
+
+    safe_tags: dict[str, int] = {}
+    for raw_name, raw_count in tags.items():
+        if not isinstance(raw_name, str):
+            raise RepositoryIntegrityError("completed duplicate tag name is invalid")
+        name = raw_name.strip()
+        if (
+            not name
+            or len(name.encode("utf-8")) > MAX_DUPLICATE_TAG_NAME_BYTES
+            or name in safe_tags
+            or any(ord(character) < 0x20 for character in name)
+        ):
+            raise RepositoryIntegrityError("completed duplicate tag name is invalid")
+        if isinstance(raw_count, bool):
+            raise RepositoryIntegrityError("completed duplicate tag count is invalid")
+        if isinstance(raw_count, Decimal):
+            if not raw_count.is_finite() or raw_count != raw_count.to_integral_value():
+                raise RepositoryIntegrityError("completed duplicate tag count is invalid")
+            count = int(raw_count)
+        elif type(raw_count) is int:
+            count = raw_count
+        else:
+            raise RepositoryIntegrityError("completed duplicate tag count is invalid")
+        if count <= 0 or count > MAX_DUPLICATE_TAG_COUNT:
+            raise RepositoryIntegrityError("completed duplicate tag count is invalid")
+        safe_tags[name] = count
+
+    return CompletedChecksumMatch(
+        file_id=file_id,
+        tags=dict(sorted(safe_tags.items())),
+        upload_time=upload_time,
+    )
 
 
 class FileRepository(ABC):
@@ -63,6 +130,12 @@ class FileRepository(ABC):
         self, user_id: str, checksum: str
     ) -> Optional[FileRecord]:
         """Return the record already reserved for this ``(user_id, checksum)`` pair."""
+
+    @abstractmethod
+    def find_completed_by_checksum(
+        self, checksum: str, *, user_id: Optional[str] = None
+    ) -> Optional[CompletedChecksumMatch]:
+        """Return the earliest safe completed match, with ``file_id`` tie-break."""
 
     @abstractmethod
     def update_tags(self, file_id: str, tags: dict[str, int]) -> None:

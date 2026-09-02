@@ -1,8 +1,12 @@
 import { useEffect, useRef, useState } from "react";
 import { uploadMedia } from "../../api/mediaApi";
-import { isDuplicateFileError } from "../../api/apiClient";
 import Field from "../../components/Field";
 import FilePicker from "../../components/FilePicker";
+import {
+  copyDuplicateFileId,
+  duplicateCardModel,
+  duplicateFailureForError,
+} from "../../lib/duplicateUpload.mjs";
 import {
   canCommitUploadEffect,
   canSubmitUpload,
@@ -35,13 +39,27 @@ function stepClass(stepKey, currentStage) {
   return "todo";
 }
 
-export default function UploadPanel({ active, getActiveSession, onStatus, onNavigate, sessionKey }) {
-  const [uploadState, setUploadState] = useState({ file: null, stage: "", receipt: null, submitting: false });
+export default function UploadPanel({
+  active,
+  getActiveSession,
+  onStatus,
+  onNavigate,
+  onExploreSpecies,
+  sessionKey,
+}) {
+  const [uploadState, setUploadState] = useState({
+    file: null,
+    stage: "",
+    receipt: null,
+    duplicate: null,
+    submitting: false,
+  });
   const [previewUrl, setPreviewUrl] = useState("");
   const mountedRef = useRef(true);
   const previewMediaRef = useRef(null);
   const uploadRunRef = useRef(0);
-  const { file, stage, receipt } = uploadState;
+  const { file, stage, receipt, duplicate } = uploadState;
+  const duplicateCard = duplicate ? duplicateCardModel(duplicate, file?.type) : null;
 
   useEffect(() => {
     mountedRef.current = true;
@@ -90,12 +108,11 @@ export default function UploadPanel({ active, getActiveSession, onStatus, onNavi
       onStatus({ type: "success", message: "Upload accepted. Processing has been queued." });
     } catch (error) {
       if (!canCommit()) return;
-      setUploadState((current) => failUpload(current));
-      onStatus({
+      const failure = duplicateFailureForError(error);
+      setUploadState((current) => failUpload(current, failure.duplicate));
+      onStatus(failure.duplicate ? null : {
         type: "error",
-        message: isDuplicateFileError(error)
-          ? "Duplicate file detected by checksum. This file already exists in your uploads."
-          : error.message,
+        message: failure.message,
       });
     }
   }
@@ -170,6 +187,63 @@ export default function UploadPanel({ active, getActiveSession, onStatus, onNavi
           </ol>
           <p className="upload-stage" role="status">{STAGE_COPY[stage]}</p>
         </>
+      )}
+      {duplicateCard && (
+        <aside className="duplicate-upload-card" aria-labelledby="duplicate-upload-heading">
+          <p className="eyebrow">Duplicate prevented</p>
+          <h2 id="duplicate-upload-heading">{duplicateCard.heading}</h2>
+          <p>{duplicateCard.guidance}</p>
+          <dl>
+            <div>
+              <dt>Existing File ID</dt>
+              <dd><code>{duplicateCard.fileId}</code></dd>
+            </div>
+          </dl>
+          <button
+            type="button"
+            className="btn btn-quiet"
+            onClick={() => copyDuplicateFileId(
+              duplicateCard.fileId,
+              navigator.clipboard,
+            ).then(
+              () => onStatus({ type: "success", message: "File ID copied." }),
+              () => onStatus({ type: "error", message: "File ID could not be copied." }),
+            )}
+          >
+            Copy File ID
+          </button>
+          {duplicateCard.tagRows.length > 0 && (
+            <div className="duplicate-tags">
+              <h3>Current database tags</h3>
+              <ul>
+                {duplicateCard.tagRows.map(({ species, label }) => (
+                  <li key={species}>{label}</li>
+                ))}
+              </ul>
+            </div>
+          )}
+          <div className="btn-row">
+            {duplicateCard.exploreActions.map((species) => (
+              <button
+                key={species}
+                type="button"
+                className="btn btn-secondary"
+                onClick={() => onExploreSpecies(species)}
+              >
+                Explore {species}
+              </button>
+            ))}
+            {duplicateCard.emptyTags && (
+              <button
+                type="button"
+                className="btn btn-secondary"
+                onClick={() => onNavigate("explore")}
+              >
+                Go to Explore
+              </button>
+            )}
+          </div>
+        </aside>
       )}
       {receipt && (
         <>

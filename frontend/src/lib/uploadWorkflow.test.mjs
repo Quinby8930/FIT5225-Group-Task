@@ -13,13 +13,34 @@ test("does not allow the successfully uploaded file to be submitted again", asyn
 test("selecting a new file clears the previous receipt and progress", async () => {
   const { selectUploadFile } = await import("./uploadWorkflow.mjs");
   const next = selectUploadFile(
-    { file: { name: "old.jpg" }, stage: "queued", submitting: false, receipt: { file_id: "old" } },
+    {
+      file: { name: "old.jpg" },
+      stage: "queued",
+      submitting: false,
+      receipt: { file_id: "old" },
+      duplicate: { fileId: "duplicate-old", tags: { cat: 1 } },
+    },
     { name: "new.jpg" },
   );
 
   assert.equal(next.file.name, "new.jpg");
   assert.equal(next.stage, "");
   assert.equal(next.receipt, null);
+  assert.equal(next.duplicate, null);
+});
+
+test("starting a new upload clears a previous duplicate card", async () => {
+  const { startUpload } = await import("./uploadWorkflow.mjs");
+  const next = startUpload({
+    file: { name: "retry.jpg" },
+    stage: "",
+    submitting: false,
+    receipt: null,
+    duplicate: { fileId: "duplicate-old", tags: { cat: 1 } },
+  });
+
+  assert.equal(next.submitting, true);
+  assert.equal(next.duplicate, null);
 });
 
 test("accepts upload effects only from the mounted current run and session", async () => {

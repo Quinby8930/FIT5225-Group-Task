@@ -3,6 +3,7 @@ import { randomUUID } from 'node:crypto';
 import { createMetadataClient } from './metadata-client.mjs';
 import { createS3Presigner } from './presigner.mjs';
 import { createUploadService } from './service.mjs';
+import { validateDuplicateDetails } from './validation.mjs';
 
 const DEFAULT_MAX_UPLOAD_BYTES = 262_144_000;
 const DEFAULT_MAX_IMAGE_UPLOAD_BYTES = 12_582_912;
@@ -43,7 +44,18 @@ function errorResponse(error, allowedOrigin) {
   if (code === 'FILE_TOO_LARGE') return response(413, { code }, allowedOrigin);
   if (code === 'INVALID_REQUEST' || code === 'UNSUPPORTED_FILE_TYPE' || code === 'INVALID_CHECKSUM') return response(400, { code }, allowedOrigin);
   if (code === 'UNAUTHENTICATED') return response(401, { code }, allowedOrigin);
-  if (code === 'DUPLICATE_FILE') return response(409, { code, ...(error.existing_file_id ? { existing_file_id: error.existing_file_id } : {}) }, allowedOrigin);
+  if (code === 'DUPLICATE_FILE') {
+    let details;
+    try {
+      details = validateDuplicateDetails({
+        existing_file_id: error.existing_file_id,
+        tags: error.tags,
+      });
+    } catch {
+      return response(503, { code: 'DEPENDENCY_UNAVAILABLE' }, allowedOrigin);
+    }
+    return response(409, { code, ...details }, allowedOrigin);
+  }
   if (code === 'DEPENDENCY_UNAVAILABLE') return response(503, { code }, allowedOrigin);
   return response(500, { code: 'INTERNAL_ERROR' }, allowedOrigin);
 }

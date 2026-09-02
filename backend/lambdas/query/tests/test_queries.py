@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+from datetime import datetime, timezone
 from types import SimpleNamespace
 
 import pytest
@@ -21,6 +22,7 @@ from app.notification_client import (
     StubNotificationPublisher,
 )
 from app.repository import SQLiteNotificationRepository, SQLiteRepository
+from app.repository.base import RepositoryIntegrityError
 from app.schemas import FileRecord, Notification
 from app.services.notification_service import build_notifications
 from app.services.query_service import (
@@ -1305,6 +1307,29 @@ def _reserve(client, fid, checksum=None, user="u1"):
     )
 
 
+def _completed_checksum_record(
+    client,
+    file_id,
+    *,
+    user_id,
+    checksum,
+    tags,
+    upload_time,
+):
+    client.repo.add(
+        FileRecord(
+            file_id=file_id,
+            user_id=user_id,
+            file_type="image",
+            object_key=f"originals/{user_id}/{file_id}.jpg",
+            checksum=checksum,
+            tags=tags,
+            status="completed",
+            upload_time=upload_time,
+        )
+    )
+
+
 def _reacquire_processing(client, file_id):
     headers = {"X-Internal-Api-Key": INTERNAL_API_KEY}
     body = {
@@ -1346,6 +1371,132 @@ def _active_lease_token(client, file_id):
 
 
 class TestMetadataEndpoints:
+    def test_cross_user_completed_checksum_returns_only_safe_duplicate_details(
+        self, client
+    ):
+        _completed_checksum_record(
+            client,
+            "archive-cat",
+            user_id="u2",
+            checksum="sha256:global",
+            tags={"cat": 1},
+            upload_time=datetime(2026, 8, 1, tzinfo=timezone.utc),
+        )
+
+        response = _reserve(
+            client, "new-upload", checksum="sha256:global", user="u1"
+        )
+
+        assert response.status_code == 409
+        assert response.json() == {
+            "existing_file_id": "archive-cat",
+            "tags": {"cat": 1},
+        }
+        assert client.repo.get("new-upload") is None
+
+    def test_same_user_completed_checksum_returns_id_and_current_tags(self, client):
+        _completed_checksum_record(
+            client,
+            "own-wombat",
+            user_id="u1",
+            checksum="sha256:own-completed",
+            tags={"wombat": 2},
+            upload_time=datetime(2026, 8, 2, tzinfo=timezone.utc),
+        )
+
+        response = _reserve(client, "own-new", checksum="sha256:own-completed")
+
+        assert response.status_code == 409
+        assert response.json() == {
+            "existing_file_id": "own-wombat",
+            "tags": {"wombat": 2},
+        }
+        assert client.repo.get("own-new") is None
+
+    @pytest.mark.parametrize("status", ["pending_upload", "processing"])
+    def test_other_user_incomplete_checksum_does_not_block_reservation(
+        self, client, status
+    ):
+        candidate = FileRecord(
+            file_id=f"other-{status}",
+            user_id="u2",
+            file_type="image",
+            object_key=f"originals/u2/{status}.jpg",
+            checksum="sha256:incomplete-other",
+            status="pending_upload",
+        )
+        client.repo.add(candidate)
+        if status == "processing":
+            client.repo.mark_processing(
+                candidate.file_id, "setup", datetime(2026, 8, 3, tzinfo=timezone.utc)
+            )
+
+        response = _reserve(
+            client, "allowed-new", checksum="sha256:incomplete-other", user="u1"
+        )
+
+        assert response.status_code == 201
+        assert response.json()["file_id"] == "allowed-new"
+
+    def test_multiple_completed_matches_choose_earliest_then_lowest_file_id(
+        self, client
+    ):
+        timestamp = datetime(2026, 8, 4, tzinfo=timezone.utc)
+        for file_id, user_id, upload_time, tags in [
+            ("later", "u2", datetime(2026, 8, 5, tzinfo=timezone.utc), {"dingo": 1}),
+            ("early-z", "u3", timestamp, {"rat": 1}),
+            ("early-a", "u4", timestamp, {"cat": 2}),
+        ]:
+            _completed_checksum_record(
+                client,
+                file_id,
+                user_id=user_id,
+                checksum="sha256:history",
+                tags=tags,
+                upload_time=upload_time,
+            )
+
+        response = _reserve(client, "history-new", checksum="sha256:history")
+
+        assert response.status_code == 409
+        assert response.json() == {
+            "existing_file_id": "early-a",
+            "tags": {"cat": 2},
+        }
+
+    @pytest.mark.parametrize(
+        "unsafe_tags",
+        [
+            {"": 1},
+            {"cat": 0},
+            {"cat": -1},
+            {"cat": True},
+            {f"species-{index}": 1 for index in range(65)},
+        ],
+        ids=["empty-key", "zero", "negative", "boolean", "too-many"],
+    )
+    def test_completed_duplicate_with_unsafe_tags_fails_closed(
+        self, client, unsafe_tags
+    ):
+        _completed_checksum_record(
+            client,
+            "unsafe-tags",
+            user_id="u2",
+            checksum="sha256:unsafe-tags",
+            tags={"cat": 1},
+            upload_time=datetime(2026, 8, 6, tzinfo=timezone.utc),
+        )
+        client.repo._conn.execute(
+            "UPDATE files SET tags_json=? WHERE file_id=?",
+            (json.dumps(unsafe_tags), "unsafe-tags"),
+        )
+        client.repo._conn.commit()
+
+        with pytest.raises(RepositoryIntegrityError):
+            _reserve(client, "unsafe-new", checksum="sha256:unsafe-tags")
+
+        assert client.repo.get("unsafe-new") is None
+
     def test_pending_reservation_is_reused_with_original_upload_identity(self, client):
         first = _reserve(client, "r1", checksum="sha256:shared")
         second = _reserve(client, "r-new", checksum="sha256:shared")
@@ -1363,10 +1514,12 @@ class TestMetadataEndpoints:
     def test_completed_reservation_remains_duplicate(self, client):
         _reserve(client, "r2", checksum="sha256:shared")
         client.repo.mark_processing("r2", "test-setup", main.utcnow())
-        client.repo.mark_completed("r2", "originals/r2", None, "image", {}, [], "v1")
+        client.repo.mark_completed(
+            "r2", "originals/r2", None, "image", {"cat": 1}, [], "v1"
+        )
         r = _reserve(client, "r3", checksum="sha256:shared")
         assert r.status_code == 409
-        assert r.json()["existing_file_id"] == "r2"
+        assert r.json() == {"existing_file_id": "r2", "tags": {"cat": 1}}
 
     def test_failed_reservation_is_reset_and_reused(self, client):
         _reserve(client, "failed-old", checksum="sha256:retry")

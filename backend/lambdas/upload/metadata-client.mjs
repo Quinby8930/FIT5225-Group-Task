@@ -1,6 +1,6 @@
 import { TextDecoder } from 'node:util';
 
-import { UploadError } from './validation.mjs';
+import { UploadError, validateDuplicateDetails } from './validation.mjs';
 
 const MAX_JSON_RESPONSE_BYTES = 1024 * 1024;
 
@@ -101,9 +101,8 @@ export function createMetadataClient({
         }
         if (response.status === 409) {
           const duplicate = await readBoundedJson(response);
-          if (typeof duplicate?.existing_file_id === 'string') {
-            throw new UploadError('DUPLICATE_FILE', { existing_file_id: duplicate.existing_file_id });
-          }
+          const details = validateDuplicateDetails(duplicate);
+          throw new UploadError('DUPLICATE_FILE', details);
         }
       } catch (error) {
         if (error?.code === 'DUPLICATE_FILE') throw error;

@@ -7,7 +7,8 @@ import SpeciesSpotlights from "../../components/SpeciesSpotlights";
 import useSignedAssetUrls from "../../hooks/useSignedAssetUrls";
 import { hasTagCounts, parseTagCounts } from "../../lib/forms";
 import { legacyReferenceLabel, normalizeQueryResponse } from "../../lib/queryResults.mjs";
-import { useRef, useState } from "react";
+import { useEffect, useRef, useState } from "react";
+import { consumeExploreSpeciesRequest } from "../../lib/duplicateUpload.mjs";
 import { beginQuery, settleQuery, shouldShowResultsHeader } from "../../lib/queryLifecycle.mjs";
 import {
   fileDescriptor,
@@ -30,12 +31,15 @@ export default function ExplorePanel({
   onToggle,
   onStatus,
   sessionKey,
+  requestedSpecies,
+  onRequestedSpeciesConsumed,
 }) {
   const [species, setSpecies] = useState("");
   const [tagCounts, setTagCounts] = useState("");
   const [thumbnailKey, setThumbnailKey] = useState("");
   const [queryFile, setQueryFile] = useState(null);
   const speciesInputRef = useRef(null);
+  const consumedSpeciesRequest = useRef(null);
   const { assetStates, refresh, openOriginal } = useSignedAssetUrls(items, sessionKey, onStatus);
   const structuredItems = items.filter((item) => !item.legacy);
   const legacyItems = items.filter((item) => item.legacy);
@@ -77,6 +81,19 @@ export default function ExplorePanel({
     setSpecies(value);
     run(() => queryBySpecies(value), speciesDescriptor(value));
   }
+
+  useEffect(() => {
+    consumedSpeciesRequest.current = consumeExploreSpeciesRequest(
+      requestedSpecies,
+      {
+        sessionKey,
+        lastRequestId: consumedSpeciesRequest.current,
+        onSpecies: setSpecies,
+        onQuery: selectSuggestedSpecies,
+        onConsumed: onRequestedSpeciesConsumed,
+      },
+    );
+  }, [requestedSpecies, sessionKey]);
 
   function submitTags(event) {
     event.preventDefault();

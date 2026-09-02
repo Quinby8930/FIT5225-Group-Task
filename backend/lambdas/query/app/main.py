@@ -48,7 +48,13 @@ from app.repository import (
     SQLiteNotificationRepository,
     SQLiteRepository,
 )
-from app.repository.base import DuplicateError, FileRepository
+from app.repository.base import (
+    CompletedChecksumMatch,
+    DuplicateError,
+    FileRepository,
+    RepositoryIntegrityError,
+    completed_checksum_match,
+)
 from app.schemas import (
     AssetAuthorizationRequest,
     CompleteRequest,
@@ -786,13 +792,23 @@ def reserve_upload(
         object_key=body.object_key,
         status="pending_upload",
     )
-    try:
-        reserved, created = repo_.reserve(candidate)
-    except DuplicateError as exc:
+
+    def duplicate_response(match: CompletedChecksumMatch) -> JSONResponse:
         return JSONResponse(
-            status_code=409, content={"existing_file_id": exc.existing_file_id}
+            status_code=409,
+            content={"existing_file_id": match.file_id, "tags": match.tags},
         )
-    if not created:
+
+    def handle_existing(reserved: FileRecord) -> JSONResponse:
+        if reserved.status == "completed":
+            match = repo_.find_completed_by_checksum(
+                body.checksum, user_id=body.user_id
+            )
+            if match is None:
+                raise RepositoryIntegrityError(
+                    "completed reservation is missing from checksum lookup"
+                )
+            return duplicate_response(match)
         if (
             reserved.filename != body.filename
             or reserved.file_type != body.file_type
@@ -803,13 +819,41 @@ def reserve_upload(
         reused = repo_.reuse_upload(reserved.file_id)
         if reused is None:
             current = repo_.get(reserved.file_id)
-            return JSONResponse(
-                status_code=409,
-                content={
-                    "existing_file_id": current.file_id if current else reserved.file_id
-                },
+            safe_match = completed_checksum_match(
+                current.file_id if current else reserved.file_id,
+                {},
+                (current or reserved).upload_time,
             )
-        reserved = reused
+            return duplicate_response(safe_match)
+        return JSONResponse(
+            status_code=201,
+            content={
+                "file_id": reused.file_id,
+                "object_key": reused.object_key,
+                "status": "pending_upload",
+                "reused": True,
+            },
+        )
+
+    existing_for_user = repo_.find_by_user_checksum(body.user_id, body.checksum)
+    if existing_for_user is not None:
+        return handle_existing(existing_for_user)
+
+    completed_match = repo_.find_completed_by_checksum(body.checksum)
+    if completed_match is not None:
+        return duplicate_response(completed_match)
+
+    try:
+        reserved, created = repo_.reserve(candidate)
+    except DuplicateError as exc:
+        safe_match = completed_checksum_match(
+            exc.existing_file_id,
+            {},
+            candidate.upload_time,
+        )
+        return duplicate_response(safe_match)
+    if not created:
+        return handle_existing(reserved)
     return JSONResponse(
         status_code=201,
         content={

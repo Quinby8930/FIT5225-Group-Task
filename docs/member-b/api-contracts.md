@@ -79,7 +79,7 @@ returns `204` for the configured origin, while POST remains JWT-protected.
 | `400` | `INVALID_CHECKSUM` | Checksum is not canonical Base64 for 32 bytes. |
 | `401` | `UNAUTHENTICATED` | The verified JWT `sub` claim is absent. |
 | `413` | `FILE_TOO_LARGE` | The declared image or video size exceeds its media-specific cap. |
-| `409` | `DUPLICATE_FILE` | Member D already reserved this user's checksum; `existing_file_id` is included when supplied. |
+| `409` | `DUPLICATE_FILE` | A completed archive record has the same checksum; the response contains only `code`, `existing_file_id`, and `tags`. |
 | `503` | `DEPENDENCY_UNAVAILABLE` | The metadata reservation did not complete. |
 | `500` | `INTERNAL_ERROR` | Pre-signing or another unexpected operation failed. |
 
@@ -184,8 +184,14 @@ POST {METADATA_API_BASE_URL}/internal/uploads/reserve
   `"reused":false}` for a new claim. An abandoned `pending_upload` or `failed`
   claim returns the same shape with the original `file_id/object_key` and
   `"reused":true`; Member B must pre-sign that returned key.
-- `processing` or `completed` claims return `409`
-  `{"existing_file_id":"existing-uuid"}` (`DUPLICATE_FILE`).
+- An existing same-user `processing` claim returns `409` with
+  `{"existing_file_id":"existing-uuid","tags":{}}`. A same-user `completed`
+  claim, or a `completed` record owned by any user with the same checksum,
+  returns `409` with its current safe tag counts, for example
+  `{"existing_file_id":"existing-uuid","tags":{"cat":1}}`.
+- Cross-user `pending_upload`, `processing`, and `failed` rows do not block a
+  new reservation. If historical completed rows share a checksum, Member D
+  chooses the earliest `upload_time`, then the lowest `file_id`.
 - A reusable claim whose filename, file type, content type, or size differs
   returns `409 METADATA_CONFLICT` and is not reset.
 - Other responses are treated as `DEPENDENCY_UNAVAILABLE` by the upload
@@ -193,7 +199,15 @@ POST {METADATA_API_BASE_URL}/internal/uploads/reserve
 - The upload boundary aborts a stalled reservation request after five seconds
   and maps abort or network failure to `DEPENDENCY_UNAVAILABLE`.
 - A `409` duplicate response is read with the same 1 MiB JSON limit and strict
-  UTF-8 decoding; oversized or malformed bodies map to `DEPENDENCY_UNAVAILABLE`.
+  UTF-8 decoding. Its identifier, positive integer tag counts, field count,
+  and exact allowed field set are validated; oversized or malformed bodies map
+  to `DEPENDENCY_UNAVAILABLE` and pre-signing does not run.
+
+The cross-user completed lookup is a demonstration-scale, best-effort DynamoDB
+Scan using the existing permission. It does not change the per-user reservation
+key and does not claim atomic global checksum uniqueness during concurrent
+uploads. Duplicate responses never include owner, email, filename, object key,
+or thumbnail key.
 
 A reservation can remain `pending_upload` if pre-signing fails or the response
 never reaches the browser. Repeating the upload request with identical immutable

@@ -47,15 +47,59 @@ test('returns the reusable upload identity from a successful reservation', async
   });
 });
 
-test('maps a metadata duplicate response to the existing file identifier', async () => {
+test('validates and preserves the approved duplicate identifier and tags', async () => {
   const fetchImpl = async () => new Response(
-    JSON.stringify({ existing_file_id: 'existing-file' }),
+    JSON.stringify({
+      existing_file_id: 'existing-file-123',
+      tags: { cat: 1, wombat: 2 },
+    }),
     { status: 409, headers: { 'Content-Type': 'application/json' } },
   );
   await assert.rejects(
     () => createMetadataClient({ baseUrl: 'https://metadata.example', fetchImpl }).reserveUpload(record),
-    (error) => error?.code === 'DUPLICATE_FILE' && error.existing_file_id === 'existing-file',
+    {
+      code: 'DUPLICATE_FILE',
+      existing_file_id: 'existing-file-123',
+      tags: { cat: 1, wombat: 2 },
+    },
   );
+});
+
+test('fails closed for malformed duplicate identifiers, tags, or extra fields', async () => {
+  const tooManyTags = Object.fromEntries(
+    Array.from({ length: 65 }, (_, index) => [`species-${index}`, 1]),
+  );
+  const invalidPayloads = [
+    { existing_file_id: '', tags: {} },
+    { existing_file_id: ' spaced ', tags: {} },
+    { existing_file_id: 'bad\nline', tags: {} },
+    { existing_file_id: 'x'.repeat(257), tags: {} },
+    { existing_file_id: 123, tags: {} },
+    { existing_file_id: 'existing-file', tags: null },
+    { existing_file_id: 'existing-file', tags: [] },
+    { existing_file_id: 'existing-file', tags: { '': 1 } },
+    { existing_file_id: 'existing-file', tags: { ' cat ': 1 } },
+    { existing_file_id: 'existing-file', tags: { cat: 0 } },
+    { existing_file_id: 'existing-file', tags: { cat: -1 } },
+    { existing_file_id: 'existing-file', tags: { cat: 1.5 } },
+    { existing_file_id: 'existing-file', tags: { cat: '1' } },
+    { existing_file_id: 'existing-file', tags: { cat: true } },
+    { existing_file_id: 'existing-file', tags: { cat: 1_000_001 } },
+    { existing_file_id: 'existing-file', tags: tooManyTags },
+    { existing_file_id: 'existing-file', tags: {}, owner: 'user-2' },
+    { existing_file_id: 'existing-file', tags: {}, object_key: 'private/key' },
+  ];
+
+  for (const payload of invalidPayloads) {
+    const fetchImpl = async () => new Response(
+      JSON.stringify(payload),
+      { status: 409, headers: { 'Content-Type': 'application/json' } },
+    );
+    await assert.rejects(
+      () => createMetadataClient({ baseUrl: 'https://metadata.example', fetchImpl }).reserveUpload(record),
+      { code: 'DEPENDENCY_UNAVAILABLE' },
+    );
+  }
 });
 
 test('stops reading an oversized duplicate response at one MiB', async () => {
@@ -172,7 +216,10 @@ test('aborts a stalled reservation after the default five-second deadline', asyn
 
 test('keeps the abort deadline active while decoding a duplicate response', async () => {
   const order = [];
-  const encoded = Buffer.from(JSON.stringify({ existing_file_id: 'existing-file' }));
+  const encoded = Buffer.from(JSON.stringify({
+    existing_file_id: 'existing-file',
+    tags: { cat: 1 },
+  }));
   let delivered = false;
   const client = createMetadataClient({
     baseUrl: 'https://metadata.example',
@@ -196,7 +243,7 @@ test('keeps the abort deadline active while decoding a duplicate response', asyn
 
   await assert.rejects(
     () => client.reserveUpload(record),
-    { code: 'DUPLICATE_FILE', existing_file_id: 'existing-file' },
+    { code: 'DUPLICATE_FILE', existing_file_id: 'existing-file', tags: { cat: 1 } },
   );
 
   assert.deepEqual(order, ['decode duplicate', 'clear deadline']);

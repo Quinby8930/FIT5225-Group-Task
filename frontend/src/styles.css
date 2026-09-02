@@ -737,6 +737,21 @@ input[type="checkbox"] { min-height: 0; width: 17px; height: 17px; accent-color:
 
 .upload-stage { color: var(--pine); font-weight: 700; margin: 12px 0 0; }
 .receipt-guidance { color: var(--ink2); margin: 16px 0 12px; }
+.duplicate-upload-card {
+  background: color-mix(in srgb, var(--amber) 8%, var(--paper));
+  border: 1px solid var(--amber);
+  border-left-width: 4px;
+  margin-top: 24px;
+  padding: 20px;
+}
+.duplicate-upload-card h2 { font-family: var(--serif); font-size: 1.55rem; font-weight: 400; }
+.duplicate-upload-card > p:not(.eyebrow) { color: var(--ink2); margin: 8px 0 16px; }
+.duplicate-upload-card dl { margin: 0 0 12px; }
+.duplicate-upload-card dt, .duplicate-tags h3 { color: var(--ink2); font-size: 0.72rem; font-weight: 700; }
+.duplicate-upload-card dd { margin: 5px 0 0; overflow-wrap: anywhere; }
+.duplicate-tags { border-top: 1px solid var(--hair); margin-top: 18px; padding-top: 14px; }
+.duplicate-tags ul { display: flex; flex-wrap: wrap; gap: 8px; list-style: none; margin: 8px 0 14px; padding: 0; }
+.duplicate-tags li { background: var(--paper); border: 1px solid var(--hair); padding: 6px 10px; }
 
 /* ---------- Manage ---------- */
 

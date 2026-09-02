@@ -340,6 +340,99 @@ def test_public_and_asset_lookup_scans_observe_begin_delete_strongly():
     assert [call["ConsistentRead"] for call in table.scan_calls] == [True, True]
 
 
+def test_completed_checksum_lookup_uses_scan_and_stable_history_order():
+    same_time = "2026-08-25T00:00:00+00:00"
+    table = _PagedTable(
+        scan_pages=[
+            {
+                "Items": [
+                    _item(
+                        "later",
+                        "originals/u2/later.jpg",
+                        user_id="u2",
+                        checksum="sha256:global",
+                        status="completed",
+                        upload_time="2026-08-26T00:00:00+00:00",
+                    ),
+                    _item(
+                        "early-z",
+                        "originals/u3/early-z.jpg",
+                        user_id="u3",
+                        checksum="sha256:global",
+                        status="completed",
+                        upload_time=same_time,
+                    ),
+                ],
+                "LastEvaluatedKey": {"page": 1},
+            },
+            {
+                "Items": [
+                    _item(
+                        "early-a",
+                        "originals/u4/early-a.jpg",
+                        user_id="u4",
+                        checksum="sha256:global",
+                        status="completed",
+                        upload_time=same_time,
+                        tags={"cat": Decimal("2")},
+                    )
+                ]
+            },
+        ]
+    )
+    repository = _file_repo(table)
+
+    record = repository.find_completed_by_checksum("sha256:global")
+
+    assert record.file_id == "early-a"
+    assert record.tags == {"cat": 2}
+    assert table.scan_calls == [
+        {
+            "FilterExpression": "checksum = :checksum AND #status = :completed",
+            "ExpressionAttributeNames": {"#status": "status"},
+            "ExpressionAttributeValues": {
+                ":checksum": "sha256:global",
+                ":completed": "completed",
+            },
+            "ConsistentRead": True,
+        },
+        {
+            "FilterExpression": "checksum = :checksum AND #status = :completed",
+            "ExpressionAttributeNames": {"#status": "status"},
+            "ExpressionAttributeValues": {
+                ":checksum": "sha256:global",
+                ":completed": "completed",
+            },
+            "ConsistentRead": True,
+            "ExclusiveStartKey": {"page": 1},
+        },
+    ]
+
+
+def test_completed_checksum_lookup_returns_none_without_a_completed_match():
+    table = _PagedTable(scan_pages=[{"Items": []}])
+    repository = _file_repo(table)
+
+    assert repository.find_completed_by_checksum("sha256:missing") is None
+
+
+def test_completed_checksum_lookup_treats_missing_legacy_tags_as_empty():
+    item = _item(
+        "legacy-no-tags",
+        "originals/u2/legacy-no-tags.jpg",
+        user_id="u2",
+        checksum="sha256:legacy",
+        status="completed",
+    )
+    item.pop("tags")
+    repository = _file_repo(_PagedTable(scan_pages=[{"Items": [item]}]))
+
+    record = repository.find_completed_by_checksum("sha256:legacy")
+
+    assert record.file_id == "legacy-no-tags"
+    assert record.tags == {}
+
+
 def test_legacy_claim_competition_loser_reads_the_winning_claim():
     table = _PagedTable(
         scan_pages=[
