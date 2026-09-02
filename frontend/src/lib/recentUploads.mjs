@@ -1,3 +1,5 @@
+import { detectionDetailsForMedia } from "./mediaDetections.mjs";
+
 const STORAGE_KEY = "pacificBioArchive.recentUploads";
 const MAX_RECENT_UPLOADS = 10;
 const ACTIVE_STATUSES = new Set(["pending_upload", "processing"]);
@@ -143,16 +145,17 @@ export function uploadStatusView(upload) {
     failed: "Processing failed",
     deleting: "Deleting",
   };
+  const detectionDetails = detectionDetailsForMedia(
+    upload?.file_type,
+    safeDetections(upload?.detections),
+  );
   return {
     label: labels[upload?.status] || "Status unavailable",
     tagRows: Object.entries(upload?.tags || {}).map(
       ([species, count]) => `${species} × ${count}`,
     ),
-    detectionRows: (upload?.detections || []).map(
-      ({ species, confidence }) => (
-        `${species} — model score ${(confidence * 100).toFixed(2)}%`
-      ),
-    ),
+    detectionRows: detectionDetails.rows.map(({ label }) => label),
+    detectionNote: detectionDetails.note,
     modelVersion: safeString(upload?.model_version, 128),
     failure: upload?.status === "failed"
       ? safeString(upload?.message, 240) || "Processing failed."

@@ -519,6 +519,11 @@ def test_video_pipeline_uploads_signed_frames_once_and_cleans_them_after_success
             "image_urls": [f"https://signed.example/{key}" for key in frame_keys],
         }
     ]
+    completion = metadata.completed[0][1]
+    assert completion["tags"] == {"wombat": 1}
+    assert completion["detections"] == [
+        {"species": "wombat", "confidence": 0.94}
+    ]
     assert metadata.completed[0][1]["thumbnail_key"] is None
     assert storage.deleted_keys == frame_keys
     assert all(not path.exists() for path in storage.local_paths)
@@ -576,13 +581,64 @@ def test_video_pipeline_batches_presigning_and_aggregates_in_stable_order():
     )
     completion = metadata.completed[0][1]
     assert list(completion["tags"]) == ["ant", "badger", "zebra"]
-    assert completion["tags"] == {"ant": 5, "badger": 1, "zebra": 1}
+    assert completion["tags"] == {"ant": 1, "badger": 1, "zebra": 1}
     assert completion["detections"] == [
         {"species": "zebra", "confidence": 0.91},
         {"species": "badger", "confidence": 0.82},
     ]
     assert completion["model_version"] == "speciesnet-v1"
     assert storage.deleted_keys == frame_keys
+
+
+def test_video_pipeline_stores_presence_tags_and_preserves_sampled_frame_evidence():
+    pipeline, _, metadata, inference, _ = make_pipeline(content_type="video/mp4")
+    detections = [
+        {"species": species, "confidence": confidence}
+        for species, confidence in [
+            ("cassowary", 0.91),
+            ("cassowary", 0.93),
+            ("dingo", 0.84),
+            ("dingo", 0.88),
+            ("wombat", 0.95),
+            ("wombat", 0.97),
+        ]
+    ]
+
+    def infer_slideshow(payload):
+        inference.calls.append(payload)
+        return {
+            "tags": {"cassowary": 2, "dingo": 2, "wombat": 2},
+            "detections": detections,
+            "model_version": "speciesnet-v1",
+        }
+
+    inference.infer = infer_slideshow
+
+    pipeline.process_record(s3_record("species-slideshow-h264.mp4"))
+
+    completion = metadata.completed[0][1]
+    assert completion["tags"] == {"cassowary": 1, "dingo": 1, "wombat": 1}
+    assert completion["detections"] == detections
+
+
+def test_video_pipeline_preserves_empty_presence_tags():
+    pipeline, _, metadata, inference, _ = make_pipeline(content_type="video/mp4")
+
+    def infer_empty(payload):
+        inference.calls.append(payload)
+        return {
+            "tags": {},
+            "detections": [],
+            "model_version": "speciesnet-v1",
+        }
+
+    inference.infer = infer_empty
+
+    pipeline.process_record(s3_record("empty.mp4"))
+
+    completion = metadata.completed[0][1]
+    assert completion["tags"] == {}
+    assert completion["detections"] == []
 
 
 def test_video_pipeline_rejects_model_version_drift_without_partial_metadata():

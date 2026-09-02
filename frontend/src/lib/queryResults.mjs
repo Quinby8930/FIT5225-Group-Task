@@ -1,3 +1,5 @@
+import { detectionDetailsForMedia } from "./mediaDetections.mjs";
+
 const MEDIA_TYPES = new Set(["image", "video"]);
 const MAX_PUBLIC_TAGS = 64;
 const MAX_PUBLIC_DETECTIONS = 1000;
@@ -85,16 +87,17 @@ export function mediaTechnicalDetails(item) {
     count,
     label: `${species} × ${count}`,
   }));
-  const detectionRows = safeDetections(item?.detections).map(({ species, confidence }) => ({
-    species,
-    confidence,
-    label: `${species} — model score ${(confidence * 100).toFixed(2)}%`,
-  }));
+  const detectionDetails = detectionDetailsForMedia(
+    item?.file_type,
+    safeDetections(item?.detections),
+  );
+  const detectionRows = detectionDetails.rows;
   const modelVersion = safePublicText(item?.model_version);
   const hasAiDetails = detectionRows.length > 0 || modelVersion !== null;
   return {
     tagRows,
     detectionRows,
+    detectionNote: detectionDetails.note,
     modelVersion,
     notice: hasAiDetails ? AI_NOTICE : null,
     hasDetails: tagRows.length > 0 || hasAiDetails,

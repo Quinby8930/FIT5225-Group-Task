@@ -119,6 +119,9 @@ export default function MediaCard({ item, assetStates, selected, onToggle, onOpe
                     <li key={`${species}:${index}`}>{label}</li>
                   ))}
                 </ul>
+                {technical.detectionNote && (
+                  <p className="ai-result-notice">{technical.detectionNote}</p>
+                )}
               </section>
             )}
             {technical.modelVersion && (

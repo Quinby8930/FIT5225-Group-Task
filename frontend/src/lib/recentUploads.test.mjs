@@ -133,7 +133,40 @@ test("failed uploads retain a bounded user-facing failure and stop polling", () 
     label: "Processing failed",
     tagRows: [],
     detectionRows: [],
+    detectionNote: null,
     modelVersion: "",
     failure: "Processing could not reach the inference service.",
   });
+});
+
+test("recent video uploads use the same grouped sampled-frame evidence format", () => {
+  const completed = mergeUploadStatus(rememberRecentUpload([], {
+    file_id: "video-1",
+    filename: "species.mp4",
+    file_type: "video",
+    status: "processing",
+  }), {
+    file_id: "video-1",
+    filename: "species.mp4",
+    file_type: "video",
+    status: "completed",
+    tags: { wombat: 1, dingo: 1 },
+    detections: [
+      { species: "wombat", confidence: 0.81 },
+      { species: "dingo", confidence: 0.9 },
+      { species: "wombat", confidence: 0.96 },
+    ],
+    model_version: "v1",
+  });
+
+  const view = uploadStatusView(completed[0]);
+
+  assert.deepEqual(view.detectionRows, [
+    "wombat — 2 sampled-frame detections, max model score 96.00%",
+    "dingo — 1 sampled-frame detection, max model score 90.00%",
+  ]);
+  assert.equal(
+    view.detectionNote,
+    "Sampled-frame detections are model evidence, not counts of individual animals.",
+  );
 });

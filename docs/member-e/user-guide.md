@@ -32,7 +32,11 @@ npm run dev
    The UI exchanges server-approved completed-media keys through authenticated
    `POST /asset-urls` calls so private thumbnails can be previewed without
    making the bucket public. Temporary links refresh automatically while the
-   results remain open; only the owner can edit tags or delete a result.
+   results remain open; only the owner can edit tags or delete a result. Video
+   archive tag counts mean that a species appeared (`1`), not the number of
+   animals. Technical details group the preserved one-frame-per-second model
+   evidence by species and report sampled-frame occurrences and the maximum
+   model score; no cross-frame individual tracking is performed.
 4. Query by species, for example `wombat`.
 5. Paste a thumbnail key and resolve the original file key.
 6. Upload a query image in the Query tab to search by detected tags without

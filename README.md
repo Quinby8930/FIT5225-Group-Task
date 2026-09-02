@@ -43,6 +43,9 @@ Member B has added a locally verified media-ingestion boundary:
 - Aspect-ratio-preserving image thumbnails with a 40 MP decode ceiling and
   bounded video extraction at exactly one frame per second (600-second maximum,
   1,024-pixel scale, 900-frame/2-GiB caps, and a 180-second finalization reserve).
+  Video archive tag counts record species presence (`1`), while the preserved
+  sampled-frame detections provide model evidence; the system does not track or
+  count individual animals across frames.
 - Provider-neutral HTTP contracts for Member C inference and Member D metadata
   state, plus guarded storage deletion.
 - AWS SAM resources for the media bucket, four Lambda functions, scoped IAM,

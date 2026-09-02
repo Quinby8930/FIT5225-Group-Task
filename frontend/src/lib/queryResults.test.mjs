@@ -190,6 +190,7 @@ test("keeps current tags and original AI detections as separate safe details", a
       confidence: 0.677265,
       label: "cat — model score 67.73%",
     }],
+    detectionNote: null,
     modelVersion: "v1",
     notice: "AI-generated result; it may be incorrect. Archive tags can be corrected by the owner.",
     hasDetails: true,
@@ -200,6 +201,64 @@ test("keeps current tags and original AI detections as separate safe details", a
     Object.keys(item).filter((key) => ["owner", "checksum", "filename"].includes(key)),
     [],
   );
+});
+
+test("groups video sampled-frame detections by species with occurrence counts and maxima", async () => {
+  const { mediaTechnicalDetails, normalizeQueryResponse } = await loadQueryResults();
+  const result = normalizeQueryResponse({
+    items: [{
+      file_id: "video-slideshow",
+      file_type: "video",
+      display_key: "originals/u/video-slideshow/species.mp4",
+      original_key: "originals/u/video-slideshow/species.mp4",
+      thumbnail_key: null,
+      can_preview: true,
+      can_manage: true,
+      tags: { cassowary: 1, dingo: 1 },
+      detections: [
+        { species: "cassowary", confidence: 0.8 },
+        { species: "dingo", confidence: 0.92 },
+        { species: "cassowary", confidence: 1 },
+      ],
+      model_version: "v1",
+    }],
+  });
+
+  const details = mediaTechnicalDetails(result.structuredItems[0]);
+
+  assert.deepEqual(details.detectionRows, [{
+    species: "cassowary",
+    confidence: 1,
+    occurrences: 2,
+    label: "cassowary — 2 sampled-frame detections, max model score 100.00%",
+  }, {
+    species: "dingo",
+    confidence: 0.92,
+    occurrences: 1,
+    label: "dingo — 1 sampled-frame detection, max model score 92.00%",
+  }]);
+  assert.equal(
+    details.detectionNote,
+    "Sampled-frame detections are model evidence, not counts of individual animals.",
+  );
+});
+
+test("keeps image detections as separate rows even when their species repeats", async () => {
+  const { mediaTechnicalDetails } = await loadQueryResults();
+
+  const details = mediaTechnicalDetails({
+    file_type: "image",
+    detections: [
+      { species: "wombat", confidence: 0.7 },
+      { species: "wombat", confidence: 0.9 },
+    ],
+  });
+
+  assert.deepEqual(details.detectionRows.map(({ label }) => label), [
+    "wombat — model score 70.00%",
+    "wombat — model score 90.00%",
+  ]);
+  assert.equal(details.detectionNote, null);
 });
 
 test("missing or malformed ML details degrade without undefined placeholders", async () => {
@@ -225,6 +284,7 @@ test("missing or malformed ML details degrade without undefined placeholders", a
   assert.deepEqual(details, {
     tagRows: [{ species: "wombat", count: 2, label: "wombat × 2" }],
     detectionRows: [],
+    detectionNote: null,
     modelVersion: null,
     notice: null,
     hasDetails: true,

@@ -85,6 +85,9 @@ function RecentUploadCard({ upload, onExploreSpecies }) {
         <div className="recent-upload-details">
           <h3>Original AI detections</h3>
           <ul>{view.detectionRows.map((row) => <li key={row}>{row}</li>)}</ul>
+          {view.detectionNote && (
+            <p className="ai-result-notice">{view.detectionNote}</p>
+          )}
         </div>
       )}
       {view.modelVersion && (

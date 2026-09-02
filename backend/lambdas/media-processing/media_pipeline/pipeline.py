@@ -314,7 +314,11 @@ class MediaPipeline:
                         "Inference response exceeded the aggregate detection limit",
                     )
             return None, {
-                "tags": dict(sorted(tags.items())),
+                "tags": {
+                    species: 1
+                    for species, count in sorted(tags.items())
+                    if count > 0
+                },
                 "detections": detections,
                 "model_version": model_version,
             }

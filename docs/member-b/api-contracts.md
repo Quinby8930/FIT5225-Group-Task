@@ -347,10 +347,15 @@ POST {INFERENCE_API_URL}/infer
 For an image, `media_type` is `image` and `image_urls` contains one temporary
 GET URL for the original. For a video it contains the one-frame-per-second
 temporary images in lexical order. B makes consecutive video requests of at
-most 30 URLs, presigning each batch immediately before its call. It sums tag
-counts and sorts their keys, concatenates detections in batch/response order,
-requires exact `model_version` consistency, and rejects the whole video if the
-aggregate would exceed 1,000 tag counts or 1,000 detections. Image decoding is capped at 40,000,000
+most 30 URLs, presigning each batch immediately before its call. It first sums
+the raw sampled-frame tag counts, concatenates detections in batch/response
+order, requires exact `model_version` consistency, and rejects the whole video
+if the raw aggregate would exceed 1,000 tag counts or 1,000 detections. Only
+after those checks pass, B stores each positive video species tag with count
+`1`: video archive tags express presence, while the unchanged detections remain
+the sampled-frame model evidence. The pipeline does not track animals across
+frames and does not estimate the number of independent animals. Image tag
+counts retain the inference response semantics. Image decoding is capped at 40,000,000
 pixels per C service request. Video extraction samples one frame per second, scales each frame so its
 longest dimension is at most 1,024 pixels without upscaling, and writes JPEGs
 at FFmpeg quality 5. Extraction times out after at most 600 seconds, rejects
